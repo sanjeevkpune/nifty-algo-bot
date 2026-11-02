@@ -66,7 +66,7 @@ jobs:
                   --address=${{ env.STATIC_IP_NAME }} \
                   --no-service-account \
                   --no-scopes \
-                  --metadata=startup-script-url="https://raw.githubusercontent.com/sanjeev-pune/nifty-algo-bot/main/startup.sh",api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}"
+                  --metadata=startup-script-url="https://raw.githubusercontent.com/sanjeevkpune/nifty-algo-bot/main/startup.sh",api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}"
           fi
 
       - name: Stop VM Instance
