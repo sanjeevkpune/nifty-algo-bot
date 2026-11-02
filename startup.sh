@@ -51,7 +51,7 @@ CLIENT_CODE=$(curl -sf -H "$HEADER" "$META_URL/client-code")
 PIN=$(curl -sf -H "$HEADER" "$META_URL/pin")
 TOTP_SECRET=$(curl -sf -H "$HEADER" "$META_URL/totp-secret")
 
-# mStock Secrets
+# mStock Secrets (Mapped explicitly with MSTOCK_ prefix)
 MSTOCK_API_KEY=$(curl -sf -H "$HEADER" "$META_URL/mstock-api-key")
 MSTOCK_CLIENT_CODE=$(curl -sf -H "$HEADER" "$META_URL/mstock-client-code")
 MSTOCK_TOTP_SECRET=$(curl -sf -H "$HEADER" "$META_URL/mstock-totp-secret")
