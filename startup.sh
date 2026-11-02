@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Fix for fatal: $HOME not set when running as root during GCP boot
+export HOME=/root
+
 REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
 USER_NAME="kumar_sanjeev_pune"
 TARGET_DIR="/home/${USER_NAME}/trading-bot"
