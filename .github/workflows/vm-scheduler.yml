@@ -2,9 +2,9 @@ name: Automated VM Start and Stop Scheduler
 
 on:
   schedule:
-    # 9:00 AM IST is 3:30 UTC (Mon-Fri) -> START VM
+    # 9:00 AM IST is 3:30 UTC (Mon-Fri) -> CREATE / START VM
     - cron: '30 3 * * 1-5'
-    # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP VM
+    # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP / DELETE VM (optional)
     - cron: '30 10 * * 1-5'
   workflow_dispatch: # Allows manual testing anytime
 
@@ -12,6 +12,7 @@ env:
   PROJECT_ID: "streamlit-db-503313"
   VM_NAME: "angel-one-auto-trading-bot-v2"
   ZONE: "us-central1-c"
+  STATIC_IP_NAME: "algo-vm-ip"
 
 jobs:
   manage-vm:
@@ -28,31 +29,49 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Determine Action (Start or Stop)
+      - name: Determine Action (Start/Create or Stop)
         id: check-time
         run: |
           UTC_HOUR=$(date -u +%H)
           echo "Current UTC Hour: $UTC_HOUR"
           
-          # If triggered near 03:30 UTC (9:00 AM IST) -> action = start
-          # If triggered near 10:30 UTC (4:00 PM IST) -> action = stop
-          # For manual workflow_dispatch testing, default to 'start' if not specified
           if [ "$UTC_HOUR" -lt 8 ]; then
             echo "action=start" >> $GITHUB_OUTPUT
           else
             echo "action=stop" >> $GITHUB_OUTPUT
           fi
 
-      - name: Start VM Instance
+      - name: Create or Start VM Instance
         if: steps.check-time.outputs.action == 'start'
         run: |
-          echo "Starting VM instance ${{ env.VM_NAME }}..."
-          gcloud compute instances start ${{ env.VM_NAME }} \
-              --zone=${{ env.ZONE }} \
-              --project=${{ env.PROJECT_ID }} \
-              || echo "VM is already running or starting."
+          echo "Checking if VM instance ${{ env.VM_NAME }} exists..."
+          if gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
+              echo "VM exists. Starting instance..."
+              gcloud compute instances start ${{ env.VM_NAME }} \
+                  --zone=${{ env.ZONE }} \
+                  --project=${{ env.PROJECT_ID }}
+          else
+              echo "VM does not exist. Creating fresh instance and executing startup.sh..."
+              gcloud compute instances create ${{ env.VM_NAME }} \
+                  --zone=${{ env.ZONE }} \
+                  --project=${{ env.PROJECT_ID }} \
+                  --machine-type=e2-micro \
+                  --image-family=ubuntu-2204-lts \
+                  --image-project=ubuntu-os-cloud \
+                  --boot-disk-size=20GB \
+                  --tags=http-server,https-server \
+                  --address=${{ env.STATIC_IP_NAME }} \
+                  --metadata=startup-script-url=https://raw.githubusercontent.com/sanjeev-pune/nifty-algo-bot/main/startup.sh,\
+                  API_KEY="${{ secrets.API_KEY }}",\
+                  CLIENT_CODE="${{ secrets.CLIENT_CODE }}",\
+                  PIN="${{ secrets.PIN }}",\
+                  TOTP_SECRET="${{ secrets.TOTP_SECRET }}",\
+                  TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}",\
+                  TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}",\
+                  GSHEET_ID_V2="${{ secrets.GSHEET_ID_V2 }}"
+          fi
 
-      - name: Stop VM Instance
+      - name: Stop VM Instance (or Delete if you prefer zero cost)
         if: steps.check-time.outputs.action == 'stop'
         run: |
           echo "Stopping VM instance ${{ env.VM_NAME }}..."
