@@ -85,7 +85,12 @@ jobs:
                       git clone $REPO_URL .
                   fi
 
-                  pip3 install -r requirements.txt --break-system-packages
+                  # Safely install python requirements regardless of pip version
+                  if pip3 install --help | grep -q -- "--break-system-packages"; then
+                      pip3 install -r requirements.txt --break-system-packages
+                  else
+                      pip3 install -r requirements.txt
+                  fi
 
                   # Create config directory and write secrets from instance attributes
                   mkdir -p /etc/trade-config
