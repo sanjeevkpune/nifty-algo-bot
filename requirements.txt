@@ -6,7 +6,7 @@ gspread
 oauth2client
 websocket-client
 logzero
-mStock-TradingApi-A
+mStock-TradingApi-A==0.1.9
 numpy
 smartapi-python==1.5.5
 
