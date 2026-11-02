@@ -58,7 +58,7 @@ jobs:
               gcloud compute instances create ${{ env.VM_NAME }} \
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
-                  --machine-type=e2-medium \
+                  --machine-type=e2-micro \
                   --image-family=ubuntu-2204-lts \
                   --image-project=ubuntu-os-cloud \
                   --boot-disk-size=20GB \
@@ -68,7 +68,7 @@ jobs:
                   --no-scopes \
                   --metadata=startup-script='#!/bin/bash
                   REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
-                  TARGET_DIR="/home/sanjeev/trading-bot"
+                  TARGET_DIR="/home/kumar_sanjeev_pune/trading-bot"
 
                   echo "Setting system timezone to Asia/Kolkata..."
                   timedatectl set-timezone Asia/Kolkata
@@ -105,8 +105,8 @@ jobs:
 
                   echo "SHELL=/bin/bash" > /tmp/crontab.txt
                   echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" >> /tmp/crontab.txt
-                  echo "38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/sanjeev/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/sanjeev/trading-bot/algo_trade.log 2>&1" >> /tmp/crontab.txt
-                  echo "39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/sanjeev/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/sanjeev/trading-bot/algo_trade_v2.log 2>&1" >> /tmp/crontab.txt
+                  #echo "38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/sanjeev/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/sanjeev/trading-bot/algo_trade.log 2>&1" >> /tmp/crontab.txt
+                  echo "38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1" >> /tmp/crontab.txt
 
                   id -u kumar_sanjeev_pune >/dev/null 2>&1 || useradd -m -s /bin/bash kumar_sanjeev_pune
                   crontab -u kumar_sanjeev_pune /tmp/crontab.txt
