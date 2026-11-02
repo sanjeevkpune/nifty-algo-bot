@@ -54,7 +54,7 @@ jobs:
                   --project=${{ env.PROJECT_ID }} \
                   || echo "VM is already running."
           else
-              echo "VM does not exist. Creating fresh instance and executing startup.sh..."
+              echo "VM does not exist. Creating fresh instance with inline startup script..."
               gcloud compute instances create ${{ env.VM_NAME }} \
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
@@ -66,7 +66,51 @@ jobs:
                   --address=${{ env.STATIC_IP_NAME }} \
                   --no-service-account \
                   --no-scopes \
-                  --metadata=startup-script-url="https://raw.githubusercontent.com/sanjeevkpune/nifty-algo-bot/main/startup.sh",api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}"
+                  --metadata=startup-script='#!/bin/bash
+                  REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
+                  TARGET_DIR="/home/sanjeev/trading-bot"
+
+                  echo "Setting system timezone to Asia/Kolkata..."
+                  timedatectl set-timezone Asia/Kolkata
+
+                  apt-get update -y
+                  apt-get install -y git python3-pip cron nano curl ufw
+
+                  mkdir -p $TARGET_DIR
+                  cd $TARGET_DIR
+
+                  if [ -d ".git" ]; then
+                      git pull
+                  else
+                      git clone $REPO_URL .
+                  fi
+
+                  pip3 install -r requirements.txt --break-system-packages
+
+                  # Create config directory and write secrets from instance attributes
+                  mkdir -p /etc/trade-config
+                  cat << EOF > /etc/trade-config/config.env
+                  API_KEY="${{ secrets.API_KEY }}"
+                  CLIENT_CODE="${{ secrets.CLIENT_CODE }}"
+                  PIN="${{ secrets.PIN }}"
+                  TOTP_SECRET="${{ secrets.TOTP_SECRET }}"
+                  TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+                  TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
+                  GSHEET_ID_V2="${{ secrets.GSHEET_ID_V2 }}"
+                  EOF
+                  chmod 600 /etc/trade-config/config.env
+
+                  cat << "EOF" > /tmp/crontab.txt
+                  SHELL=/bin/bash
+                  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                  38 9 * * 1-5 export $(xargs -a /etc/trade-config/config.env) && cd /home/sanjeev/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/sanjeev/trading-bot/algo_trade.log 2>&1
+                  39 9 * * 1-5 export $(xargs -a /etc/trade-config/config.env) && cd /home/sanjeev/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/sanjeev/trading-bot/algo_trade_v2.log 2>&1
+                  EOF
+                  crontab /tmp/crontab.txt
+                  systemctl enable --now cron
+
+                  echo "Startup script completed successfully at $(date)"
+                  '
           fi
 
       - name: Stop VM Instance
