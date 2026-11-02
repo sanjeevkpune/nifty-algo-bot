@@ -15,6 +15,7 @@ from logzero import logger
 # ==========================================
 API_KEY = os.environ.get("MSTOCK_API_KEY")
 CLIENT_CODE = os.environ.get("MSTOCK_CLIENT_CODE")
+PIN = os.environ.get("MSTOCK_PIN")  # mStock uses PIN / Password for login()
 TOTP_SECRET = os.environ.get("MSTOCK_TOTP_SECRET")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -23,9 +24,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GSHEET_ID_V3 = os.environ.get("GSHEET_ID_V3")
 SERVICE_ACCOUNT_FILE = "service_account.json"
 
-# Validate critical env variables
+# Validate critical env variables including PIN/Password
 missing_env = [var for var, val in {
-    "MSTOCK_API_KEY": API_KEY, "MSTOCK_CLIENT_CODE": CLIENT_CODE, 
+    "MSTOCK_API_KEY": API_KEY, "MSTOCK_CLIENT_CODE": CLIENT_CODE, "MSTOCK_PIN": PIN,
     "MSTOCK_TOTP_SECRET": TOTP_SECRET, "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, 
     "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID, "GSHEET_ID_V3": GSHEET_ID_V3
 }.items() if not val]
@@ -94,8 +95,8 @@ def init_mstock_session():
             logger.info("Initializing mStock session...")
             mconnect = MConnect()
             
-            # Official mStock Type-A SDK login call
-            login_res = mconnect.login("", "")
+            # Pass username (client code) and password (PIN) into login method
+            login_res = mconnect.login(CLIENT_CODE, PIN)
             logger.info(f"mStock Login Response: {login_res}")
             
             totp_code = pyotp.TOTP(TOTP_SECRET).now()
