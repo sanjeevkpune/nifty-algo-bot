@@ -17,10 +17,10 @@ apt-get update -y
 apt-get install -y --no-install-recommends software-properties-common curl ca-certificates
 add-apt-repository ppa:deadsnakes/ppa -y
 apt-get update -y
-apt-get install -y --no-install-recommends git python3.11 python3.11-dev python3.11-pip cron nano curl ca-certificates
+apt-get install -y --no-install-recommends git python3-pip cron nano curl ca-certificates
 
 # Make Python 3.11 the default python3
-update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+# update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
 echo "3. Allocating 2GB Swap File for memory stability..."
 if [ ! -f /swapfile ]; then
