@@ -1,20 +1,13 @@
 #!/bin/bash
-# ==========================================
-# GCP VM AUTOMATED STARTUP & PROVISIONING SCRIPT
-# ==========================================
-
-REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
+REPO_URL="https://github.com/sanjeev-pune/nifty-algo-bot.git"
 TARGET_DIR="/home/sanjeev/trading-bot"
 
-# 1. Set System Timezone to IST (Kolkata)
 echo "Setting system timezone to Asia/Kolkata..."
 timedatectl set-timezone Asia/Kolkata
 
-# 2. Update system & install dependencies
 apt-get update -y
 apt-get install -y git python3-pip cron nano curl ufw
 
-# 3. Setup working directory and pull code from GitHub
 mkdir -p $TARGET_DIR
 cd $TARGET_DIR
 
@@ -24,10 +17,17 @@ else
     git clone $REPO_URL .
 fi
 
-# 4. Install Python dependencies
 pip3 install -r requirements.txt --break-system-packages
 
-# 5. Read environment variables passed via GCP metadata script-values and save to a secure file
+# Fetch metadata passed from gcloud compute instances create
+API_KEY=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/api-key")
+CLIENT_CODE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/client-code")
+PIN=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/pin")
+TOTP_SECRET=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/totp-secret")
+TELEGRAM_BOT_TOKEN=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/telegram-token")
+TELEGRAM_CHAT_ID=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/telegram-chat")
+GSHEET_ID_V2=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/gsheet-v2")
+
 mkdir -p /etc/trade-config
 cat << EOF > /etc/trade-config/config.env
 API_KEY="${API_KEY}"
@@ -40,7 +40,6 @@ GSHEET_ID_V2="${GSHEET_ID_V2}"
 EOF
 chmod 600 /etc/trade-config/config.env
 
-# 6. Configure Automated Crontab for Staggered Execution (Loading env vars automatically)
 cat << 'EOF' > /tmp/crontab.txt
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
