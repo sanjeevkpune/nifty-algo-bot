@@ -51,15 +51,20 @@ jobs:
           GCP_SA_RAW: ${{ secrets.GCP_SA_KEY }}
         run: |
           echo "Checking if VM instance ${{ env.VM_NAME }} exists..."
+          GCP_SA_B64=$(echo -n "$GCP_SA_RAW" | base64 -w 0)
           if gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
-              echo "VM exists. Starting instance..."
+              echo "VM exists. Updating startup-script metadata and starting instance..."
+              gcloud compute instances add-metadata ${{ env.VM_NAME }} \
+                  --zone=${{ env.ZONE }} \
+                  --project=${{ env.PROJECT_ID }} \
+                  --metadata-from-file=startup-script=startup.sh \
+                  --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",mstock-api-key="${{ secrets.MSTOCK_API_KEY }}",mstock-client-code="${{ secrets.MSTOCK_CLIENT_CODE }}",mstock-totp-secret="${{ secrets.MSTOCK_TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gsheet-v3="${{ secrets.GSHEET_ID_V3 }}",gcp-sa-b64="${GCP_SA_B64}"
               gcloud compute instances start ${{ env.VM_NAME }} \
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
                   || echo "VM is already running."
           else
-              echo "VM does not exist. Creating fresh instance with startup.sh..."
-              GCP_SA_B64=$(echo -n "$GCP_SA_RAW" | base64 -w 0)
+              echo "VM does not exist. Creating fresh Ubuntu 24.04 instance with startup.sh..."
               gcloud compute instances create ${{ env.VM_NAME }} \
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
