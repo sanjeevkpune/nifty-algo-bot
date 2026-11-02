@@ -68,8 +68,8 @@ echo "6. Configuring Crontab for ${USER_NAME} and root..."
 cat <<'EOF' > /tmp/crontab.txt
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade.log 2>&1
-39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
+#38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade.log 2>&1
+38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
 EOF
 
 crontab -u $USER_NAME /tmp/crontab.txt
