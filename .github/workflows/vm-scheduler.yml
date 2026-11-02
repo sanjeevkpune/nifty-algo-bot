@@ -64,7 +64,7 @@ jobs:
               gcloud compute instances create ${{ env.VM_NAME }} \
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
-                  --machine-type=e2-medium \
+                  --machine-type=e2-micro \
                   --image-family=ubuntu-2204-lts \
                   --image-project=ubuntu-os-cloud \
                   --boot-disk-size=20GB \
