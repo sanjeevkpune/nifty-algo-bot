@@ -25,8 +25,8 @@ SERVICE_ACCOUNT_FILE = "service_account.json"
 
 # Validate critical env variables
 missing_env = [var for var, val in {
-    "API_KEY": API_KEY, "CLIENT_CODE": CLIENT_CODE, 
-    "TOTP_SECRET": TOTP_SECRET, "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, 
+    "MSTOCK_API_KEY": API_KEY, "MSTOCK_CLIENT_CODE": CLIENT_CODE, 
+    "MSTOCK_TOTP_SECRET": TOTP_SECRET, "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, 
     "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID, "GSHEET_ID_V3": GSHEET_ID_V3
 }.items() if not val]
 
@@ -91,12 +91,18 @@ def send_telegram_alert(message):
 def init_mstock_session():
     for attempt in range(1, 4):
         try:
+            logger.info("Initializing mStock session...")
             mconnect = MConnect()
-            # mStock Type-A login does not require PIN
+            
+            # Official mStock Type-A SDK login call
             login_res = mconnect.login("", "")
+            logger.info(f"mStock Login Response: {login_res}")
+            
             totp_code = pyotp.TOTP(TOTP_SECRET).now()
             gen_res = mconnect.generate_session(API_KEY, totp_code, "")
-            if gen_res and (str(gen_res.get("status")) == "true" or gen_res.get("status") is True):
+            logger.info(f"mStock Session Generation Response: {gen_res}")
+            
+            if gen_res and (str(gen_res.get("status")).lower() == "true" or gen_res.get("status") is True or "data" in gen_res):
                 print("mStock Type-A Session authenticated successfully.")
                 return mconnect
             print(f"mStock Session attempt {attempt} rejected: {gen_res}")
