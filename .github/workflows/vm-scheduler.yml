@@ -6,7 +6,7 @@ on:
     - cron: '30 3 * * 1-5'
     # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP VM
     - cron: '30 10 * * 1-5'
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual testing anytime
 
 env:
   PROJECT_ID: "streamlit-db-503313"
@@ -34,6 +34,9 @@ jobs:
         run: |
           UTC_HOUR=$(date -u +%H)
           echo "Current UTC Hour: $UTC_HOUR"
+          
+          # If triggered before 10:00 UTC (i.e. before 3:30 PM IST), default to START/CREATE.
+          # If after 10:00 UTC, default to STOP.
           if [ "$UTC_HOUR" -lt 10 ]; then
             echo "action=start" >> $GITHUB_OUTPUT
           else
@@ -42,8 +45,6 @@ jobs:
 
       - name: Create or Start VM Instance
         if: steps.check-time.outputs.action == 'start'
-        env:
-          GCP_SA_RAW: ${{ secrets.GCP_SA_KEY }}
         run: |
           echo "Checking if VM instance ${{ env.VM_NAME }} exists..."
           if gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
@@ -53,8 +54,7 @@ jobs:
                   --project=${{ env.PROJECT_ID }} \
                   || echo "VM is already running."
           else
-              echo "VM does not exist. Creating fresh instance with startup.sh..."
-              GCP_SA_B64=$(echo -n "$GCP_SA_RAW" | base64 -w 0)
+              echo "VM does not exist. Creating fresh instance with inline startup script..."
               gcloud compute instances create ${{ env.VM_NAME }} \
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
@@ -66,8 +66,54 @@ jobs:
                   --address=${{ env.STATIC_IP_NAME }} \
                   --no-service-account \
                   --no-scopes \
-                  --metadata-from-file=startup-script=startup.sh \
-                  --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
+                  --metadata=startup-script='#!/bin/bash
+                  REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
+                  TARGET_DIR="/home/sanjeev/trading-bot"
+
+                  echo "Setting system timezone to Asia/Kolkata..."
+                  timedatectl set-timezone Asia/Kolkata
+
+                  export DEBIAN_FRONTEND=noninteractive
+                  apt-get update -y
+                  apt-get install -y --no-install-recommends git python3-pip cron nano curl ufw ca-certificates
+
+                  mkdir -p $TARGET_DIR
+                  cd $TARGET_DIR
+
+                  if [ -d ".git" ]; then
+                      git pull
+                  else
+                      git clone $REPO_URL .
+                  fi
+
+                  if pip3 install --help | grep -q -- "--break-system-packages"; then
+                      pip3 install -r requirements.txt --break-system-packages
+                  else
+                      pip3 install -r requirements.txt
+                  fi
+
+                  mkdir -p /etc/trade-config
+                  echo "API_KEY=${{ secrets.API_KEY }}" > /etc/trade-config/config.env
+                  echo "CLIENT_CODE=${{ secrets.CLIENT_CODE }}" >> /etc/trade-config/config.env
+                  echo "PIN=${{ secrets.PIN }}" >> /etc/trade-config/config.env
+                  echo "TOTP_SECRET=${{ secrets.TOTP_SECRET }}" >> /etc/trade-config/config.env
+                  echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> /etc/trade-config/config.env
+                  echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> /etc/trade-config/config.env
+                  echo "GSHEET_ID_V2=${{ secrets.GSHEET_ID_V2 }}" >> /etc/trade-config/config.env
+                  chmod 644 /etc/trade-config/config.env
+                  chmod -R 777 $TARGET_DIR
+
+                  echo "SHELL=/bin/bash" > /tmp/crontab.txt
+                  echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" >> /tmp/crontab.txt
+                  echo "38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/sanjeev/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/sanjeev/trading-bot/algo_trade.log 2>&1" >> /tmp/crontab.txt
+                  echo "39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/sanjeev/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/sanjeev/trading-bot/algo_trade_v2.log 2>&1" >> /tmp/crontab.txt
+
+                  id -u kumar_sanjeev_pune >/dev/null 2>&1 || useradd -m -s /bin/bash kumar_sanjeev_pune
+                  crontab -u kumar_sanjeev_pune /tmp/crontab.txt
+                  systemctl enable --now cron
+
+                  echo "Startup script completed successfully at $(date)"
+                  '
           fi
 
       - name: Stop VM Instance
