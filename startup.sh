@@ -5,18 +5,19 @@
 
 REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
 TARGET_DIR="/home/sanjeev/trading-bot"
-STATIC_IP_NAME="algo-vm-ip"
-ZONE="us-central1-c"  # Update to your VM zone
 
-# 1. Update system & install dependencies
+# 1. Set System Timezone to IST (Kolkata)
+echo "Setting system timezone to Asia/Kolkata..."
+timedatectl set-timezone Asia/Kolkata
+
+# 2. Update system & install dependencies
 apt-get update -y
 apt-get install -y git python3-pip cron nano curl ufw
 
-# 2. Setup working directory
+# 3. Setup working directory and pull code from GitHub
 mkdir -p $TARGET_DIR
 cd $TARGET_DIR
 
-# 3. Clone or pull latest code from GitHub
 if [ -d ".git" ]; then
     git pull
 else
@@ -26,20 +27,25 @@ fi
 # 4. Install Python dependencies
 pip3 install -r requirements.txt --break-system-packages
 
-# 5. Inject Secrets from Metadata / Environment variables passed during creation
-cat << EOF > service_account.json
-{
-  "type": "service_account",
-  "project_id": "$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/project-id)",
-  "private_key_id": "...",
-  ... # Alternatively, inject via GitHub Actions secrets file creation
-}
+# 5. Read environment variables passed via GCP metadata script-values and save to a secure file
+mkdir -p /etc/trade-config
+cat << EOF > /etc/trade-config/config.env
+API_KEY="${API_KEY}"
+CLIENT_CODE="${CLIENT_CODE}"
+PIN="${PIN}"
+TOTP_SECRET="${TOTP_SECRET}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
+GSHEET_ID_V2="${GSHEET_ID_V2}"
 EOF
+chmod 600 /etc/trade-config/config.env
 
-# 6. Configure Automated Crontab for Staggered Execution
-cat << EOF > /tmp/crontab.txt
-# 38 9 * * 1-5 cd $TARGET_DIR && /usr/bin/python3 strangle_algo.py >> $TARGET_DIR/algo_trade.log 2>&1
-39 9 * * 1-5 cd $TARGET_DIR && /usr/bin/python3 adaptive_strangle_v2.py >> $TARGET_DIR/algo_trade_v2.log 2>&1
+# 6. Configure Automated Crontab for Staggered Execution (Loading env vars automatically)
+cat << 'EOF' > /tmp/crontab.txt
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+38 9 * * 1-5 export $(xargs -a /etc/trade-config/config.env) && cd /home/sanjeev/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/sanjeev/trading-bot/algo_trade.log 2>&1
+39 9 * * 1-5 export $(xargs -a /etc/trade-config/config.env) && cd /home/sanjeev/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/sanjeev/trading-bot/algo_trade_v2.log 2>&1
 EOF
 crontab /tmp/crontab.txt
 systemctl enable --now cron
