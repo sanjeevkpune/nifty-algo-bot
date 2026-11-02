@@ -11,18 +11,7 @@ TARGET_DIR="/home/${USER_NAME}/trading-bot"
 echo "1. Setting system timezone to Asia/Kolkata..."
 timedatectl set-timezone Asia/Kolkata
 
-echo "2. Installing Python 3.11 (Required for mStock SDK) and system packages..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends software-properties-common curl ca-certificates
-add-apt-repository ppa:deadsnakes/ppa -y
-apt-get update -y
-apt-get install -y --no-install-recommends git python3-pip cron nano curl ca-certificates
-
-# Make Python 3.11 the default python3
-# update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
-
-echo "3. Allocating 2GB Swap File for memory stability..."
+echo "2. Allocating 2GB Swap File for memory stability..."
 if [ ! -f /swapfile ]; then
     fallocate -l 2G /swapfile
     chmod 600 /swapfile
@@ -30,6 +19,11 @@ if [ ! -f /swapfile ]; then
     swapon /swapfile
     echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
+
+echo "3. Installing system packages (Ubuntu 24.04 / Python 3.12)..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y --no-install-recommends git python3-pip python3-dev build-essential cron nano curl ca-certificates
 
 echo "4. Setting up user & cloning repository..."
 id -u $USER_NAME &>/dev/null || useradd -m -s /bin/bash $USER_NAME
@@ -44,14 +38,8 @@ else
     git clone $REPO_URL .
 fi
 
-echo "5. Upgrading pip and installing Python dependencies..."
-python3 -m pip install --upgrade pip setuptools wheel
-
-if pip3 install --help | grep -q -- "--break-system-packages"; then
-    pip3 install -r requirements.txt --break-system-packages
-else
-    pip3 install -r requirements.txt
-fi
+echo "5. Installing Python dependencies..."
+pip3 install --break-system-packages -r requirements.txt || pip3 install --break-system-packages --ignore-installed -r requirements.txt
 
 echo "6. Fetching secrets from GCP Metadata..."
 META_URL="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
@@ -104,7 +92,7 @@ cat <<'EOF' > /tmp/crontab.txt
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Angel One Strategy (9:39 AM IST)
-39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2_2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
+39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
 # mStock Strategy (10:00 AM IST)
 0 10 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_mstock_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_mstock.log 2>&1
 EOF
