@@ -1,5 +1,5 @@
 #!/bin/bash
-REPO_URL="https://github.com/sanjeev-pune/nifty-algo-bot.git"
+REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
 TARGET_DIR="/home/sanjeev/trading-bot"
 
 echo "Setting system timezone to Asia/Kolkata..."
