@@ -18,7 +18,7 @@ PIN = os.environ.get("MSTOCK_PIN")
 TOTP_SECRET = os.environ.get("MSTOCK_TOTP_SECRET")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-GSHEET_ID_V2 = os.environ.get("GSHEET_ID_V2")
+GSHEET_ID_V3 = os.environ.get("GSHEET_ID_V3")
 SERVICE_ACCOUNT_FILE = "service_account.json"
 
 # Quantity configuration: 5 Lots * 65 Nifty Lot Size = 325 quantity
