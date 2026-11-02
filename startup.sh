@@ -11,7 +11,18 @@ TARGET_DIR="/home/${USER_NAME}/trading-bot"
 echo "1. Setting system timezone to Asia/Kolkata..."
 timedatectl set-timezone Asia/Kolkata
 
-echo "2. Allocating 2GB Swap File for memory stability..."
+echo "2. Installing Python 3.11 (Required for mStock SDK) and system packages..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y --no-install-recommends software-properties-common curl ca-certificates
+add-apt-repository ppa:deadsnakes/ppa -y
+apt-get update -y
+apt-get install -y --no-install-recommends git python3.11 python3.11-dev python3.11-pip cron nano curl ca-certificates
+
+# Make Python 3.11 the default python3
+update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+echo "3. Allocating 2GB Swap File for memory stability..."
 if [ ! -f /swapfile ]; then
     fallocate -l 2G /swapfile
     chmod 600 /swapfile
@@ -19,11 +30,6 @@ if [ ! -f /swapfile ]; then
     swapon /swapfile
     echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
-
-echo "3. Installing system packages..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends git python3-pip cron nano curl ca-certificates
 
 echo "4. Setting up user & cloning repository..."
 id -u $USER_NAME &>/dev/null || useradd -m -s /bin/bash $USER_NAME
@@ -38,7 +44,7 @@ else
     git clone $REPO_URL .
 fi
 
-echo "5. Installing Python dependencies..."
+echo "5. Upgrading pip and installing Python dependencies..."
 python3 -m pip install --upgrade pip setuptools wheel
 
 if pip3 install --help | grep -q -- "--break-system-packages"; then
