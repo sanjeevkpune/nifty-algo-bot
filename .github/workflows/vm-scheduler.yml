@@ -4,7 +4,7 @@ on:
   schedule:
     # 9:00 AM IST is 3:30 UTC (Mon-Fri) -> CREATE / START VM
     - cron: '30 3 * * 1-5'
-    # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP / DELETE VM (optional)
+    # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP VM
     - cron: '30 10 * * 1-5'
   workflow_dispatch: # Allows manual testing anytime
 
@@ -55,23 +55,16 @@ jobs:
               gcloud compute instances create ${{ env.VM_NAME }} \
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
-                  --machine-type=e2-micro \
+                  --machine-type=e2-medium \
                   --image-family=ubuntu-2204-lts \
                   --image-project=ubuntu-os-cloud \
                   --boot-disk-size=20GB \
                   --tags=http-server,https-server \
                   --address=${{ env.STATIC_IP_NAME }} \
-                  --metadata=startup-script-url=https://raw.githubusercontent.com/sanjeev-pune/nifty-algo-bot/main/startup.sh,\
-                  API_KEY="${{ secrets.API_KEY }}",\
-                  CLIENT_CODE="${{ secrets.CLIENT_CODE }}",\
-                  PIN="${{ secrets.PIN }}",\
-                  TOTP_SECRET="${{ secrets.TOTP_SECRET }}",\
-                  TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}",\
-                  TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}",\
-                  GSHEET_ID_V2="${{ secrets.GSHEET_ID_V2 }}"
+                  --metadata=startup-script-url="https://raw.githubusercontent.com/sanjeev-pune/nifty-algo-bot/main/startup.sh",api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}"
           fi
 
-      - name: Stop VM Instance (or Delete if you prefer zero cost)
+      - name: Stop VM Instance
         if: steps.check-time.outputs.action == 'stop'
         run: |
           echo "Stopping VM instance ${{ env.VM_NAME }}..."
