@@ -1,0 +1,8 @@
+smartapi-python
+pyotp
+pandas
+requests
+gspread
+oauth2client
+websocket-client
+logzero
