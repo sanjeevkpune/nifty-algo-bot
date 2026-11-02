@@ -8,7 +8,7 @@ TARGET_DIR="/home/${USER_NAME}/trading-bot"
 echo "1. Setting system timezone to Asia/Kolkata..."
 timedatectl set-timezone Asia/Kolkata
 
-echo "2. Installing system packages (fast mode)..."
+echo "2. Installing system packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y --no-install-recommends git python3-pip cron nano curl ca-certificates
@@ -16,10 +16,12 @@ apt-get install -y --no-install-recommends git python3-pip cron nano curl ca-cer
 echo "3. Setting up user & cloning repository..."
 id -u $USER_NAME &>/dev/null || useradd -m -s /bin/bash $USER_NAME
 mkdir -p $TARGET_DIR
+git config --global --add safe.directory $TARGET_DIR
 cd $TARGET_DIR
 
 if [ -d ".git" ]; then
-    git pull
+    git fetch --all
+    git reset --hard origin/main
 else
     git clone $REPO_URL .
 fi
@@ -64,16 +66,16 @@ chmod 644 /etc/trade-config/config.env
 
 chown -R ${USER_NAME}:${USER_NAME} $TARGET_DIR
 
-echo "6. Configuring Crontab for ${USER_NAME} and root..."
+echo "6. Configuring Crontab and restarting Cron service in IST..."
 cat <<'EOF' > /tmp/crontab.txt
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-#38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 strangle_algo.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade.log 2>&1
 38 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
 EOF
 
 crontab -u $USER_NAME /tmp/crontab.txt
 rm -f /tmp/crontab.txt
-systemctl enable --now cron
+systemctl enable cron
+systemctl restart cron
 
 echo "Startup script completed successfully at $(date)"
