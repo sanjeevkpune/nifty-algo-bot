@@ -39,6 +39,8 @@ else
 fi
 
 echo "5. Installing Python dependencies..."
+python3 -m pip install --upgrade pip setuptools wheel
+
 if pip3 install --help | grep -q -- "--break-system-packages"; then
     pip3 install -r requirements.txt --break-system-packages
 else
