@@ -32,7 +32,6 @@ jobs:
       - name: Determine Action (Start/Create or Stop)
         id: check-time
         run: |
-          # If triggered manually via GitHub GUI, force 'start' for testing
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Forcing 'action=start' for manual test workflow_dispatch."
             echo "action=start" >> $GITHUB_OUTPUT
@@ -73,7 +72,7 @@ jobs:
                   --no-service-account \
                   --no-scopes \
                   --metadata-from-file=startup-script=startup.sh \
-                  --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
+                  --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",mstock-api-key="${{ secrets.MSTOCK_API_KEY }}",mstock-client-code="${{ secrets.MSTOCK_CLIENT_CODE }}",mstock-totp-secret="${{ secrets.MSTOCK_TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gsheet-v3="${{ secrets.GSHEET_ID_V3 }}",gcp-sa-b64="${GCP_SA_B64}"
           fi
 
       - name: Stop VM Instance
