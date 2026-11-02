@@ -2,17 +2,16 @@ name: Automated VM Start and Stop Scheduler
 
 on:
   schedule:
-    # 9:00 AM IST is 3:30 UTC (Mon-Fri)
+    # 9:00 AM IST is 3:30 UTC (Mon-Fri) -> START VM
     - cron: '30 3 * * 1-5'
-    # 4:00 PM IST is 10:30 UTC (Mon-Fri)
+    # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP VM
     - cron: '30 10 * * 1-5'
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual testing anytime
 
 env:
   PROJECT_ID: "streamlit-db-503313"
   VM_NAME: "angel-one-auto-trading-bot-v2"
   ZONE: "us-central1-c"
-  STATIC_IP_NAME: "algo-vm-ip"
 
 jobs:
   manage-vm:
@@ -33,36 +32,31 @@ jobs:
         id: check-time
         run: |
           UTC_HOUR=$(date -u +%H)
-          if [ "$UTC_HOUR" -eq 3 ]; then
+          echo "Current UTC Hour: $UTC_HOUR"
+          
+          # If triggered near 03:30 UTC (9:00 AM IST) -> action = start
+          # If triggered near 10:30 UTC (4:00 PM IST) -> action = stop
+          # For manual workflow_dispatch testing, default to 'start' if not specified
+          if [ "$UTC_HOUR" -lt 8 ]; then
             echo "action=start" >> $GITHUB_OUTPUT
           else
             echo "action=stop" >> $GITHUB_OUTPUT
           fi
 
-      - name: Start / Recreate VM and Execute startup.sh
+      - name: Start VM Instance
         if: steps.check-time.outputs.action == 'start'
         run: |
-          if gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
-              echo "Deleting old instance for clean daily provision..."
-              gcloud compute instances delete ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --quiet
-          fi
-
-          echo "Creating fresh VM, binding static IP, and passing secrets into metadata..."
-          gcloud compute instances create ${{ env.VM_NAME }} \
+          echo "Starting VM instance ${{ env.VM_NAME }}..."
+          gcloud compute instances start ${{ env.VM_NAME }} \
               --zone=${{ env.ZONE }} \
               --project=${{ env.PROJECT_ID }} \
-              --machine-type=e2-micro \
-              --image-family=ubuntu-2204-lts \
-              --image-project=ubuntu-os-cloud \
-              --boot-disk-size=20GB \
-              --tags=http-server,https-server \
-              --address=${{ env.STATIC_IP_NAME }} \
-              --metadata=startup-script-url=https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/startup.sh,API_KEY="${{ secrets.API_KEY }}",CLIENT_CODE="${{ secrets.CLIENT_CODE }}",PIN="${{ secrets.PIN }}",TOTP_SECRET="${{ secrets.TOTP_SECRET }}",TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}",TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}",GSHEET_ID_V2="${{ secrets.GSHEET_ID_V2 }}"
+              || echo "VM is already running or starting."
 
-      - name: Stop / Delete VM at Market Close
+      - name: Stop VM Instance
         if: steps.check-time.outputs.action == 'stop'
         run: |
-          gcloud compute instances delete ${{ env.VM_NAME }} \
+          echo "Stopping VM instance ${{ env.VM_NAME }}..."
+          gcloud compute instances stop ${{ env.VM_NAME }} \
               --zone=${{ env.ZONE }} \
               --project=${{ env.PROJECT_ID }} \
-              --quiet || echo "VM already deleted."
+              || echo "VM is already stopped."
