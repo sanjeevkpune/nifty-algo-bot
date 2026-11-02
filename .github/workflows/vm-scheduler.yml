@@ -64,7 +64,7 @@ jobs:
                   --zone=${{ env.ZONE }} \
                   --project=${{ env.PROJECT_ID }} \
                   --machine-type=e2-medium \
-                  --image-family=ubuntu-2204-lts \
+                  --image-family=ubuntu-2404-lts-amd64 \
                   --image-project=ubuntu-os-cloud \
                   --boot-disk-size=20GB \
                   --tags=http-server,https-server \
