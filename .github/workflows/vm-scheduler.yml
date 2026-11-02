@@ -1,0 +1,97 @@
+name: Automated VM Start and Stop Scheduler
+
+on:
+  schedule:
+    # 9:00 AM IST is 3:30 AM UTC (Mon-Fri)
+    - cron: '30 3 * * 1-5'
+    # 4:00 PM IST is 10:30 AM UTC (Mon-Fri)
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+env:
+  PROJECT_ID: "streamlit-db-503313"
+  VM_NAME: "angel-one-auto-trading-bot-v2"
+  ZONE: "us-central1-c"
+  STATIC_IP_NAME: "algo-vm-ip"
+
+jobs:
+  manage-vm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+  
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+  
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+  
+      - name: Determine Action (Start or Stop)
+        id: check-time
+        run: |
+          # Get current UTC hour & minute
+          UTC_HOUR=$(date -u +%H)
+          UTC_MIN=$(date -u +%M)
+          
+          # If cron triggered around 03:30 UTC -> START VM
+          # If cron triggered around 10:30 UTC -> DELETE/STOP VM
+          if [ "$UTC_HOUR" -eq 3 ]; then
+            echo "action=start" >> $GITHUB_OUTPUT
+          else
+            echo "action=stop" >> $GITHUB_OUTPUT
+          fi
+  
+      - name: Start / Recreate VM and Attach Static IP
+        if: steps.check-time.outputs.action == 'start'
+        run: |
+          echo "Checking if VM exists..."
+          if gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
+              echo "VM exists. Deleting old instance to ensure fresh provision..."
+              gcloud compute instances delete ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --quiet
+          fi
+  
+          echo "Creating fresh VM instance and attaching static IP..."
+          gcloud compute instances create ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
+              --machine-type=e2-medium \
+              --image-family=ubuntu-2204-lts \
+              --image-project=ubuntu-os-cloud \
+              --boot-disk-size=20GB \
+              --tags=http-server,https-server \
+              --address=${{ env.STATIC_IP_NAME }} \
+              --metadata=startup-script='#!/bin/bash
+              apt-get update -y && apt-get install -y git python3-pip cron
+              git clone https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME.git /home/sanjeev/bot
+              cd /home/sanjeev/bot
+              pip3 install -r requirements.txt --break-system-packages
+              
+              # Write config secrets dynamically from workflow environment
+              cat << "EOF" > config.env
+              API_KEY="${{ secrets.API_KEY }}"
+              CLIENT_CODE="${{ secrets.CLIENT_CODE }}"
+              PIN="${{ secrets.PIN }}"
+              TOTP_SECRET="${{ secrets.TOTP_SECRET }}"
+              TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+              TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
+              GSHEET_ID_V2="${{ secrets.GSHEET_ID_V2 }}"
+              EOF
+              
+              # Setup Cron
+              echo "38 9 * * 1-5 cd /home/sanjeev/bot && /usr/bin/python3 strangle_algo.py >> /home/sanjeev/bot/algo_trade.log 2>&1" > /tmp/cron.txt
+              echo "39 9 * * 1-5 cd /home/sanjeev/bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/sanjeev/bot/algo_trade_v2.log 2>&1" >> /tmp/cron.txt
+              crontab /tmp/cron.txt
+              systemctl enable --now cron
+              '
+  
+      - name: Stop / Delete VM at Market Close
+        if: steps.check-time.outputs.action == 'stop'
+        run: |
+          echo "Deleting VM instance to stop compute billing..."
+          gcloud compute instances delete ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
+              --quiet || echo "VM already deleted or stopped."
