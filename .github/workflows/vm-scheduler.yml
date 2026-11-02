@@ -32,12 +32,18 @@ jobs:
       - name: Determine Action (Start/Create or Stop)
         id: check-time
         run: |
-          UTC_HOUR=$(date -u +%H)
-          echo "Current UTC Hour: $UTC_HOUR"
-          if [ "$UTC_HOUR" -lt 10 ]; then
+          # If triggered manually via GitHub GUI, force 'start' for testing
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Forcing 'action=start' for manual test workflow_dispatch."
             echo "action=start" >> $GITHUB_OUTPUT
           else
-            echo "action=stop" >> $GITHUB_OUTPUT
+            UTC_HOUR=$(date -u +%H)
+            echo "Current UTC Hour: $UTC_HOUR"
+            if [ "$UTC_HOUR" -lt 10 ]; then
+              echo "action=start" >> $GITHUB_OUTPUT
+            else
+              echo "action=stop" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Create or Start VM Instance
