@@ -4,6 +4,19 @@ import time
 import datetime
 import resource
 import gspread
+
+# Automatically load /etc/trade-config/config.env before importing strategy modules
+CONFIG_ENV_PATH = "/etc/trade-config/config.env"
+if os.path.exists(CONFIG_ENV_PATH):
+    with open(CONFIG_ENV_PATH, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+else:
+    print(f"⚠️ Warning: {CONFIG_ENV_PATH} not found. Relying on current shell environment.")
+
 import adaptive_strangle_v2 as v2
 import adaptive_strangle_mstock_v2 as mstock_v2
 
