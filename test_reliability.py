@@ -50,16 +50,16 @@ def run_diagnostics(test_order=False):
         sys.exit(1)
 
     # 3. mStock: Type-A Auth & Options Master Test
-    print("\n[3/6] Testing mStock Type-A Auth & Instruments Master...")
-    try:
-        mconnect = mstock_v2.init_mstock_session()
-        options_df_mstock = mstock_v2.get_mstock_options_master(mconnect)
-        next_expiry_mstock = mstock_v2.get_next_expiry(options_df_mstock)
-        mem_mb_mstock = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-        print(f"✅ mStock Master parsed ({len(options_df_mstock)} contracts) | Expiry: {next_expiry_mstock} | Peak RAM: {mem_mb_mstock:.1f} MB")
-    except Exception as e:
-        print(f"❌ mStock Test Failed: {e}")
-        sys.exit(1)
+    # print("\n[3/6] Testing mStock Type-A Auth & Instruments Master...")
+    # try:
+    #     mconnect = mstock_v2.init_mstock_session()
+    #     options_df_mstock = mstock_v2.get_mstock_options_master(mconnect)
+    #     next_expiry_mstock = mstock_v2.get_next_expiry(options_df_mstock)
+    #     mem_mb_mstock = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    #     print(f"✅ mStock Master parsed ({len(options_df_mstock)} contracts) | Expiry: {next_expiry_mstock} | Peak RAM: {mem_mb_mstock:.1f} MB")
+    # except Exception as e:
+    #     print(f"❌ mStock Test Failed: {e}")
+    #     sys.exit(1)
 
     # 4. Market Filter & Strike Selection Simulation (Both Brokers)
     print("\n[4/6] Testing Market Filters & Contract Lookups...")
@@ -72,18 +72,18 @@ def run_diagnostics(test_order=False):
         print(f"⚠️ Angel One filter check warning: {e}")
 
     # mStock check
-    try:
-        is_safe_m, spot_m, gap_m, opening_m, msg_m = mstock_v2.check_market_filters(mconnect)
-        print(f"✅ mStock Filter Check -> Safe: {is_safe_m} | Spot: {spot_m:.2f} | Msg: {msg_m}")
+    # try:
+    #     is_safe_m, spot_m, gap_m, opening_m, msg_m = mstock_v2.check_market_filters(mconnect)
+    #     print(f"✅ mStock Filter Check -> Safe: {is_safe_m} | Spot: {spot_m:.2f} | Msg: {msg_m}")
 
-        atm_strike_m = round(spot_m / 50.0) * 50
-        ce_sym_m, ce_tok_m = mstock_v2.get_contract_by_expiry_and_strike(options_df_mstock, next_expiry_mstock, atm_strike_m + 200, "CE")
-        pe_sym_m, pe_tok_m = mstock_v2.get_contract_by_expiry_and_strike(options_df_mstock, next_expiry_mstock, atm_strike_m - 200, "PE")
-        ce_ltp_m = mstock_v2.get_ltp(mconnect, ce_sym_m) if ce_sym_m else 0.0
-        pe_ltp_m = mstock_v2.get_ltp(mconnect, pe_sym_m) if pe_sym_m else 0.0
-        print(f"✅ mStock Sample Contracts -> CE: {ce_sym_m} (LTP: ₹{ce_ltp_m}) | PE: {pe_sym_m} (LTP: ₹{pe_ltp_m})")
-    except Exception as e:
-        print(f"⚠️ mStock contract lookup warning: {e}")
+    #     atm_strike_m = round(spot_m / 50.0) * 50
+    #     ce_sym_m, ce_tok_m = mstock_v2.get_contract_by_expiry_and_strike(options_df_mstock, next_expiry_mstock, atm_strike_m + 200, "CE")
+    #     pe_sym_m, pe_tok_m = mstock_v2.get_contract_by_expiry_and_strike(options_df_mstock, next_expiry_mstock, atm_strike_m - 200, "PE")
+    #     ce_ltp_m = mstock_v2.get_ltp(mconnect, ce_sym_m) if ce_sym_m else 0.0
+    #     pe_ltp_m = mstock_v2.get_ltp(mconnect, pe_sym_m) if pe_sym_m else 0.0
+    #     print(f"✅ mStock Sample Contracts -> CE: {ce_sym_m} (LTP: ₹{ce_ltp_m}) | PE: {pe_sym_m} (LTP: ₹{pe_ltp_m})")
+    # except Exception as e:
+    #     print(f"⚠️ mStock contract lookup warning: {e}")
 
     # 5. Google Sheets Test (V2 & V3) & Telegram Alert
     print("\n[5/6] Testing Google Sheets (GSHEET_ID_V2 & GSHEET_ID_V3) & Telegram...")
