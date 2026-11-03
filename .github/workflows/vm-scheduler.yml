@@ -3,8 +3,8 @@ name: Automated VM Start and Stop Scheduler
 on:
   schedule:
     # 9:00 AM IST is 3:30 UTC (Mon-Fri) -> CREATE / START VM
-    #- cron: '30 3 * * 1-5'
-    - cron: '20 17 * * *'
+    - cron: '30 3 * * 1-5'
+    #- cron: '20 17 * * *'
     # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP VM
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
