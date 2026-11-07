@@ -45,23 +45,14 @@ echo "6. Fetching secrets from GCP Metadata..."
 META_URL="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
 HEADER="Metadata-Flavor: Google"
 
-# Angel One Secrets
+# Angel One & Telegram/GSheet Secrets
 API_KEY=$(curl -sf -H "$HEADER" "$META_URL/api-key")
 CLIENT_CODE=$(curl -sf -H "$HEADER" "$META_URL/client-code")
 PIN=$(curl -sf -H "$HEADER" "$META_URL/pin")
 TOTP_SECRET=$(curl -sf -H "$HEADER" "$META_URL/totp-secret")
-
-# mStock Secrets (Mapped explicitly with MSTOCK_ prefix)
-MSTOCK_API_KEY=$(curl -sf -H "$HEADER" "$META_URL/mstock-api-key")
-MSTOCK_CLIENT_CODE=$(curl -sf -H "$HEADER" "$META_URL/mstock-client-code")
-MSTOCK_TOTP_SECRET=$(curl -sf -H "$HEADER" "$META_URL/mstock-totp-secret")
-MSTOCK_PIN=$(curl -sf -H "$HEADER" "$META_URL/mstock-pin")
-
-# Shared Secrets
 TELEGRAM_BOT_TOKEN=$(curl -sf -H "$HEADER" "$META_URL/telegram-token")
 TELEGRAM_CHAT_ID=$(curl -sf -H "$HEADER" "$META_URL/telegram-chat")
 GSHEET_ID_V2=$(curl -sf -H "$HEADER" "$META_URL/gsheet-v2")
-GSHEET_ID_V3=$(curl -sf -H "$HEADER" "$META_URL/gsheet-v3")
 GCP_SA_B64=$(curl -sf -H "$HEADER" "$META_URL/gcp-sa-b64")
 
 # Decode Google Service Account JSON into the trading directory
@@ -76,27 +67,20 @@ API_KEY=${API_KEY}
 CLIENT_CODE=${CLIENT_CODE}
 PIN=${PIN}
 TOTP_SECRET=${TOTP_SECRET}
-MSTOCK_API_KEY=${MSTOCK_API_KEY}
-MSTOCK_CLIENT_CODE=${MSTOCK_CLIENT_CODE}
-MSTOCK_TOTP_SECRET=${MSTOCK_TOTP_SECRET}
-MSTOCK_PIN=${MSTOCK_PIN}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 GSHEET_ID_V2=${GSHEET_ID_V2}
-GSHEET_ID_V3=${GSHEET_ID_V3}
 EOF
 chmod 644 /etc/trade-config/config.env
 
 chown -R ${USER_NAME}:${USER_NAME} $TARGET_DIR
 
-echo "7. Configuring Crontab for Angel One (09:39) and mStock (10:00)..."
+echo "7. Configuring Crontab for Angel One..."
 cat <<'EOF' > /tmp/crontab.txt
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Angel One Strategy (9:39 AM IST)
 39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
-# mStock Strategy (10:00 AM IST)
-0 10 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_mstock_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_mstock.log 2>&1
 EOF
 
 crontab -u $USER_NAME /tmp/crontab.txt
