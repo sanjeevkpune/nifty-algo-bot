@@ -36,17 +36,15 @@ if missing_env:
     sys.exit(1)
 
 NIFTY_LOT_SIZE = 65
-TRANCHE_1_QTY = NIFTY_LOT_SIZE * 2       # 2 Lots (130 qty) at 9:50 AM
-TRANCHE_2_QTY = NIFTY_LOT_SIZE * 1       # +1 Lot (65 qty) at 10:05 AM if stable
+TRANCHE_1_QTY = NIFTY_LOT_SIZE * 5       # Fixed 5 Lots (325 qty) at 9:50 AM
 
 DELTA_WIDTH_MULTIPLIER = 1.15            # ~18-Delta OTM strike distance
 TARGET_DECAY_POINTS = 30.0               # Standard target: 30 points combined decay
 SALVAGE_DECAY_POINTS = 12.0              # Post-roll salvage target: 12 points net decay
-MAX_MONETARY_LOSS = 12000.0              # Hard ₹12,000 gross loss ceiling
+MAX_MONETARY_LOSS = 15000.0              # Hard ₹15,000 gross loss ceiling for 5 lots
 
 MAX_GAP_PERCENT = 0.60                   # Pre-market gap threshold (%)
 MAX_OPENING_RANGE_PTS = 110.0            # Max 9:15-9:50 AM High-Low spread (pts)
-TRANCHE_2_MAX_DRIFT_PTS = 40.0           # Max Spot drift from 9:50 to 10:05 AM
 
 SPOT_ROLL_BUFFER = 40.0                  # Roll tested leg if Spot comes within 40 pts
 SPOT_HARD_EXIT_BUFFER = 30.0             # Hard exit if Spot comes within 30 pts
@@ -263,7 +261,7 @@ def main():
     if not is_safe:
         skip_alert = f"⚠️ V2 STRATEGY SKIPPED ({today_str})\nReason: {filter_msg}"
         print(skip_alert); send_telegram_alert(skip_alert)
-        log_to_v2_google_sheet([today_str, now_time_str, "V2 Adaptive Strangle", "SKIPPED", round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2), "N/A", "N/A", 0.0, "N/A", "N/A", 0, "No", filter_msg, 0.0, 0.0, 0.0])
+        log_to_v2_google_sheet([today_str, now_time_str, "V2 Adaptive Strangle (5 Lot)", "SKIPPED", round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2), "N/A", "N/A", 0.0, "N/A", "N/A", 0, "No", filter_msg, 0.0, 0.0, 0.0])
         sys.exit(0)
 
     atm_strike = round(entry_spot / 50.0) * 50
@@ -289,13 +287,12 @@ def main():
     initial_ce_sym, initial_pe_sym = ce_sym, pe_sym
     initial_combined_premium = ce_avg + pe_avg
     active_qty = TRANCHE_1_QTY
-    tranche_2_evaluated = False
     rolled_status = "No"
     realized_roll_pnl = 0.0
     exit_reason = "N/A"
 
     send_telegram_alert(
-        f"🟢 V2 STRANGLE TRANCHE 1 (2 Lots | 9:50 AM)\n"
+        f"🟢 V2 STRANGLE DEPLOYED (5 Lots | {active_qty} Qty | 9:50 AM)\n"
         f"Expiry: {expiry_str} | Spot: {entry_spot:.2f}\n"
         f"CE: {ce_sym} @ ₹{ce_avg:.2f} | PE: {pe_sym} @ ₹{pe_avg:.2f}\n"
         f"Combined Premium: ₹{initial_combined_premium:.2f}"
@@ -312,23 +309,6 @@ def main():
         if not live_spot or not live_ce or not live_pe:
             time.sleep(2); continue
 
-        # --- 10:05 AM STAGGERED TRANCHE 2 SCALING (+1 LOT) ---
-        if not tranche_2_evaluated and (now.hour > 10 or (now.hour == 10 and now.minute >= 5)):
-            tranche_2_evaluated = True
-            if abs(live_spot - entry_spot) <= TRANCHE_2_MAX_DRIFT_PTS and rolled_status == "No" and orb_pts <= 85.0:
-                ce_p2 = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "SELL", TRANCHE_2_QTY), "NFO", ce_sym, ce_tok, live_ce)
-                time.sleep(1)
-                pe_p2 = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "SELL", TRANCHE_2_QTY), "NFO", pe_sym, pe_tok, live_pe)
-                
-                ledger.record_trade("SELL", ce_p2, TRANCHE_2_QTY)
-                ledger.record_trade("SELL", pe_p2, TRANCHE_2_QTY)
-
-                new_total_qty = active_qty + TRANCHE_2_QTY
-                ce_avg = ((ce_avg * active_qty) + (ce_p2 * TRANCHE_2_QTY)) / new_total_qty
-                pe_avg = ((pe_avg * active_qty) + (pe_p2 * TRANCHE_2_QTY)) / new_total_qty
-                active_qty = new_total_qty
-                send_telegram_alert(f"➕ V2 TRANCHE 2 DEPLOYED (+1 Lot at 10:05 AM | Qty: {active_qty})")
-
         open_pnl = ((ce_avg - live_ce) + (pe_avg - live_pe)) * active_qty
         total_running_pnl = realized_roll_pnl + open_pnl
         net_points_captured = total_running_pnl / active_qty
@@ -343,7 +323,7 @@ def main():
             break
 
         if total_running_pnl <= -MAX_MONETARY_LOSS:
-            exit_reason = "Hard Spot SL Hit (₹12k Cap)"
+            exit_reason = "Hard Spot SL Hit (₹15k Cap)"
             break
 
         if rolled_status == "No":
@@ -402,7 +382,7 @@ def main():
     send_telegram_alert(f"🏁 V2 CLOSED | Exit: {exit_reason} | Net P&L: ₹{net_pnl:+,.2f}")
 
     log_to_v2_google_sheet([
-        today_str, datetime.datetime.now().strftime("%H:%M:%S"), "V2 Adaptive Strangle", "TRADED",
+        today_str, datetime.datetime.now().strftime("%H:%M:%S"), "V2 Adaptive Strangle (5 Lot)", "TRADED",
         round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2),
         initial_ce_sym, initial_pe_sym, round(initial_combined_premium, 2),
         ce_sym, pe_sym, active_qty, rolled_status, exit_reason,
