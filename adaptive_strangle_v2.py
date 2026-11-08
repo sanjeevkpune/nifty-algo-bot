@@ -656,9 +656,7 @@ class Bot:
             
         new_ltp = self.get_ltp_retry("NFO", contract["token"])
         new_leg = self.open_leg("SHORT_" + opt_type, opt_type, new_strike, contract, "SELL", new_ltp)
-        tg(f"🔄 {opt_type} {old_sym} rolled to {new_leg.symbol} @ ₹{new_leg.entry_px:.2f}
-"
-           f"Booked leg P&L: ₹{leg_pnl:,.2f}")
+        tg(f"🔄 {opt_type} {old_sym} rolled to {new_leg.symbol} @ ₹{new_leg.entry_px:.2f}\nBooked leg P&L: ₹{leg_pnl:,.2f}")
 
     def run(self):
         today = now_ist().date()
@@ -687,8 +685,7 @@ class Bot:
         today_str = str(today)
         ok, spot, gap_pct, orb, msg = self.check_filters()
         if not ok:
-            tg(f"⚠️ STRATEGY SKIPPED ({today_str})
-Reason: {msg}")
+            tg(f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {msg}")
             self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
                             round(spot, 2), round(gap_pct, 2), round(orb, 2), "N/A", "N/A", 0.0,
                             "N/A", "N/A", 0, "No", msg, 0.0, 0.0, 0.0])
@@ -732,16 +729,7 @@ Reason: {msg}")
         max_loss = initial_premium * MAX_PREMIUM_LOSS_PCT * self.qty
         initial_ce_sym, initial_pe_sym = short_ce.symbol, short_pe.symbol
 
-        tg(f"🟢 STRANGLE DEPLOYED ({NUM_LOTS} lots | {self.qty} qty | {now_ist():%H:%M})
-"
-           f"Expiry: {self.expiry} | Spot: {spot:.2f} | Gap {gap_pct:+.2f}% | ORB {orb:.0f} pts
-"
-           f"CE {short_ce.symbol} @ ₹{short_ce.entry_px:.2f} | PE {short_pe.symbol} @ ₹{short_pe.entry_px:.2f}
-"
-           f"Combined premium ₹{initial_premium:.2f}
-"
-           f"Hard SL: -₹{max_loss:,.0f} ({int(MAX_PREMIUM_LOSS_PCT * 100)}% of premium)")
-           
+        tg(f"🟢 STRANGLE DEPLOYED ({NUM_LOTS} lots | {self.qty} qty | {now_ist():%H:%M})\nExpiry: {self.expiry} | Spot: {spot:.2f} | Gap {gap_pct:+.2f}% | ORB {orb:.0f} pts\nCE {short_ce.symbol} @ ₹{short_ce.entry_px:.2f} | PE {short_pe.symbol} @ ₹{short_pe.entry_px:.2f}\nCombined premium ₹{initial_premium:.2f}\nHard SL: -₹{max_loss:,.0f} ({int(MAX_PREMIUM_LOSS_PCT * 100)}% of premium)")
         self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "ENTERED",
                         round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
                         round(initial_premium, 2), initial_ce_sym, initial_pe_sym, self.qty, "No",
