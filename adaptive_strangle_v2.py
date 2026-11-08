@@ -37,22 +37,18 @@ if missing_env:
     sys.exit(1)
 
 # ==========================================
-# 2. OPTIMIZED STRATEGY PARAMETERS
+# 2. FINAL OPTIMIZED PARAMETERS (V2.1 Uncapped)
 # ==========================================
 NIFTY_LOT_SIZE = 65
 TRANCHE_1_QTY = NIFTY_LOT_SIZE * 5       # Fixed 5 Lots (325 qty) at 9:50 AM
 
-# OPTIMIZED ALGO SETTINGS (Based on 11-Year Backtest)
 DELTA_WIDTH_MULTIPLIER = 1.25            # Pushed to 1.25x for wider, safer strikes
 MAX_OPENING_RANGE_PTS = 140.0            # Relaxed to 140 pts to maximize traded days & ROI
 MAX_GAP_PERCENT = 0.60                   # Kept at 0.60% to filter catastrophic overnight gaps
 
-TARGET_DECAY_POINTS = 30.0               # Standard target: 30 points combined decay
-SALVAGE_DECAY_POINTS = 12.0              # Post-roll salvage target: 12 points net decay
-MAX_MONETARY_LOSS = 15000.0              # Hard ₹15,000 gross loss ceiling for 5 lots
+MAX_PREMIUM_LOSS_PCT = 0.40              # Hard Stop-Loss: 40% expansion of combined initial premium
 
 SPOT_ROLL_BUFFER = 40.0                  # Roll tested leg if Spot comes within 40 pts
-SPOT_HARD_EXIT_BUFFER = 30.0             # Hard exit if Spot comes within 30 pts post-roll
 ROLL_DISTANCE_PTS = 100                  # Distance (pts) to roll tested leg further OTM
 
 NIFTY_SPOT_TOKEN = "99926000"
@@ -218,14 +214,14 @@ def get_filled_price(smart_client, order_id, exchange, symbol, token, fallback_l
         ob = get_order_book_dict(smart_client)
         if str(order_id) in ob:
             avg_px, status = ob[str(order_id)]
-            # Aggressive Ghost Position Protection
+            # Patch 2: Aggressive Ghost Position Protection
             if status == "rejected":
                 send_telegram_alert(f"❌ ORDER REJECTED BY BROKER: {symbol}. Check Angel One App for margin/errors.")
                 raise Exception(f"Order {order_id} rejected. Halting bot to prevent ghost positions.")
             if avg_px > 0: 
                 return avg_px
                 
-    # If the order is pending or API is slow, fallback to LTP
+    # Fallback to live LTP if order pending or API slow
     live_px = get_ltp(smart_client, exchange, symbol, token)
     return live_px if live_px and live_px > 0 else (fallback_ltp if fallback_ltp else 0.0)
 
@@ -245,8 +241,7 @@ def log_to_google_sheet(row_values):
         worksheet.append_row(row_values)
     except Exception as e:
         print(f"Failed to log to Google Sheet: {e}")
-        # Send alert if background logging fails
-        send_telegram_alert(f"⚠️ SHEET LOGGING FAILED\nTrade finished, but Google API timed out. Please log manually.\nError: {e}")
+        send_telegram_alert("⚠️ SHEET LOGGING FAILED\nTrade finished, but Google API timed out. Please log manually.")
 
 # ==========================================
 # 5. MAIN EXECUTION PIPELINE (9:50 AM ENTRY)
@@ -268,7 +263,7 @@ def main():
     if not is_safe:
         skip_alert = f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {filter_msg}"
         print(skip_alert); send_telegram_alert(skip_alert)
-        log_to_google_sheet([today_str, now_time_str, "V2 Optimized (5 Lot)", "SKIPPED", round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2), "N/A", "N/A", 0.0, "N/A", "N/A", 0, "No", filter_msg, 0.0, 0.0, 0.0])
+        log_to_google_sheet([today_str, now_time_str, "V2.1 Uncapped", "SKIPPED", round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2), "N/A", "N/A", 0.0, "N/A", "N/A", 0, "No", filter_msg, 0.0, 0.0, 0.0])
         sys.exit(0)
 
     atm_strike = round(entry_spot / 50.0) * 50
@@ -298,11 +293,15 @@ def main():
     realized_roll_pnl = 0.0
     exit_reason = "N/A"
 
+    # Calculate exact dynamic SL based on 40% of collected premium
+    max_monetary_loss = (initial_combined_premium * MAX_PREMIUM_LOSS_PCT) * active_qty
+
     send_telegram_alert(
         f"🟢 STRANGLE DEPLOYED (5 Lots | {active_qty} Qty | 9:50 AM)\n"
         f"Expiry: {expiry_str} | Spot: {entry_spot:.2f}\n"
         f"CE: {ce_sym} @ ₹{ce_avg:.2f} | PE: {pe_sym} @ ₹{pe_avg:.2f}\n"
-        f"Combined Premium: ₹{initial_combined_premium:.2f}"
+        f"Combined Premium: ₹{initial_combined_premium:.2f}\n"
+        f"Dynamic SL: -₹{max_monetary_loss:,.0f} (40% Exp)"
     )
 
     last_alert_minute = datetime.datetime.now().minute
@@ -318,69 +317,61 @@ def main():
 
         open_pnl = ((ce_avg - live_ce) + (pe_avg - live_pe)) * active_qty
         total_running_pnl = realized_roll_pnl + open_pnl
-        net_points_captured = total_running_pnl / active_qty
-        active_target_pts = TARGET_DECAY_POINTS if rolled_status == "No" else SALVAGE_DECAY_POINTS
 
         if now.minute % 30 == 0 and now.minute != last_alert_minute:
             last_alert_minute = now.minute
             send_telegram_alert(f"⏱️ UPDATE ({now.strftime('%I:%M %p')}): P&L ₹{total_running_pnl:,.2f} | Spot: {live_spot:.2f}")
 
-        # 1. Check Targets
-        if net_points_captured >= active_target_pts:
-            exit_reason = "Target (30 pts)" if rolled_status == "No" else "Rolled & Salvaged"
+        # 1. Check Hard Stop Loss (40% Premium Expansion)
+        if total_running_pnl <= -max_monetary_loss:
+            exit_reason = f"Hard SL Hit (40% Premium Loss)"
             break
 
-        # 2. Check Hard Stop Loss (₹15k)
-        if total_running_pnl <= -MAX_MONETARY_LOSS:
-            exit_reason = "Hard Spot SL Hit (₹15k Cap)"
-            break
-
-        # 3. Check Spot Roll Boundaries
+        # 2. Check Spot Roll Boundaries
         if rolled_status == "No":
             if live_spot >= (ce_strike - SPOT_ROLL_BUFFER):
                 new_ce_strike = ce_strike + ROLL_DISTANCE_PTS
                 new_ce_sym, new_ce_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_ce_strike, "CE")
                 if not new_ce_sym: break
                 
-                # Buy back losing CE and calculate loss
+                # Buy back losing CE
                 exit_ce_px = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, live_ce)
                 ledger.record_trade("BUY", exit_ce_px, active_qty)
-                booked_ce_loss = (ce_avg - exit_ce_px) * active_qty
-                realized_roll_pnl += booked_ce_loss
+                realized_roll_pnl += (ce_avg - exit_ce_px) * active_qty
+                
+                leg_loss = (ce_avg - exit_ce_px) * active_qty
+                old_ce_sym = ce_sym
 
                 # Sell new OTM CE
                 ce_avg = get_filled_price(smart, place_market_order(smart, new_ce_sym, new_ce_tok, "SELL", active_qty), "NFO", new_ce_sym, new_ce_tok, get_ltp(smart, "NFO", new_ce_sym, new_ce_tok))
                 ledger.record_trade("SELL", ce_avg, active_qty)
                 ce_strike, ce_sym, ce_tok = new_ce_strike, new_ce_sym, new_ce_tok
                 rolled_status = "Yes (Call Rolled Up)"
-                send_telegram_alert(f"🔄 CALL ROLLED UP to {ce_sym} @ ₹{ce_avg:.2f}\nBooked Leg PnL: ₹{booked_ce_loss:,.2f}")
+                send_telegram_alert(f"🔄 CALL {old_ce_sym} ROLLED UP to {ce_sym} @ ₹{ce_avg:.2f}\nBooked Leg Loss: ₹{leg_loss:,.2f}")
 
             elif live_spot <= (pe_strike + SPOT_ROLL_BUFFER):
                 new_pe_strike = pe_strike - ROLL_DISTANCE_PTS
                 new_pe_sym, new_pe_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_pe_strike, "PE")
                 if not new_pe_sym: break
 
-                # Buy back losing PE and calculate loss
+                # Buy back losing PE
                 exit_pe_px = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "BUY", active_qty), "NFO", pe_sym, pe_tok, live_pe)
                 ledger.record_trade("BUY", exit_pe_px, active_qty)
-                booked_pe_loss = (pe_avg - exit_pe_px) * active_qty
-                realized_roll_pnl += booked_pe_loss
+                realized_roll_pnl += (pe_avg - exit_pe_px) * active_qty
+                
+                leg_loss = (pe_avg - exit_pe_px) * active_qty
+                old_pe_sym = pe_sym
 
                 # Sell new OTM PE
                 pe_avg = get_filled_price(smart, place_market_order(smart, new_pe_sym, new_pe_tok, "SELL", active_qty), "NFO", new_pe_sym, new_pe_tok, get_ltp(smart, "NFO", new_pe_sym, new_pe_tok))
                 ledger.record_trade("SELL", pe_avg, active_qty)
                 pe_strike, pe_sym, pe_tok = new_pe_strike, new_pe_sym, new_pe_tok
                 rolled_status = "Yes (Put Rolled Down)"
-                send_telegram_alert(f"🔄 PUT ROLLED DOWN to {pe_sym} @ ₹{pe_avg:.2f}\nBooked Leg PnL: ₹{booked_pe_loss:,.2f}")
-        else:
-            # Post-Roll hard exit boundary check
-            if live_spot >= (ce_strike - SPOT_HARD_EXIT_BUFFER) or live_spot <= (pe_strike + SPOT_HARD_EXIT_BUFFER):
-                exit_reason = "Hard Spot SL Hit (Boundary Breached)"
-                break
+                send_telegram_alert(f"🔄 PUT {old_pe_sym} ROLLED DOWN to {pe_sym} @ ₹{pe_avg:.2f}\nBooked Leg Loss: ₹{leg_loss:,.2f}")
 
-        # 4. Check Time Exit (3:10 PM)
+        # 3. Check Time Exit (Hold till 3:10 PM for Uncapped Theta)
         if now.hour > 15 or (now.hour == 15 and now.minute >= 10):
-            exit_reason = "Time Exit (3:10 PM)" if rolled_status == "No" else "Rolled & Salvaged (3:10 PM)"
+            exit_reason = "Time Exit (3:10 PM)" if rolled_status == "No" else "Rolled & Time Exit (3:10 PM)"
             break
 
         time.sleep(2)
@@ -401,14 +392,14 @@ def main():
     send_telegram_alert(f"🏁 BOT CLOSED | Exit: {exit_reason} | Net P&L: ₹{net_pnl:+,.2f}")
 
     log_to_google_sheet([
-        today_str, datetime.datetime.now().strftime("%H:%M:%S"), "V2 Optimized (5 Lot)", "TRADED",
+        today_str, datetime.datetime.now().strftime("%H:%M:%S"), "V2.1 Uncapped", "TRADED",
         round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2),
         initial_ce_sym, initial_pe_sym, round(initial_combined_premium, 2),
         ce_sym, pe_sym, active_qty, rolled_status, exit_reason,
         round(gross_pnl, 2), round(total_charges, 2), round(net_pnl, 2)
     ])
 
-# Global Catch-All with Telegram SOS
+# Patch 1: Global Catch-All with Telegram SOS
 if __name__ == "__main__":
     try:
         main()
