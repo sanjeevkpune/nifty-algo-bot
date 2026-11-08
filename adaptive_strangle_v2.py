@@ -1,410 +1,852 @@
+#!/usr/bin/env python3
+"""
+adaptive_strangle_v3.py  --  Nifty intraday short strangle bot for Angel One SmartAPI
+
+Changes vs v2.1
+---------------
+* All times in IST (Asia/Kolkata) regardless of server timezone
+* Orders are CONFIRMED (order book polled) before a fill is recorded; failed/rejected
+  orders raise instead of being treated as filled
+* emergency_square_off() closes every position this bot touched (called on any crash)
+* Expiry is config driven (EXPIRY_MODE = CURRENT | NEXT)
+* Lot size read from the scrip master
+* Optional limit-then-market execution to reduce slippage
+* One batched LTP call per loop; data-feed-loss watchdog (alert, then forced exit)
+* Paper-trade mode (default ON) -- logs what it WOULD do, places no orders
+* Late-start / holiday / stale-quote protection, margin check, run lock file
+* Per-side roll cap (configurable) and no more silent "N/A" exit reasons
+
+V3.2 Fixes (No Ghost Positions / Fixed Gap / No Hedges / Market Orders)
+---------------
+* Removed Hedge logic entirely to prevent roll-inversion margin spikes
+* Gap filter now explicitly uses the Previous Day Close via getMarketData("FULL") instead of the live Close
+* ORDER_MODE defaults to MARKET to prevent orderBook polling deadlocks during the 9:50 AM rush
+* Before EVERY exit order the broker's position book is read; the bot only trades what is
+  actually open (already-closed legs are skipped, partial quantities are respected)
+* Pending/open orders on the bot's symbols are cancelled before exit and after it
+* After the 3:10 PM square-off the account is verified FLAT
+"""
 import sys
 import os
 import time
-import datetime
-import urllib.request
 import json
+import datetime
+import traceback
+import urllib.request
+from dataclasses import dataclass
+from typing import Optional, Dict, List
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import pyotp
 import requests
 import gspread
-import traceback
 from SmartApi import SmartConnect
 
+IST = ZoneInfo("Asia/Kolkata")
+
+def now_ist() -> datetime.datetime:
+    return datetime.datetime.now(IST)
+
+def at_ist(date: datetime.date, hour: int, minute: int) -> datetime.datetime:
+    return datetime.datetime.combine(date, datetime.time(hour, minute), tzinfo=IST)
+
 # ==========================================
-# 1. DYNAMIC CONFIGURATION (FROM GITHUB SECRETS / ENV)
+# 1. CONFIGURATION
 # ==========================================
+def env_bool(name, default):
+    v = os.environ.get(name)
+    return default if v is None else v.strip().lower() in ("1", "true", "yes", "y")
+
+def env_float(name, default):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, "") else default
+
+def env_int(name, default):
+    v = os.environ.get(name)
+    return int(v) if v not in (None, "") else default
+
 API_KEY = os.environ.get("API_KEY")
 CLIENT_CODE = os.environ.get("CLIENT_CODE")
 PIN = os.environ.get("PIN")
 TOTP_SECRET = os.environ.get("TOTP_SECRET")
-
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
 GSHEET_ID_V2 = os.environ.get("GSHEET_ID_V2")
-SERVICE_ACCOUNT_FILE = "service_account.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
 
-# Validate that critical env variables exist
-missing_env = [var for var, val in {
-    "API_KEY": API_KEY, "CLIENT_CODE": CLIENT_CODE, "PIN": PIN, 
-    "TOTP_SECRET": TOTP_SECRET, "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, 
-    "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID, "GSHEET_ID_V2": GSHEET_ID_V2
-}.items() if not val]
-
+missing_env = [k for k, v in {
+    "API_KEY": API_KEY, "CLIENT_CODE": CLIENT_CODE, "PIN": PIN, "TOTP_SECRET": TOTP_SECRET,
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    "GSHEET_ID_V2": GSHEET_ID_V2,
+}.items() if not v]
 if missing_env:
-    print(f"🚨 CRITICAL ERROR: Missing required environment variables/secrets: {', '.join(missing_env)}")
+    print(f"CRITICAL: missing environment variables: {', '.join(missing_env)}")
     sys.exit(1)
 
-# ==========================================
-# 2. FINAL OPTIMIZED PARAMETERS (V2.1 Uncapped)
-# ==========================================
-NIFTY_LOT_SIZE = 65
-TRANCHE_1_QTY = NIFTY_LOT_SIZE * 5       # Fixed 5 Lots (325 qty) at 9:50 AM
+STRATEGY_VERSION = "V3.2"
 
-DELTA_WIDTH_MULTIPLIER = 1.25            # Pushed to 1.25x for wider, safer strikes
-MAX_OPENING_RANGE_PTS = 140.0            # Relaxed to 140 pts to maximize traded days & ROI
-MAX_GAP_PERCENT = 0.60                   # Kept at 0.60% to filter catastrophic overnight gaps
+# --- Mode -------------------------------------------------------------
+PAPER_MODE = env_bool("PAPER_MODE", True)          # SAFE DEFAULT: no real orders
+PAPER_SLIPPAGE_PTS = env_float("PAPER_SLIPPAGE_PTS", 0.5)
 
-MAX_PREMIUM_LOSS_PCT = 0.40              # Hard Stop-Loss: 40% expansion of combined initial premium
+# --- Strategy rules ---------------------------------------------------
+NUM_LOTS = env_int("NUM_LOTS", 5)
+FALLBACK_LOT_SIZE = env_int("FALLBACK_LOT_SIZE", 65)
+ENTRY_HOUR, ENTRY_MIN = 9, 50
+ENTRY_GRACE_MIN = env_int("ENTRY_GRACE_MIN", 5)
+EXIT_HOUR, EXIT_MIN = 15, 10
 
-SPOT_ROLL_BUFFER = 40.0                  # Roll tested leg if Spot comes within 40 pts
-ROLL_DISTANCE_PTS = 100                  # Distance (pts) to roll tested leg further OTM
+DELTA_WIDTH_MULTIPLIER = env_float("DELTA_WIDTH_MULTIPLIER", 1.25)
+MAX_OPENING_RANGE_PTS = env_float("MAX_OPENING_RANGE_PTS", 140.0)
+MAX_GAP_PERCENT = env_float("MAX_GAP_PERCENT", 0.60)
+MAX_PREMIUM_LOSS_PCT = env_float("MAX_PREMIUM_LOSS_PCT", 0.40)
+SPOT_ROLL_BUFFER = env_float("SPOT_ROLL_BUFFER", 40.0)
+ROLL_DISTANCE_PTS = env_int("ROLL_DISTANCE_PTS", 100)
+MAX_ROLLS_PER_SIDE = env_int("MAX_ROLLS_PER_SIDE", 1)
+
+EXPIRY_MODE = os.environ.get("EXPIRY_MODE", "NEXT").upper()
+
+# --- Execution --------------------------------------------------------
+ORDER_MODE = os.environ.get("ORDER_MODE", "MARKET").upper()  # Defaulted to MARKET for speed & reliability
+MARKET_WAIT_SECS = env_int("MARKET_WAIT_SECS", 15)
+ORDER_POLL_SECS = 1.0
+
+# --- Monitoring -------------------------------------------------------
+POLL_SECS = env_float("POLL_SECS", 1.5)
+DATA_FAIL_ALERT_SECS = env_int("DATA_FAIL_ALERT_SECS", 15)
+DATA_FAIL_EXIT_SECS = env_int("DATA_FAIL_EXIT_SECS", 60)
+
+# --- Safety -----------------------------------------------------------
+MIN_REQUIRED_MARGIN = env_float("MIN_REQUIRED_MARGIN", 0.0)
+HOLIDAYS = {d.strip() for d in os.environ.get("MARKET_HOLIDAYS", "").split(",") if d.strip()}
+
+# --- Charges (VERIFY against current Angel One / exchange schedules) ---
+BROKERAGE_PER_ORDER = env_float("BROKERAGE_PER_ORDER", 20.0)
+STT_SELL_PCT = env_float("STT_SELL_PCT", 0.0015)
+EXCHANGE_PCT = env_float("EXCHANGE_PCT", 0.000355299)
+SEBI_PCT = 0.000001
+GST_PCT = 0.18
+STAMP_BUY_PCT = 0.00003
+
+# --- Exit verification --------------------------------------------------
+EXIT_BLIND_IF_POSITIONS_UNAVAILABLE = env_bool("EXIT_BLIND_IF_POSITIONS_UNAVAILABLE", False)
+POSITION_READ_TRIES = env_int("POSITION_READ_TRIES", 4)
+FLAT_VERIFY_ROUNDS = env_int("FLAT_VERIFY_ROUNDS", 3)
 
 NIFTY_SPOT_TOKEN = "99926000"
+TERMINAL_STATES = {"complete", "rejected", "cancelled", "canceled"}
+
+class OrderError(Exception):
+    pass
 
 # ==========================================
-# 3. ORDER & TURNOVER LEDGER
+# 2. HELPERS
 # ==========================================
+def tg(message: str):
+    tag = "[PAPER] " if PAPER_MODE else ""
+    print(f"{tag}{message}")
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{tag}{message}"}, timeout=5)
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+def wait_until(target: datetime.datetime):
+    while True:
+        remaining = (target - now_ist()).total_seconds()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 1.0))
+
 class OrderLedger:
     def __init__(self):
         self.sell_turnover = 0.0
         self.buy_turnover = 0.0
-        self.executed_orders = 0
+        self.orders = 0
 
-    def record_trade(self, side, price, qty):
-        turnover = float(price) * int(qty)
+    def record(self, side, price, qty):
+        t = float(price) * int(qty)
         if side.upper() == "SELL":
-            self.sell_turnover += turnover
-        elif side.upper() == "BUY":
-            self.buy_turnover += turnover
-        self.executed_orders += 1
+            self.sell_turnover += t
+        else:
+            self.buy_turnover += t
+        self.orders += 1
 
-    def calculate_charges(self):
-        total_turnover = self.sell_turnover + self.buy_turnover
-        brokerage = self.executed_orders * 20.00
-        stt = self.sell_turnover * 0.0015
-        exchange_charges = total_turnover * 0.000355299
-        sebi_fee = total_turnover * 0.000001
-        gst = (brokerage + exchange_charges + sebi_fee) * 0.18
-        stamp_duty = self.buy_turnover * 0.00003
-        return brokerage + stt + exchange_charges + sebi_fee + gst + stamp_duty
+    def charges(self):
+        total = self.sell_turnover + self.buy_turnover
+        brokerage = self.orders * BROKERAGE_PER_ORDER
+        stt = self.sell_turnover * STT_SELL_PCT
+        exch = total * EXCHANGE_PCT
+        sebi = total * SEBI_PCT
+        gst = (brokerage + exch + sebi) * GST_PCT
+        stamp = self.buy_turnover * STAMP_BUY_PCT
+        return brokerage + stt + exch + sebi + gst + stamp
 
-ledger = OrderLedger()
+@dataclass
+class Leg:
+    role: str
+    opt_type: str
+    strike: int
+    symbol: str
+    token: str
+    side: str
+    qty: int
+    entry_px: float
+    active: bool = True
+    exit_px: float = 0.0
 
 # ==========================================
-# 4. CORE HELPER FUNCTIONS
+# 3. BOT
 # ==========================================
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=5)
-    except Exception as e:
-        print(f"Telegram alert error: {e}")
+class Bot:
+    def __init__(self):
+        self.smart: Optional[SmartConnect] = None
+        self.options_df: Optional[pd.DataFrame] = None
+        self.expiry: Optional[datetime.date] = None
+        self.legs: List[Leg] = []
+        self.traded_symbols = set()
+        self.realized = 0.0
+        self.ledger = OrderLedger()
+        self.rolls = {"CE": 0, "PE": 0}
+        self.qty = 0
+        self.last_q: Dict[str, float] = {}
+        self.lock_path = ""
 
-def init_smartapi_session():
-    smart_client = SmartConnect(api_key=API_KEY)
-    for attempt in range(1, 4):
+    def login(self):
+        self.smart = SmartConnect(api_key=API_KEY)
+        for attempt in range(1, 4):
+            try:
+                res = self.smart.generateSession(CLIENT_CODE, PIN, pyotp.TOTP(TOTP_SECRET).now())
+                if res and res.get("status"):
+                    print("SmartAPI session authenticated.")
+                    return
+                print(f"Session attempt {attempt} rejected: {res}")
+            except Exception as e:
+                print(f"Session error attempt {attempt}: {e}")
+            time.sleep(3)
+        raise RuntimeError("Angel One authentication failed after 3 attempts.")
+
+    def load_master(self):
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        last_err = None
+        for _ in range(3):
+            try:
+                data = json.loads(urllib.request.urlopen(url, timeout=30).read())
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(3)
+        else:
+            raise RuntimeError(f"Could not download scrip master: {last_err}")
+        df = pd.DataFrame(data)
+        df = df[(df["name"] == "NIFTY") & (df["instrumenttype"] == "OPTIDX")].copy()
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce") / 100.0
+        df["expirydate"] = pd.to_datetime(df["expiry"], format="%d%b%Y", errors="coerce").dt.date
+        df["lotsize"] = pd.to_numeric(df["lotsize"], errors="coerce")
+        today = now_ist().date()
+        self.options_df = df[df["expirydate"] >= today].copy()
+        expiries = sorted(self.options_df["expirydate"].dropna().unique())
+        if not expiries:
+            raise RuntimeError("No Nifty option expiries found in scrip master.")
+        idx = 1 if (EXPIRY_MODE == "NEXT" and len(expiries) > 1) else 0
+        self.expiry = expiries[idx]
+
+    def find_contract(self, strike, opt_type) -> Optional[Dict]:
+        df = self.options_df
+        m = df[(df["expirydate"] == self.expiry) & (df["strike"] == float(strike)) &
+               (df["symbol"].str.endswith(opt_type))]
+        if m.empty:
+            return None
+        row = m.iloc[0]
+        lot = int(row["lotsize"]) if pd.notna(row["lotsize"]) and row["lotsize"] > 0 else FALLBACK_LOT_SIZE
+        return {"symbol": str(row["symbol"]), "token": str(row["token"]), "lotsize": lot}
+
+    def get_ltps(self, request: Dict[str, List[str]]) -> Dict[str, float]:
         try:
-            totp_code = pyotp.TOTP(TOTP_SECRET).now()
-            res = smart_client.generateSession(CLIENT_CODE, PIN, totp_code)
-            if res and res.get("status"):
-                print("SmartAPI Session authenticated successfully.")
-                return smart_client
-            print(f"Session attempt {attempt} rejected: {res}")
-        except Exception as e:
-            print(f"Session error on attempt {attempt}: {e}")
-        time.sleep(3)
-    send_telegram_alert("🚨 CRITICAL ERROR: Angel One authentication failed after 3 attempts.")
-    sys.exit(1)
-
-def wait_for_market_time(target_hour, target_minute):
-    while True:
-        now = datetime.datetime.now()
-        target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-        remaining = (target - now).total_seconds()
-        if remaining <= 0:
-            break
-        time.sleep(min(remaining, 1.0))
-
-def get_nifty_options_master():
-    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    data = json.loads(urllib.request.urlopen(url, timeout=15).read())
-    df = pd.DataFrame(data)
-    nifty_opt = df[(df['name'] == 'NIFTY') & (df['instrumenttype'] == 'OPTIDX')].copy()
-    nifty_opt['strike'] = pd.to_numeric(nifty_opt['strike'], errors='coerce') / 100.0
-    nifty_opt['expirydate'] = pd.to_datetime(nifty_opt['expiry'], format='%d%b%Y', errors='coerce').dt.date
-    today = datetime.date.today()
-    return nifty_opt[nifty_opt['expirydate'] >= today].copy()
-
-def get_next_expiry(df):
-    unique_expiries = sorted(df['expirydate'].dropna().unique())
-    return unique_expiries[1] if len(unique_expiries) > 1 else unique_expiries[0]
-
-def get_contract_by_expiry_and_strike(df, expiry_date, strike, opt_type):
-    contracts = df[(df['expirydate'] == expiry_date) & (df['strike'] == float(strike)) & (df['symbol'].str.endswith(opt_type))]
-    if not contracts.empty:
-        return str(contracts.iloc[0]['symbol']), str(contracts.iloc[0]['token'])
-    return None, None
-
-def get_ltp(smart_client, exchange, symbol, token, retries=3):
-    for attempt in range(retries):
-        try:
-            res = smart_client.ltpData(exchange, symbol, str(token))
+            res = self.smart.getMarketData("LTP", request)
             if res and res.get("status") and res.get("data"):
-                ltp = float(res["data"].get("ltp", 0.0))
-                if ltp > 0: return ltp
-        except Exception:
-            pass
-        time.sleep(0.4 * (attempt + 1))
-    return None
+                out = {}
+                for q in res["data"].get("fetched", []):
+                    p = float(q.get("ltp", 0) or 0)
+                    if p > 0:
+                        out[str(q.get("symbolToken"))] = p
+                return out
+        except Exception as e:
+            print(f"LTP fetch error: {e}")
+        return {}
 
-def get_nifty_spot_ohlc(smart_client):
-    for tok in [NIFTY_SPOT_TOKEN, "26000"]:
+    def get_ltp_retry(self, exch, token, tries=3) -> Optional[float]:
+        for i in range(tries):
+            v = self.get_ltps({exch: [str(token)]}).get(str(token))
+            if v:
+                return v
+            time.sleep(0.5 * (i + 1))
+        return None
+
+    def spot_ohlc(self) -> Optional[Dict]:
+        for tok in (NIFTY_SPOT_TOKEN, "26000"):
+            try:
+                res = self.smart.getMarketData("FULL", {"NSE": [tok]})
+                if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
+                    q = res["data"]["fetched"][0]
+                    trade_date = None
+                    try:
+                        trade_date = datetime.datetime.strptime(
+                            str(q.get("exchTradeTime", "")), "%d-%b-%Y %H:%M:%S").date()
+                    except Exception:
+                        pass
+                    # FIX: Safely parse previousClose or fallback to live close
+                    pc = float(q.get("previousClose", 0) or q.get("pc", 0) or q.get("close", 0) or 0)
+                    return {"ltp": float(q.get("ltp", 0) or 0), "open": float(q.get("open", 0) or 0),
+                            "high": float(q.get("high", 0) or 0), "low": float(q.get("low", 0) or 0),
+                            "close": pc, "trade_date": trade_date}
+            except Exception as e:
+                print(f"OHLC error ({tok}): {e}")
+        return None
+
+    def check_filters(self):
+        o = self.spot_ohlc()
+        if not o or o["ltp"] <= 0 or o["open"] <= 0 or o["close"] <= 0:
+            return False, 0.0, 0.0, 0.0, "No valid Nifty OHLC (holiday / market closed / data issue)."
+        if o["trade_date"] and o["trade_date"] != now_ist().date():
+            return False, o["ltp"], 0.0, 0.0, "Stale quote date - market likely closed today (holiday?)."
+        
+        # FIX: Gap calculated against Previous Day Close
+        gap_pct = (o["open"] - o["close"]) / o["close"] * 100.0     
+        orb = o["high"] - o["low"]
+        
+        if abs(gap_pct) > MAX_GAP_PERCENT:
+            return False, o["ltp"], gap_pct, orb, f"Opening gap {gap_pct:+.2f}% exceeds {MAX_GAP_PERCENT}%."
+        if orb > MAX_OPENING_RANGE_PTS:
+            return False, o["ltp"], gap_pct, orb, f"9:15-9:50 range {orb:.1f} pts exceeds {MAX_OPENING_RANGE_PTS} pts."
+        return True, o["ltp"], gap_pct, orb, "PASSED"
+
+    def check_margin(self):
+        if PAPER_MODE or MIN_REQUIRED_MARGIN <= 0:
+            return True, "skipped"
         try:
-            res = smart_client.getMarketData("FULL", {"NSE": [tok]})
-            if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
-                q = res["data"]["fetched"][0]
-                return {"ltp": float(q.get("ltp", 0)), "open": float(q.get("open", 0)), "high": float(q.get("high", 0)), "low": float(q.get("low", 0)), "close": float(q.get("close", 0))}
-        except Exception:
-            pass
-    return None
+            res = self.smart.rmsLimit()
+            data = res.get("data") or {}
+            avail = float(data.get("net") or data.get("availablecash") or 0)
+            return avail >= MIN_REQUIRED_MARGIN, f"available ₹{avail:,.0f} vs required ₹{MIN_REQUIRED_MARGIN:,.0f}"
+        except Exception as e:
+            return False, f"margin check failed: {e}"
 
-def check_market_filters(smart_client):
-    ohlc = get_nifty_spot_ohlc(smart_client)
-    if not ohlc or ohlc["ltp"] <= 0:
-        return False, 0.0, 0.0, 0.0, "Unable to fetch Nifty Spot OHLC data at 9:50 AM."
+    @staticmethod
+    def _status(info) -> str:
+        return str((info or {}).get("orderstatus") or (info or {}).get("status") or "").lower()
 
-    spot = ohlc["ltp"]
-    prev_close = ohlc["close"] if ohlc["close"] > 0 else spot
-    day_high = ohlc["high"] if ohlc["high"] > 0 else spot
-    day_low = ohlc["low"] if ohlc["low"] > 0 else spot
-
-    gap_pct = ((spot - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
-    opening_range = day_high - day_low
-
-    if abs(gap_pct) > MAX_GAP_PERCENT:
-        return False, spot, gap_pct, opening_range, f"Overnight Gap ({gap_pct:+.2f}%) exceeds {MAX_GAP_PERCENT}% limit."
-    if opening_range > MAX_OPENING_RANGE_PTS:
-        return False, spot, gap_pct, opening_range, f"9:15-9:50 Range ({opening_range:.2f} pts) exceeds {MAX_OPENING_RANGE_PTS} pt limit."
-    return True, spot, gap_pct, opening_range, "PASSED"
-
-def place_market_order(smart_client, symbol, token, side, qty):
-    if not symbol or not token or qty <= 0: return None
-    order_params = {
-        "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": str(token),
-        "transactiontype": side.upper(), "exchange": "NFO", "ordertype": "MARKET",
-        "producttype": "INTRADAY", "duration": "DAY", "quantity": int(qty)
-    }
-    for _ in range(3):
+    def _order_info(self, order_id) -> Optional[Dict]:
         try:
-            res = smart_client.placeOrder(order_params)
-            if isinstance(res, str) and res.strip(): return res.strip()
-            elif isinstance(res, dict) and res.get("status"):
-                data = res.get("data")
-                return data if isinstance(data, str) else str(data.get("orderid"))
+            ob = self.smart.orderBook()
+            if ob and ob.get("status") and ob.get("data"):
+                for o in ob["data"]:
+                    if str(o.get("orderid", "")) == str(order_id):
+                        return o
+        except Exception as e:
+            print(f"orderBook error: {e}")
+        return None
+
+    def _wait_terminal(self, order_id, timeout) -> Optional[Dict]:
+        deadline = time.time() + timeout
+        info = None
+        while time.time() < deadline:
+            time.sleep(ORDER_POLL_SECS)
+            info = self._order_info(order_id) or info
+            if self._status(info) in TERMINAL_STATES:
+                return info
+        return info
+
+    def _place(self, symbol, token, side, qty, ordertype, price=0.0) -> str:
+        params = {
+            "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": str(token),
+            "transactiontype": side.upper(), "exchange": "NFO", "ordertype": ordertype,
+            "producttype": "INTRADAY", "duration": "DAY", "price": str(price),
+            "squareoff": "0", "stoploss": "0", "quantity": int(qty),
+        }
+        self.traded_symbols.add(symbol)
+        for attempt in range(2):
+            try:
+                res = self.smart.placeOrder(params)
+            except Exception as e:
+                raise OrderError(f"placeOrder exception for {symbol}: {e}")
+            if isinstance(res, str) and res.strip():
+                return res.strip()
+            if isinstance(res, dict):
+                if res.get("status") and res.get("data"):
+                    d = res["data"]
+                    return d if isinstance(d, str) else str(d.get("orderid"))
+                print(f"Order not accepted (attempt {attempt + 1}): {res}")
+                time.sleep(0.5)
+                continue
+            raise OrderError(f"Ambiguous placeOrder response for {symbol}: {res!r}")
+        raise OrderError(f"Broker did not accept {side} {symbol}")
+
+    def execute(self, symbol, token, side, qty, ref_ltp=None, force_market=False) -> float:
+        side = side.upper()
+        if PAPER_MODE:
+            px = ref_ltp or self.get_ltp_retry("NFO", token)
+            if not px:
+                raise OrderError(f"[paper] no price for {symbol}")
+            fill = px + PAPER_SLIPPAGE_PTS if side == "BUY" else max(0.05, px - PAPER_SLIPPAGE_PTS)
+            self.traded_symbols.add(symbol)
+            print(f"[paper] {side} {qty} {symbol} @ {fill:.2f}")
+            return round(fill, 2)
+
+        # FIX: Always force MARKET orders to prevent orderbook polling deadlock
+        oid2 = self._place(symbol, token, side, qty, "MARKET", 0)
+        info2 = self._wait_terminal(oid2, MARKET_WAIT_SECS)
+        st2 = self._status(info2)
+        
+        if st2 == "rejected":
+            tg(f"❌ ORDER REJECTED: {side} {symbol} - {(info2 or {}).get('text', '')}")
+            raise OrderError(f"{symbol} market order rejected")
+        if st2 != "complete":
+            raise OrderError(f"{symbol} market order not confirmed (status={st2 or 'unknown'})")
+            
+        avg2 = float(info2.get("averageprice") or 0)
+        if avg2 <= 0:
+            avg2 = ref_ltp or 0.0
+            
+        return avg2
+
+    def open_leg(self, role, opt_type, strike, contract, side, ref_ltp) -> Leg:
+        px = self.execute(contract["symbol"], contract["token"], side, self.qty, ref_ltp)
+        self.ledger.record(side, px, self.qty)
+        leg = Leg(role, opt_type, int(strike), contract["symbol"], contract["token"], side, self.qty, px)
+        self.legs.append(leg)
+        self.save_state()
+        return leg
+
+    @staticmethod
+    def _is_terminal(status: str) -> bool:
+        return status in TERMINAL_STATES
+
+    def get_net_positions(self, tries=None) -> Optional[Dict[str, int]]:
+        tries = tries or POSITION_READ_TRIES
+        for i in range(tries):
+            try:
+                res = self.smart.position()
+                if res and res.get("status"):
+                    out: Dict[str, int] = {}
+                    for p in (res.get("data") or []):
+                        sym = p.get("tradingsymbol")
+                        if p.get("exchange") != "NFO" or sym not in self.traded_symbols:
+                            continue
+                        if str(p.get("producttype") or "INTRADAY").upper() != "INTRADAY":
+                            continue
+                        out[sym] = out.get(sym, 0) + int(float(p.get("netqty", 0) or 0))
+                    return out
+                print(f"position() not ok (try {i + 1}): {res}")
+            except Exception as e:
+                print(f"position() error (try {i + 1}): {e}")
+            time.sleep(0.7 * (i + 1))
+        return None
+
+    def open_orders(self) -> Optional[List[Dict]]:
+        try:
+            ob = self.smart.orderBook()
+            if not ob or not ob.get("status"):
+                return None
+            return [o for o in (ob.get("data") or [])
+                    if o.get("tradingsymbol") in self.traded_symbols
+                    and not self._is_terminal(self._status(o))]
+        except Exception as e:
+            print(f"orderBook error: {e}")
+            return None
+
+    def cancel_pending_orders(self, reason="") -> int:
+        if PAPER_MODE:
+            return 0
+        pend = self.open_orders()
+        if pend is None:
+            tg("⚠️ Could not read order book to cancel pending orders. Check Angel One for open orders.")
+            return 0
+        cancelled = 0
+        for o in pend:
+            try:
+                self.smart.cancelOrder(o.get("orderid"), o.get("variety") or "NORMAL")
+                cancelled += 1
+                print(f"Cancelled pending order {o.get('orderid')} {o.get('tradingsymbol')} "
+                      f"({self._status(o)}) {reason}")
+            except Exception as e:
+                print(f"Cancel failed for {o.get('orderid')}: {e}")
+        if cancelled:
+            tg(f"🧹 Cancelled {cancelled} pending order(s) {reason}".strip())
+        return cancelled
+
+    def close_leg(self, leg: Leg, ref_ltp, force_market=False):
+        expected = -leg.qty if leg.side == "SELL" else leg.qty
+        close_side = "BUY" if leg.side == "SELL" else "SELL"
+        qty_to_close = leg.qty
+        status = "closed"
+
+        if not PAPER_MODE:
+            self.cancel_pending_orders(f"before exiting {leg.symbol}")
+            net = self.get_net_positions()
+            if net is None:
+                msg = f"Cannot read broker positions - NOT sending exit for {leg.symbol}"
+                tg(f"🚨 {msg}. CHECK AND CLOSE MANUALLY IF STILL OPEN.")
+                if not EXIT_BLIND_IF_POSITIONS_UNAVAILABLE:
+                    raise OrderError(msg)
+                tg("⚠️ EXIT_BLIND_IF_POSITIONS_UNAVAILABLE=1: trading on the bot's own records.")
+            else:
+                actual = net.get(leg.symbol, 0)
+                if actual == 0:
+                    leg.active, status = False, "already_flat"
+                    px = ref_ltp or leg.entry_px
+                    leg.exit_px = px
+                    pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * leg.qty
+                    self.realized += pnl
+                    self.save_state()
+                    tg(f"ℹ️ {leg.symbol} is already flat at the broker - no order sent.")
+                    return pnl, status
+                if (actual < 0) != (expected < 0):
+                    msg = (f"{leg.symbol}: broker net qty {actual} has the OPPOSITE direction to the "
+                           f"bot's record ({expected}). No order sent.")
+                    tg(f"🚨 {msg} CHECK MANUALLY.")
+                    raise OrderError(msg)
+                if abs(actual) != abs(expected):
+                    tg(f"⚠️ {leg.symbol}: broker net qty {actual} differs from bot record {expected}. "
+                       f"Closing the broker quantity ({abs(actual)}).")
+                    qty_to_close, status = abs(actual), "partial"
+
+        px = self.execute(leg.symbol, leg.token, close_side, qty_to_close, ref_ltp, force_market)
+        self.ledger.record(close_side, px, qty_to_close)
+        leg.exit_px, leg.active = px, False
+        pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * qty_to_close
+        self.realized += pnl
+        self.save_state()
+        return pnl, status
+
+    def verify_flat(self) -> bool:
+        if PAPER_MODE:
+            return True
+        for rnd in range(1, FLAT_VERIFY_ROUNDS + 1):
+            time.sleep(2)
+            self.cancel_pending_orders(f"(post-exit check, round {rnd})")
+            net = self.get_net_positions()
+            leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
+            pend = self.open_orders()
+            if leftover == {} and pend == []:
+                tg("✅ VERIFIED FLAT: no open positions or pending orders on the bot's symbols.")
+                return True
+            if leftover is None or pend is None:
+                print(f"verify_flat round {rnd}: could not read positions/orders")
+                continue
+            if leftover:
+                tg(f"⚠️ Round {rnd}: still open after exit: {leftover}. Closing again.")
+                self.emergency_square_off(f"post-exit leftovers {leftover}")
+        net = self.get_net_positions()
+        pend = self.open_orders()
+        leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
+        tg(f"🚨🚨 NOT VERIFIED FLAT after {FLAT_VERIFY_ROUNDS} rounds.
+"
+           f"Positions: {leftover if leftover is not None else 'UNREADABLE'}
+"
+           f"Pending orders: {len(pend) if pend is not None else 'UNREADABLE'}
+"
+           f"OPEN ANGEL ONE AND CLOSE / CANCEL MANUALLY NOW.")
+        return False
+
+    def active(self, role=None) -> List[Leg]:
+        return [l for l in self.legs if l.active and (role is None or l.role == role)]
+
+    def emergency_square_off(self, reason=""):
+        if PAPER_MODE:
+            tg(f"🛑 [paper] emergency square-off triggered: {reason}")
+            return
+        tg(f"🛑 EMERGENCY SQUARE-OFF: {reason}")
+        self.cancel_pending_orders("before emergency square-off")
+        positions = None
+        for i in range(POSITION_READ_TRIES):
+            try:
+                res = self.smart.position()
+                if res and res.get("status"):
+                    positions = res.get("data") or []
+                    break
+            except Exception as e:
+                print(f"position() error (try {i + 1}): {e}")
+            time.sleep(0.7 * (i + 1))
+        if positions is None:
+            tg("🚨 Could not read positions. CLOSE POSITIONS MANUALLY IN ANGEL ONE NOW.")
+            return
+        todo = []
+        for p in positions:
+            if p.get("exchange") != "NFO" or p.get("tradingsymbol") not in self.traded_symbols:
+                continue
+            if str(p.get("producttype") or "INTRADAY").upper() != "INTRADAY":
+                continue
+            net = int(float(p.get("netqty", 0) or 0))
+            if net != 0:
+                todo.append((0 if net < 0 else 1, p["tradingsymbol"], str(p["symboltoken"]), net))
+        todo.sort()
+        failed = []
+        for _, sym, tok, net in todo:
+            side = "BUY" if net < 0 else "SELL"
+            try:
+                oid = self._place(sym, tok, side, abs(net), "MARKET", 0)
+                info = self._wait_terminal(oid, MARKET_WAIT_SECS)
+                if self._status(info) != "complete":
+                    failed.append(sym)
+            except Exception as e:
+                print(f"Emergency close failed for {sym}: {e}")
+                failed.append(sym)
+        if failed:
+            tg(f"🚨 STILL OPEN after emergency exit: {', '.join(failed)}. CLOSE MANUALLY NOW.")
+        else:
+            tg(f"✅ Emergency square-off complete ({len(todo)} positions closed).")
+
+    def save_state(self):
+        if not self.lock_path:
+            return
+        try:
+            with open(self.lock_path, "w") as f:
+                json.dump({"paper": PAPER_MODE, "expiry": str(self.expiry), "realized": self.realized,
+                           "legs": [l.__dict__ for l in self.legs]}, f, indent=1)
+        except Exception as e:
+            print(f"State save failed: {e}")
+
+    def log_sheet(self, row):
+        headers = ["Date", "Timestamp", "Strategy_Version", "Session_Status", "Nifty_Spot_950", "Gap_Pct",
+                   "ORB_915_950_Pts", "Initial_CE_Symbol", "Initial_PE_Symbol", "Initial_Combined_Premium",
+                   "Final_CE_Symbol", "Final_PE_Symbol", "Active_Qty", "Rolled_Status", "Exit_Reason",
+                   "Gross_PnL", "Charges", "Net_PnL"]
+        try:
+            if not os.path.exists(SERVICE_ACCOUNT_FILE):
+                raise FileNotFoundError(SERVICE_ACCOUNT_FILE)
+            ws = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2).sheet1
+            if not ws.row_values(1):
+                ws.append_row(headers)
+            ws.append_row(row)
+        except Exception as e:
+            print(f"Sheet logging failed: {e}")
+            tg(f"⚠️ SHEET LOGGING FAILED ({e}). Please log this trade manually.")
+
+    def version_tag(self):
+        return f"{STRATEGY_VERSION} {'PAPER' if PAPER_MODE else 'LIVE'}"
+
+    def try_roll(self, opt_type, spot):
+        shorts = self.active("SHORT_" + opt_type)
+        if not shorts or self.rolls[opt_type] >= MAX_ROLLS_PER_SIDE:
+            return
+        short = shorts[0]
+        if opt_type == "CE":
+            triggered = spot >= short.strike - SPOT_ROLL_BUFFER
+            new_strike = short.strike + ROLL_DISTANCE_PTS
+        else:
+            triggered = spot <= short.strike + SPOT_ROLL_BUFFER
+            new_strike = short.strike - ROLL_DISTANCE_PTS
+        if not triggered:
+            return
+        
+        contract = self.find_contract(new_strike, opt_type)
+        if not contract:
+            self.rolls[opt_type] = MAX_ROLLS_PER_SIDE
+            tg(f"⚠️ {opt_type} roll skipped: strike {new_strike} not listed. Position unchanged.")
+            return
+            
+        old_sym = short.symbol
+        leg_pnl, close_status = self.close_leg(short, self.last_q.get(short.token))
+        self.rolls[opt_type] += 1
+        
+        if close_status == "already_flat":
+            self.rolls[opt_type] = MAX_ROLLS_PER_SIDE
+            tg(f"⚠️ {opt_type} roll cancelled: {old_sym} was already closed at the broker. No new leg opened.")
+            return
+            
+        new_ltp = self.get_ltp_retry("NFO", contract["token"])
+        new_leg = self.open_leg("SHORT_" + opt_type, opt_type, new_strike, contract, "SELL", new_ltp)
+        tg(f"🔄 {opt_type} {old_sym} rolled to {new_leg.symbol} @ ₹{new_leg.entry_px:.2f}
+"
+           f"Booked leg P&L: ₹{leg_pnl:,.2f}")
+
+    def run(self):
+        today = now_ist().date()
+        if today.weekday() >= 5 or str(today) in HOLIDAYS:
+            print("Weekend / configured holiday - nothing to do.")
+            return
+
+        self.lock_path = f"run_lock_{today}_{'paper' if PAPER_MODE else 'live'}.json"
+        if os.path.exists(self.lock_path):
+            tg(f"⚠️ Bot already ran today ({self.lock_path} exists). Not re-entering. Check Angel One for open positions.")
+            self.lock_path = ""
+            return
+
+        entry_time = at_ist(today, ENTRY_HOUR, ENTRY_MIN)
+        exit_time = at_ist(today, EXIT_HOUR, EXIT_MIN)
+        if now_ist() > entry_time + datetime.timedelta(minutes=ENTRY_GRACE_MIN):
+            tg(f"⚠️ Started too late ({now_ist():%H:%M:%S} IST). Skipping today.")
+            return
+
+        self.login()
+        self.load_master()
+        print(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'} | Expiry: {self.expiry} ({EXPIRY_MODE})")
+        print("Waiting for 9:50 AM IST ...")
+        wait_until(entry_time)
+
+        today_str = str(today)
+        ok, spot, gap_pct, orb, msg = self.check_filters()
+        if not ok:
+            tg(f"⚠️ STRATEGY SKIPPED ({today_str})
+Reason: {msg}")
+            self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
+                            round(spot, 2), round(gap_pct, 2), round(orb, 2), "N/A", "N/A", 0.0,
+                            "N/A", "N/A", 0, "No", msg, 0.0, 0.0, 0.0])
+            return
+
+        atm = int(round(spot / 50.0) * 50)
+        atm_ce, atm_pe = self.find_contract(atm, "CE"), self.find_contract(atm, "PE")
+        if not atm_ce or not atm_pe:
+            tg(f"⚠️ SKIPPED: ATM {atm} contracts not found for {self.expiry}.")
+            return
+            
+        q = self.get_ltps({"NFO": [atm_ce["token"], atm_pe["token"]]})
+        if atm_ce["token"] not in q or atm_pe["token"] not in q:
+            tg("⚠️ SKIPPED: could not read ATM straddle prices.")
+            return
+            
+        offset = (q[atm_ce["token"]] + q[atm_pe["token"]]) * DELTA_WIDTH_MULTIPLIER
+        ce_strike = int(round((spot + offset) / 50.0) * 50)
+        pe_strike = int(round((spot - offset) / 50.0) * 50)
+        ce_c, pe_c = self.find_contract(ce_strike, "CE"), self.find_contract(pe_strike, "PE")
+        
+        if not ce_c or not pe_c:
+            tg(f"⚠️ SKIPPED: required strikes not listed (CE {ce_strike}, PE {pe_strike}).")
+            return
+
+        lot = ce_c["lotsize"]
+        self.qty = NUM_LOTS * lot
+
+        margin_ok, margin_msg = self.check_margin()
+        if not margin_ok:
+            tg(f"⚠️ SKIPPED: insufficient margin ({margin_msg}).")
+            return
+
+        open(self.lock_path, "w").close()
+        ltps = self.get_ltps({"NFO": [c["token"] for c in (ce_c, pe_c) if c]})
+        
+        short_ce = self.open_leg("SHORT_CE", "CE", ce_strike, ce_c, "SELL", ltps.get(ce_c["token"]))
+        short_pe = self.open_leg("SHORT_PE", "PE", pe_strike, pe_c, "SELL", ltps.get(pe_c["token"]))
+
+        initial_premium = short_ce.entry_px + short_pe.entry_px
+        max_loss = initial_premium * MAX_PREMIUM_LOSS_PCT * self.qty
+        initial_ce_sym, initial_pe_sym = short_ce.symbol, short_pe.symbol
+
+        tg(f"🟢 STRANGLE DEPLOYED ({NUM_LOTS} lots | {self.qty} qty | {now_ist():%H:%M})
+"
+           f"Expiry: {self.expiry} | Spot: {spot:.2f} | Gap {gap_pct:+.2f}% | ORB {orb:.0f} pts
+"
+           f"CE {short_ce.symbol} @ ₹{short_ce.entry_px:.2f} | PE {short_pe.symbol} @ ₹{short_pe.entry_px:.2f}
+"
+           f"Combined premium ₹{initial_premium:.2f}
+"
+           f"Hard SL: -₹{max_loss:,.0f} ({int(MAX_PREMIUM_LOSS_PCT * 100)}% of premium)")
+           
+        self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "ENTERED",
+                        round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
+                        round(initial_premium, 2), initial_ce_sym, initial_pe_sym, self.qty, "No",
+                        "OPEN", 0.0, 0.0, 0.0])
+
+        exit_reason, force_market = "N/A", False
+        last_ok, feed_alerted = time.time(), False
+        last_slot = now_ist().hour * 2 + now_ist().minute // 30
+
+        while True:
+            now = now_ist()
+            if now >= exit_time:
+                exit_reason = "Time Exit (3:10 PM)"
+                break
+
+            active_legs = self.active()
+            need = [NIFTY_SPOT_TOKEN] + [l.token for l in active_legs]
+            q = self.get_ltps({"NSE": [NIFTY_SPOT_TOKEN], "NFO": [l.token for l in active_legs]})
+            
+            if any(t not in q for t in need):
+                stale = time.time() - last_ok
+                if stale >= DATA_FAIL_EXIT_SECS:
+                    exit_reason, force_market = f"Data feed lost {int(stale)}s - forced exit", True
+                    break
+                if stale >= DATA_FAIL_ALERT_SECS and not feed_alerted:
+                    tg(f"⚠️ No market data for {int(stale)}s. Forced exit at {DATA_FAIL_EXIT_SECS}s.")
+                    feed_alerted = True
+                time.sleep(1)
+                continue
+                
+            last_ok, feed_alerted = time.time(), False
+            self.last_q = q
+            spot_now = q[NIFTY_SPOT_TOKEN]
+
+            open_pnl = sum(((l.entry_px - q[l.token]) if l.side == "SELL" else (q[l.token] - l.entry_px)) * l.qty
+                           for l in active_legs)
+            total_pnl = self.realized + open_pnl
+
+            slot = now.hour * 2 + now.minute // 30
+            if slot != last_slot and now.minute % 30 == 0:
+                last_slot = slot
+                tg(f"⏱️ {now:%I:%M %p}: P&L ₹{total_pnl:,.0f} | Spot {spot_now:.2f}")
+
+            if total_pnl <= -max_loss:
+                exit_reason = f"Hard SL ({int(MAX_PREMIUM_LOSS_PCT * 100)}% premium loss)"
+                break
+
+            try:
+                self.try_roll("CE", spot_now)
+                self.try_roll("PE", spot_now)
+            except OrderError as e:
+                exit_reason, force_market = f"Roll order failed: {e}", True
+                break
+
+            time.sleep(POLL_SECS)
+
+        self.cancel_pending_orders("at exit time")
+        failures = []
+        for leg in sorted(self.active(), key=lambda l: 0 if l.side == "SELL" else 1):
+            try:
+                self.close_leg(leg, self.last_q.get(leg.token), force_market)
+            except Exception as e:
+                failures.append(leg.symbol)
+                print(f"Exit failed for {leg.symbol}: {e}")
+                
+        if failures:
+            self.emergency_square_off(f"normal exit failed for {', '.join(failures)}")
+            
+        flat_ok = self.verify_flat()
+        if not flat_ok:
+            exit_reason += " | NOT VERIFIED FLAT - CHECK BROKER"
+
+        gross = self.realized
+        charges = self.ledger.charges()
+        net = gross - charges
+        rolled = "No" if not any(self.rolls.values()) else "+".join(k for k, v in self.rolls.items() if v) + " rolled"
+
+        def last_sym(role, default):
+            m = [l.symbol for l in self.legs if l.role == role]
+            return m[-1] if m else default
+
+        tg(f"🏁 BOT CLOSED | {exit_reason}\nGross ₹{gross:+,.2f} | Charges ₹{charges:,.2f} | Net ₹{net:+,.2f}")
+        self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "TRADED",
+                        round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
+                        round(initial_premium, 2), last_sym("SHORT_CE", "N/A"), last_sym("SHORT_PE", "N/A"),
+                        self.qty, rolled, exit_reason, round(gross, 2), round(charges, 2), round(net, 2)])
+        try:
+            self.smart.terminateSession(CLIENT_CODE)
         except Exception:
             pass
-        time.sleep(0.5)
-    return None
 
-def get_order_book_dict(smart_client):
-    order_map = {}
-    try:
-        ob = smart_client.orderBook()
-        if ob and ob.get("status") and ob.get("data"):
-            for order in ob["data"]:
-                order_map[str(order.get("orderid", ""))] = (float(order.get("averageprice", 0)), str(order.get("orderstatus", "")).lower())
-    except Exception:
-        pass
-    return order_map
-
-def get_filled_price(smart_client, order_id, exchange, symbol, token, fallback_ltp=None):
-    if order_id:
-        ob = get_order_book_dict(smart_client)
-        if str(order_id) in ob:
-            avg_px, status = ob[str(order_id)]
-            # Patch 2: Aggressive Ghost Position Protection
-            if status == "rejected":
-                send_telegram_alert(f"❌ ORDER REJECTED BY BROKER: {symbol}. Check Angel One App for margin/errors.")
-                raise Exception(f"Order {order_id} rejected. Halting bot to prevent ghost positions.")
-            if avg_px > 0: 
-                return avg_px
-                
-    # Fallback to live LTP if order pending or API slow
-    live_px = get_ltp(smart_client, exchange, symbol, token)
-    return live_px if live_px and live_px > 0 else (fallback_ltp if fallback_ltp else 0.0)
-
-def log_to_google_sheet(row_values):
-    headers = [
-        "Date", "Timestamp", "Strategy_Version", "Session_Status",
-        "Nifty_Spot_950", "Gap_Pct", "ORB_915_950_Pts",
-        "Initial_CE_Symbol", "Initial_PE_Symbol", "Initial_Combined_Premium",
-        "Final_CE_Symbol", "Final_PE_Symbol", "Active_Qty", "Rolled_Status",
-        "Exit_Reason", "Gross_PnL", "Charges", "Net_PnL"
-    ]
-    try:
-        gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-        sh = gc.open_by_key(GSHEET_ID_V2)
-        worksheet = sh.sheet1
-        if not worksheet.row_values(1): worksheet.append_row(headers)
-        worksheet.append_row(row_values)
-    except Exception as e:
-        print(f"Failed to log to Google Sheet: {e}")
-        send_telegram_alert("⚠️ SHEET LOGGING FAILED\nTrade finished, but Google API timed out. Please log manually.")
-
-# ==========================================
-# 5. MAIN EXECUTION PIPELINE (9:50 AM ENTRY)
-# ==========================================
-def main():
-    smart = init_smartapi_session()
-
-    options_df = get_nifty_options_master()
-    next_expiry_date = get_next_expiry(options_df)
-    expiry_str = next_expiry_date.strftime("%d-%b-%Y")
-
-    print("Waiting until 9:50 AM for entry execution...")
-    wait_for_market_time(9, 50)
-
-    is_safe, entry_spot, gap_pct, orb_pts, filter_msg = check_market_filters(smart)
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    now_time_str = datetime.datetime.now().strftime("%H:%M:%S")
-
-    if not is_safe:
-        skip_alert = f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {filter_msg}"
-        print(skip_alert); send_telegram_alert(skip_alert)
-        log_to_google_sheet([today_str, now_time_str, "V2.1 Uncapped", "SKIPPED", round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2), "N/A", "N/A", 0.0, "N/A", "N/A", 0, "No", filter_msg, 0.0, 0.0, 0.0])
-        sys.exit(0)
-
-    atm_strike = round(entry_spot / 50.0) * 50
-    atm_ce_sym, atm_ce_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, atm_strike, "CE")
-    atm_pe_sym, atm_pe_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, atm_strike, "PE")
-
-    combined_atm = get_ltp(smart, "NFO", atm_ce_sym, atm_ce_tok) + get_ltp(smart, "NFO", atm_pe_sym, atm_pe_tok)
-    strike_offset = combined_atm * DELTA_WIDTH_MULTIPLIER
-
-    ce_strike = int(round((entry_spot + strike_offset) / 50.0) * 50)
-    pe_strike = int(round((entry_spot - strike_offset) / 50.0) * 50)
-
-    ce_sym, ce_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, ce_strike, "CE")
-    pe_sym, pe_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, pe_strike, "PE")
-
-    ce_avg = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "SELL", TRANCHE_1_QTY), "NFO", ce_sym, ce_tok, get_ltp(smart, "NFO", ce_sym, ce_tok))
-    time.sleep(1)
-    pe_avg = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "SELL", TRANCHE_1_QTY), "NFO", pe_sym, pe_tok, get_ltp(smart, "NFO", pe_sym, pe_tok))
-
-    ledger.record_trade("SELL", ce_avg, TRANCHE_1_QTY)
-    ledger.record_trade("SELL", pe_avg, TRANCHE_1_QTY)
-
-    initial_ce_sym, initial_pe_sym = ce_sym, pe_sym
-    initial_combined_premium = ce_avg + pe_avg
-    active_qty = TRANCHE_1_QTY
-    rolled_status = "No"
-    realized_roll_pnl = 0.0
-    exit_reason = "N/A"
-
-    # Calculate exact dynamic SL based on 40% of collected premium
-    max_monetary_loss = (initial_combined_premium * MAX_PREMIUM_LOSS_PCT) * active_qty
-
-    send_telegram_alert(
-        f"🟢 STRANGLE DEPLOYED (5 Lots | {active_qty} Qty | 9:50 AM)\n"
-        f"Expiry: {expiry_str} | Spot: {entry_spot:.2f}\n"
-        f"CE: {ce_sym} @ ₹{ce_avg:.2f} | PE: {pe_sym} @ ₹{pe_avg:.2f}\n"
-        f"Combined Premium: ₹{initial_combined_premium:.2f}\n"
-        f"Dynamic SL: -₹{max_monetary_loss:,.0f} (40% Exp)"
-    )
-
-    last_alert_minute = datetime.datetime.now().minute
-
-    while True:
-        now = datetime.datetime.now()
-        live_spot = get_ltp(smart, "NSE", "NIFTY", NIFTY_SPOT_TOKEN)
-        live_ce = get_ltp(smart, "NFO", ce_sym, ce_tok)
-        live_pe = get_ltp(smart, "NFO", pe_sym, pe_tok)
-
-        if not live_spot or not live_ce or not live_pe:
-            time.sleep(2); continue
-
-        open_pnl = ((ce_avg - live_ce) + (pe_avg - live_pe)) * active_qty
-        total_running_pnl = realized_roll_pnl + open_pnl
-
-        if now.minute % 30 == 0 and now.minute != last_alert_minute:
-            last_alert_minute = now.minute
-            send_telegram_alert(f"⏱️ UPDATE ({now.strftime('%I:%M %p')}): P&L ₹{total_running_pnl:,.2f} | Spot: {live_spot:.2f}")
-
-        # 1. Check Hard Stop Loss (40% Premium Expansion)
-        if total_running_pnl <= -max_monetary_loss:
-            exit_reason = f"Hard SL Hit (40% Premium Loss)"
-            break
-
-        # 2. Check Spot Roll Boundaries
-        if rolled_status == "No":
-            if live_spot >= (ce_strike - SPOT_ROLL_BUFFER):
-                new_ce_strike = ce_strike + ROLL_DISTANCE_PTS
-                new_ce_sym, new_ce_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_ce_strike, "CE")
-                if not new_ce_sym: break
-                
-                # Buy back losing CE
-                exit_ce_px = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, live_ce)
-                ledger.record_trade("BUY", exit_ce_px, active_qty)
-                realized_roll_pnl += (ce_avg - exit_ce_px) * active_qty
-                
-                leg_loss = (ce_avg - exit_ce_px) * active_qty
-                old_ce_sym = ce_sym
-
-                # Sell new OTM CE
-                ce_avg = get_filled_price(smart, place_market_order(smart, new_ce_sym, new_ce_tok, "SELL", active_qty), "NFO", new_ce_sym, new_ce_tok, get_ltp(smart, "NFO", new_ce_sym, new_ce_tok))
-                ledger.record_trade("SELL", ce_avg, active_qty)
-                ce_strike, ce_sym, ce_tok = new_ce_strike, new_ce_sym, new_ce_tok
-                rolled_status = "Yes (Call Rolled Up)"
-                send_telegram_alert(f"🔄 CALL {old_ce_sym} ROLLED UP to {ce_sym} @ ₹{ce_avg:.2f}\nBooked Leg Loss: ₹{leg_loss:,.2f}")
-
-            elif live_spot <= (pe_strike + SPOT_ROLL_BUFFER):
-                new_pe_strike = pe_strike - ROLL_DISTANCE_PTS
-                new_pe_sym, new_pe_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_pe_strike, "PE")
-                if not new_pe_sym: break
-
-                # Buy back losing PE
-                exit_pe_px = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "BUY", active_qty), "NFO", pe_sym, pe_tok, live_pe)
-                ledger.record_trade("BUY", exit_pe_px, active_qty)
-                realized_roll_pnl += (pe_avg - exit_pe_px) * active_qty
-                
-                leg_loss = (pe_avg - exit_pe_px) * active_qty
-                old_pe_sym = pe_sym
-
-                # Sell new OTM PE
-                pe_avg = get_filled_price(smart, place_market_order(smart, new_pe_sym, new_pe_tok, "SELL", active_qty), "NFO", new_pe_sym, new_pe_tok, get_ltp(smart, "NFO", new_pe_sym, new_pe_tok))
-                ledger.record_trade("SELL", pe_avg, active_qty)
-                pe_strike, pe_sym, pe_tok = new_pe_strike, new_pe_sym, new_pe_tok
-                rolled_status = "Yes (Put Rolled Down)"
-                send_telegram_alert(f"🔄 PUT {old_pe_sym} ROLLED DOWN to {pe_sym} @ ₹{pe_avg:.2f}\nBooked Leg Loss: ₹{leg_loss:,.2f}")
-
-        # 3. Check Time Exit (Hold till 3:10 PM for Uncapped Theta)
-        if now.hour > 15 or (now.hour == 15 and now.minute >= 10):
-            exit_reason = "Time Exit (3:10 PM)" if rolled_status == "No" else "Rolled & Time Exit (3:10 PM)"
-            break
-
-        time.sleep(2)
-
-    # ==========================================
-    # 6. SQUARE-OFF & LOGGING
-    # ==========================================
-    final_ce_px = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, get_ltp(smart, "NFO", ce_sym, ce_tok))
-    final_pe_px = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, get_ltp(smart, "NFO", pe_sym, pe_tok))
-
-    ledger.record_trade("BUY", final_ce_px, active_qty)
-    ledger.record_trade("BUY", final_pe_px, active_qty)
-
-    gross_pnl = realized_roll_pnl + (((ce_avg - final_ce_px) + (pe_avg - final_pe_px)) * active_qty)
-    total_charges = ledger.calculate_charges()
-    net_pnl = gross_pnl - total_charges
-
-    send_telegram_alert(f"🏁 BOT CLOSED | Exit: {exit_reason} | Net P&L: ₹{net_pnl:+,.2f}")
-
-    log_to_google_sheet([
-        today_str, datetime.datetime.now().strftime("%H:%M:%S"), "V2.1 Uncapped", "TRADED",
-        round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2),
-        initial_ce_sym, initial_pe_sym, round(initial_combined_premium, 2),
-        ce_sym, pe_sym, active_qty, rolled_status, exit_reason,
-        round(gross_pnl, 2), round(total_charges, 2), round(net_pnl, 2)
-    ])
-
-# Patch 1: Global Catch-All with Telegram SOS
 if __name__ == "__main__":
+    bot = Bot()
     try:
-        main()
+        bot.run()
     except Exception as e:
-        error_msg = traceback.format_exc()
-        send_telegram_alert(f"🚨 FATAL BOT CRASH 🚨\nManual intervention required immediately!\n\nError: {str(e)}")
-        print(f"CRITICAL FAILURE:\n{error_msg}")
+        print(f"CRITICAL FAILURE:\n{traceback.format_exc()}")
+        tg(f"🚨 FATAL BOT CRASH 🚨\n{e}\nAttempting emergency square-off...")
+        try:
+            if bot.smart and bot.traded_symbols:
+                bot.emergency_square_off(f"crash: {e}")
+                bot.verify_flat()
+        except Exception as e2:
+            tg(f"🚨 Emergency square-off itself failed: {e2}. CLOSE POSITIONS MANUALLY NOW.")
         sys.exit(1)
