@@ -542,12 +542,9 @@ class Bot:
         net = self.get_net_positions()
         pend = self.open_orders()
         leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
-        tg(f"🚨🚨 NOT VERIFIED FLAT after {FLAT_VERIFY_ROUNDS} rounds.
-"
-           f"Positions: {leftover if leftover is not None else 'UNREADABLE'}
-"
-           f"Pending orders: {len(pend) if pend is not None else 'UNREADABLE'}
-"
+        tg(f"🚨🚨 NOT VERIFIED FLAT after {FLAT_VERIFY_ROUNDS} rounds.\n"
+           f"Positions: {leftover if leftover is not None else 'UNREADABLE'}\n"
+           f"Pending orders: {len(pend) if pend is not None else 'UNREADABLE'}\n"
            f"OPEN ANGEL ONE AND CLOSE / CANCEL MANUALLY NOW.")
         return False
 
