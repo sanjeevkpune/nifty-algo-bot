@@ -2,10 +2,9 @@ name: Automated VM Start and Stop Scheduler
 
 on:
   schedule:
-    # 9:00 AM IST is 3:30 UTC (Mon-Fri) -> CREATE / START VM
-    - cron: '30 3 * * 1-5'
-    #- cron: '20 17 * * *'
-    # 4:00 PM IST is 10:30 UTC (Mon-Fri) -> STOP VM
+    # 8:30 AM IST (3:00 UTC, Mon-Fri) -> Gives a 30 min buffer so VM is guaranteed UP by 9:00 AM IST
+    - cron: '0 3 * * 1-5'
+    # 4:00 PM IST (10:30 UTC, Mon-Fri) -> Triggers STOP at 4:00 PM IST
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -52,6 +51,7 @@ jobs:
           else
             UTC_HOUR=$(date -u +%H)
             echo "Current UTC Hour: $UTC_HOUR"
+            # 3:00 UTC (start) gives hour 03. 10:30 UTC (stop) gives hour 10.
             if [ "$UTC_HOUR" -lt 10 ]; then
               echo "action=start_or_sync" >> $GITHUB_OUTPUT
             else
