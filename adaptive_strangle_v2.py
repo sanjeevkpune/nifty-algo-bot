@@ -35,25 +35,29 @@ if missing_env:
     print(f"🚨 CRITICAL ERROR: Missing required environment variables/secrets: {', '.join(missing_env)}")
     sys.exit(1)
 
+# ==========================================
+# 2. OPTIMIZED STRATEGY PARAMETERS
+# ==========================================
 NIFTY_LOT_SIZE = 65
 TRANCHE_1_QTY = NIFTY_LOT_SIZE * 5       # Fixed 5 Lots (325 qty) at 9:50 AM
 
-DELTA_WIDTH_MULTIPLIER = 1.15            # ~18-Delta OTM strike distance
+# OPTIMIZED ALGO SETTINGS (Based on 11-Year Backtest)
+DELTA_WIDTH_MULTIPLIER = 1.25            # Pushed to 1.25x for wider, safer strikes
+MAX_OPENING_RANGE_PTS = 140.0            # Relaxed to 140 pts to maximize traded days & ROI
+MAX_GAP_PERCENT = 0.60                   # Kept at 0.60% to filter catastrophic overnight gaps
+
 TARGET_DECAY_POINTS = 30.0               # Standard target: 30 points combined decay
 SALVAGE_DECAY_POINTS = 12.0              # Post-roll salvage target: 12 points net decay
 MAX_MONETARY_LOSS = 15000.0              # Hard ₹15,000 gross loss ceiling for 5 lots
 
-MAX_GAP_PERCENT = 0.60                   # Pre-market gap threshold (%)
-MAX_OPENING_RANGE_PTS = 110.0            # Max 9:15-9:50 AM High-Low spread (pts)
-
 SPOT_ROLL_BUFFER = 40.0                  # Roll tested leg if Spot comes within 40 pts
-SPOT_HARD_EXIT_BUFFER = 30.0             # Hard exit if Spot comes within 30 pts
+SPOT_HARD_EXIT_BUFFER = 30.0             # Hard exit if Spot comes within 30 pts post-roll
 ROLL_DISTANCE_PTS = 100                  # Distance (pts) to roll tested leg further OTM
 
 NIFTY_SPOT_TOKEN = "99926000"
 
 # ==========================================
-# 2. ORDER & TURNOVER LEDGER
+# 3. ORDER & TURNOVER LEDGER
 # ==========================================
 class OrderLedger:
     def __init__(self):
@@ -82,7 +86,7 @@ class OrderLedger:
 ledger = OrderLedger()
 
 # ==========================================
-# 3. CORE HELPER FUNCTIONS
+# 4. CORE HELPER FUNCTIONS
 # ==========================================
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -98,13 +102,13 @@ def init_smartapi_session():
             totp_code = pyotp.TOTP(TOTP_SECRET).now()
             res = smart_client.generateSession(CLIENT_CODE, PIN, totp_code)
             if res and res.get("status"):
-                print("SmartAPI V2 Session authenticated successfully.")
+                print("SmartAPI Session authenticated successfully.")
                 return smart_client
             print(f"Session attempt {attempt} rejected: {res}")
         except Exception as e:
             print(f"Session error on attempt {attempt}: {e}")
         time.sleep(3)
-    send_telegram_alert("🚨 V2 CRITICAL ERROR: SmartAPI authentication failed after 3 attempts.")
+    send_telegram_alert("🚨 CRITICAL ERROR: Angel One authentication failed after 3 attempts.")
     sys.exit(1)
 
 def wait_for_market_time(target_hour, target_minute):
@@ -157,16 +161,9 @@ def get_nifty_spot_ohlc(smart_client):
                 return {"ltp": float(q.get("ltp", 0)), "open": float(q.get("open", 0)), "high": float(q.get("high", 0)), "low": float(q.get("low", 0)), "close": float(q.get("close", 0))}
         except Exception:
             pass
-        try:
-            res = smart_client.ltpData("NSE", "NIFTY", tok)
-            if res and res.get("status") and res.get("data"):
-                q = res["data"]
-                return {"ltp": float(q.get("ltp", 0)), "open": float(q.get("open", 0)), "high": float(q.get("high", 0)), "low": float(q.get("low", 0)), "close": float(q.get("close", 0))}
-        except Exception:
-            pass
     return None
 
-def check_v2_market_filters(smart_client):
+def check_market_filters(smart_client):
     ohlc = get_nifty_spot_ohlc(smart_client)
     if not ohlc or ohlc["ltp"] <= 0:
         return False, 0.0, 0.0, 0.0, "Unable to fetch Nifty Spot OHLC data at 9:50 AM."
@@ -180,9 +177,9 @@ def check_v2_market_filters(smart_client):
     opening_range = day_high - day_low
 
     if abs(gap_pct) > MAX_GAP_PERCENT:
-        return False, spot, gap_pct, opening_range, f"Overnight Gap ({gap_pct:+.2f}%) exceeds limit."
+        return False, spot, gap_pct, opening_range, f"Overnight Gap ({gap_pct:+.2f}%) exceeds {MAX_GAP_PERCENT}% limit."
     if opening_range > MAX_OPENING_RANGE_PTS:
-        return False, spot, gap_pct, opening_range, f"9:15-9:50 Range ({opening_range:.2f} pts) exceeds limit."
+        return False, spot, gap_pct, opening_range, f"9:15-9:50 Range ({opening_range:.2f} pts) exceeds {MAX_OPENING_RANGE_PTS} pt limit."
     return True, spot, gap_pct, opening_range, "PASSED"
 
 def place_market_order(smart_client, symbol, token, side, qty):
@@ -224,7 +221,7 @@ def get_filled_price(smart_client, order_id, exchange, symbol, token, fallback_l
     live_px = get_ltp(smart_client, exchange, symbol, token)
     return live_px if live_px and live_px > 0 else (fallback_ltp if fallback_ltp else 0.0)
 
-def log_to_v2_google_sheet(row_values):
+def log_to_google_sheet(row_values):
     headers = [
         "Date", "Timestamp", "Strategy_Version", "Session_Status",
         "Nifty_Spot_950", "Gap_Pct", "ORB_915_950_Pts",
@@ -239,10 +236,10 @@ def log_to_v2_google_sheet(row_values):
         if not worksheet.row_values(1): worksheet.append_row(headers)
         worksheet.append_row(row_values)
     except Exception as e:
-        print(f"Failed to log to V2 Google Sheet: {e}")
+        print(f"Failed to log to Google Sheet: {e}")
 
 # ==========================================
-# 4. MAIN EXECUTION PIPELINE (9:50 AM ENTRY)
+# 5. MAIN EXECUTION PIPELINE (9:50 AM ENTRY)
 # ==========================================
 def main():
     smart = init_smartapi_session()
@@ -251,17 +248,17 @@ def main():
     next_expiry_date = get_next_expiry(options_df)
     expiry_str = next_expiry_date.strftime("%d-%b-%Y")
 
-    print("Waiting until 9:50 AM for V2 entry execution...")
+    print("Waiting until 9:50 AM for entry execution...")
     wait_for_market_time(9, 50)
 
-    is_safe, entry_spot, gap_pct, orb_pts, filter_msg = check_v2_market_filters(smart)
+    is_safe, entry_spot, gap_pct, orb_pts, filter_msg = check_market_filters(smart)
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
     now_time_str = datetime.datetime.now().strftime("%H:%M:%S")
 
     if not is_safe:
-        skip_alert = f"⚠️ V2 STRATEGY SKIPPED ({today_str})\nReason: {filter_msg}"
+        skip_alert = f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {filter_msg}"
         print(skip_alert); send_telegram_alert(skip_alert)
-        log_to_v2_google_sheet([today_str, now_time_str, "V2 Adaptive Strangle (5 Lot)", "SKIPPED", round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2), "N/A", "N/A", 0.0, "N/A", "N/A", 0, "No", filter_msg, 0.0, 0.0, 0.0])
+        log_to_google_sheet([today_str, now_time_str, "V2 Optimized (5 Lot)", "SKIPPED", round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2), "N/A", "N/A", 0.0, "N/A", "N/A", 0, "No", filter_msg, 0.0, 0.0, 0.0])
         sys.exit(0)
 
     atm_strike = round(entry_spot / 50.0) * 50
@@ -292,7 +289,7 @@ def main():
     exit_reason = "N/A"
 
     send_telegram_alert(
-        f"🟢 V2 STRANGLE DEPLOYED (5 Lots | {active_qty} Qty | 9:50 AM)\n"
+        f"🟢 STRANGLE DEPLOYED (5 Lots | {active_qty} Qty | 9:50 AM)\n"
         f"Expiry: {expiry_str} | Spot: {entry_spot:.2f}\n"
         f"CE: {ce_sym} @ ₹{ce_avg:.2f} | PE: {pe_sym} @ ₹{pe_avg:.2f}\n"
         f"Combined Premium: ₹{initial_combined_premium:.2f}"
@@ -302,7 +299,7 @@ def main():
 
     while True:
         now = datetime.datetime.now()
-        live_spot = get_ltp(smart, "NSE", "NIFTY", NIFTY_SPOT_TOKEN) or get_ltp(smart, "NSE", "NIFTY", "26000")
+        live_spot = get_ltp(smart, "NSE", "NIFTY", NIFTY_SPOT_TOKEN)
         live_ce = get_ltp(smart, "NFO", ce_sym, ce_tok)
         live_pe = get_ltp(smart, "NFO", pe_sym, pe_tok)
 
@@ -316,59 +313,69 @@ def main():
 
         if now.minute % 30 == 0 and now.minute != last_alert_minute:
             last_alert_minute = now.minute
-            send_telegram_alert(f"⏱️ V2 UPDATE ({now.strftime('%I:%M %p')}): P&L ₹{total_running_pnl:,.2f} | Spot: {live_spot:.2f}")
+            send_telegram_alert(f"⏱️ UPDATE ({now.strftime('%I:%M %p')}): P&L ₹{total_running_pnl:,.2f} | Spot: {live_spot:.2f}")
 
+        # 1. Check Targets
         if net_points_captured >= active_target_pts:
             exit_reason = "Target (30 pts)" if rolled_status == "No" else "Rolled & Salvaged"
             break
 
+        # 2. Check Hard Stop Loss (₹15k)
         if total_running_pnl <= -MAX_MONETARY_LOSS:
             exit_reason = "Hard Spot SL Hit (₹15k Cap)"
             break
 
+        # 3. Check Spot Roll Boundaries
         if rolled_status == "No":
             if live_spot >= (ce_strike - SPOT_ROLL_BUFFER):
                 new_ce_strike = ce_strike + ROLL_DISTANCE_PTS
                 new_ce_sym, new_ce_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_ce_strike, "CE")
                 if not new_ce_sym: break
                 
+                # Buy back losing CE
                 exit_ce_px = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, live_ce)
                 ledger.record_trade("BUY", exit_ce_px, active_qty)
                 realized_roll_pnl += (ce_avg - exit_ce_px) * active_qty
 
+                # Sell new OTM CE
                 ce_avg = get_filled_price(smart, place_market_order(smart, new_ce_sym, new_ce_tok, "SELL", active_qty), "NFO", new_ce_sym, new_ce_tok, get_ltp(smart, "NFO", new_ce_sym, new_ce_tok))
                 ledger.record_trade("SELL", ce_avg, active_qty)
                 ce_strike, ce_sym, ce_tok = new_ce_strike, new_ce_sym, new_ce_tok
-                rolled_status = "Yes (Call Rolled)"
-                send_telegram_alert(f"🔄 V2 CALL ROLLED to {ce_sym} @ ₹{ce_avg:.2f}")
+                rolled_status = "Yes (Call Rolled Up)"
+                send_telegram_alert(f"🔄 CALL ROLLED UP to {ce_sym} @ ₹{ce_avg:.2f}")
 
             elif live_spot <= (pe_strike + SPOT_ROLL_BUFFER):
                 new_pe_strike = pe_strike - ROLL_DISTANCE_PTS
                 new_pe_sym, new_pe_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_pe_strike, "PE")
                 if not new_pe_sym: break
 
+                # Buy back losing PE
                 exit_pe_px = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "BUY", active_qty), "NFO", pe_sym, pe_tok, live_pe)
                 ledger.record_trade("BUY", exit_pe_px, active_qty)
                 realized_roll_pnl += (pe_avg - exit_pe_px) * active_qty
 
+                # Sell new OTM PE
                 pe_avg = get_filled_price(smart, place_market_order(smart, new_pe_sym, new_pe_tok, "SELL", active_qty), "NFO", new_pe_sym, new_pe_tok, get_ltp(smart, "NFO", new_pe_sym, new_pe_tok))
                 ledger.record_trade("SELL", pe_avg, active_qty)
                 pe_strike, pe_sym, pe_tok = new_pe_strike, new_pe_sym, new_pe_tok
-                rolled_status = "Yes (Put Rolled)"
-                send_telegram_alert(f"🔄 V2 PUT ROLLED to {pe_sym} @ ₹{pe_avg:.2f}")
+                rolled_status = "Yes (Put Rolled Down)"
+                send_telegram_alert(f"🔄 PUT ROLLED DOWN to {pe_sym} @ ₹{pe_avg:.2f}")
         else:
+            # Post-Roll hard exit boundary check
             if live_spot >= (ce_strike - SPOT_HARD_EXIT_BUFFER) or live_spot <= (pe_strike + SPOT_HARD_EXIT_BUFFER):
-                exit_reason = "Hard Spot SL Hit"
-                rolled_status = "Yes (Breached)"
+                exit_reason = "Hard Spot SL Hit (Boundary Breached)"
                 break
 
+        # 4. Check Time Exit (3:10 PM)
         if now.hour > 15 or (now.hour == 15 and now.minute >= 10):
             exit_reason = "Time Exit (3:10 PM)" if rolled_status == "No" else "Rolled & Salvaged (3:10 PM)"
             break
 
         time.sleep(2)
 
-    # Square-off & Log
+    # ==========================================
+    # 6. SQUARE-OFF & LOGGING
+    # ==========================================
     final_ce_px = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, get_ltp(smart, "NFO", ce_sym, ce_tok))
     final_pe_px = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, get_ltp(smart, "NFO", pe_sym, pe_tok))
 
@@ -379,10 +386,10 @@ def main():
     total_charges = ledger.calculate_charges()
     net_pnl = gross_pnl - total_charges
 
-    send_telegram_alert(f"🏁 V2 CLOSED | Exit: {exit_reason} | Net P&L: ₹{net_pnl:+,.2f}")
+    send_telegram_alert(f"🏁 BOT CLOSED | Exit: {exit_reason} | Net P&L: ₹{net_pnl:+,.2f}")
 
-    log_to_v2_google_sheet([
-        today_str, datetime.datetime.now().strftime("%H:%M:%S"), "V2 Adaptive Strangle (5 Lot)", "TRADED",
+    log_to_google_sheet([
+        today_str, datetime.datetime.now().strftime("%H:%M:%S"), "V2 Optimized (5 Lot)", "TRADED",
         round(entry_spot, 2), round(gap_pct, 2), round(orb_pts, 2),
         initial_ce_sym, initial_pe_sym, round(initial_combined_premium, 2),
         ce_sym, pe_sym, active_qty, rolled_status, exit_reason,
