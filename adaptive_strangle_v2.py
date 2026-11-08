@@ -8,6 +8,7 @@ import pandas as pd
 import pyotp
 import requests
 import gspread
+import traceback
 from SmartApi import SmartConnect
 
 # ==========================================
@@ -216,8 +217,15 @@ def get_filled_price(smart_client, order_id, exchange, symbol, token, fallback_l
     if order_id:
         ob = get_order_book_dict(smart_client)
         if str(order_id) in ob:
-            avg_px, _ = ob[str(order_id)]
-            if avg_px > 0: return avg_px
+            avg_px, status = ob[str(order_id)]
+            # Aggressive Ghost Position Protection
+            if status == "rejected":
+                send_telegram_alert(f"❌ ORDER REJECTED BY BROKER: {symbol}. Check Angel One App for margin/errors.")
+                raise Exception(f"Order {order_id} rejected. Halting bot to prevent ghost positions.")
+            if avg_px > 0: 
+                return avg_px
+                
+    # If the order is pending or API is slow, fallback to LTP
     live_px = get_ltp(smart_client, exchange, symbol, token)
     return live_px if live_px and live_px > 0 else (fallback_ltp if fallback_ltp else 0.0)
 
@@ -237,6 +245,8 @@ def log_to_google_sheet(row_values):
         worksheet.append_row(row_values)
     except Exception as e:
         print(f"Failed to log to Google Sheet: {e}")
+        # Send alert if background logging fails
+        send_telegram_alert(f"⚠️ SHEET LOGGING FAILED\nTrade finished, but Google API timed out. Please log manually.\nError: {e}")
 
 # ==========================================
 # 5. MAIN EXECUTION PIPELINE (9:50 AM ENTRY)
@@ -332,34 +342,36 @@ def main():
                 new_ce_sym, new_ce_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_ce_strike, "CE")
                 if not new_ce_sym: break
                 
-                # Buy back losing CE
+                # Buy back losing CE and calculate loss
                 exit_ce_px = get_filled_price(smart, place_market_order(smart, ce_sym, ce_tok, "BUY", active_qty), "NFO", ce_sym, ce_tok, live_ce)
                 ledger.record_trade("BUY", exit_ce_px, active_qty)
-                realized_roll_pnl += (ce_avg - exit_ce_px) * active_qty
+                booked_ce_loss = (ce_avg - exit_ce_px) * active_qty
+                realized_roll_pnl += booked_ce_loss
 
                 # Sell new OTM CE
                 ce_avg = get_filled_price(smart, place_market_order(smart, new_ce_sym, new_ce_tok, "SELL", active_qty), "NFO", new_ce_sym, new_ce_tok, get_ltp(smart, "NFO", new_ce_sym, new_ce_tok))
                 ledger.record_trade("SELL", ce_avg, active_qty)
                 ce_strike, ce_sym, ce_tok = new_ce_strike, new_ce_sym, new_ce_tok
                 rolled_status = "Yes (Call Rolled Up)"
-                send_telegram_alert(f"🔄 CALL ROLLED UP to {ce_sym} @ ₹{ce_avg:.2f}")
+                send_telegram_alert(f"🔄 CALL ROLLED UP to {ce_sym} @ ₹{ce_avg:.2f}\nBooked Leg PnL: ₹{booked_ce_loss:,.2f}")
 
             elif live_spot <= (pe_strike + SPOT_ROLL_BUFFER):
                 new_pe_strike = pe_strike - ROLL_DISTANCE_PTS
                 new_pe_sym, new_pe_tok = get_contract_by_expiry_and_strike(options_df, next_expiry_date, new_pe_strike, "PE")
                 if not new_pe_sym: break
 
-                # Buy back losing PE
+                # Buy back losing PE and calculate loss
                 exit_pe_px = get_filled_price(smart, place_market_order(smart, pe_sym, pe_tok, "BUY", active_qty), "NFO", pe_sym, pe_tok, live_pe)
                 ledger.record_trade("BUY", exit_pe_px, active_qty)
-                realized_roll_pnl += (pe_avg - exit_pe_px) * active_qty
+                booked_pe_loss = (pe_avg - exit_pe_px) * active_qty
+                realized_roll_pnl += booked_pe_loss
 
                 # Sell new OTM PE
                 pe_avg = get_filled_price(smart, place_market_order(smart, new_pe_sym, new_pe_tok, "SELL", active_qty), "NFO", new_pe_sym, new_pe_tok, get_ltp(smart, "NFO", new_pe_sym, new_pe_tok))
                 ledger.record_trade("SELL", pe_avg, active_qty)
                 pe_strike, pe_sym, pe_tok = new_pe_strike, new_pe_sym, new_pe_tok
                 rolled_status = "Yes (Put Rolled Down)"
-                send_telegram_alert(f"🔄 PUT ROLLED DOWN to {pe_sym} @ ₹{pe_avg:.2f}")
+                send_telegram_alert(f"🔄 PUT ROLLED DOWN to {pe_sym} @ ₹{pe_avg:.2f}\nBooked Leg PnL: ₹{booked_pe_loss:,.2f}")
         else:
             # Post-Roll hard exit boundary check
             if live_spot >= (ce_strike - SPOT_HARD_EXIT_BUFFER) or live_spot <= (pe_strike + SPOT_HARD_EXIT_BUFFER):
@@ -396,5 +408,12 @@ def main():
         round(gross_pnl, 2), round(total_charges, 2), round(net_pnl, 2)
     ])
 
+# Global Catch-All with Telegram SOS
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        send_telegram_alert(f"🚨 FATAL BOT CRASH 🚨\nManual intervention required immediately!\n\nError: {str(e)}")
+        print(f"CRITICAL FAILURE:\n{error_msg}")
+        sys.exit(1)
