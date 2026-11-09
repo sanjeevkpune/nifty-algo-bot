@@ -1,30 +1,11 @@
 #!/usr/bin/env python3
 """
-adaptive_strangle_v3.py  --  Nifty intraday short strangle bot for Angel One SmartAPI
+adaptive_strangle_v4.py  --  Nifty intraday short strangle bot (Zero-Touch Edition)
 
-Changes vs v2.1
+V4.1 Upgrades
 ---------------
-* All times in IST (Asia/Kolkata) regardless of server timezone
-* Orders are CONFIRMED (order book polled) before a fill is recorded; failed/rejected
-  orders raise instead of being treated as filled
-* emergency_square_off() closes every position this bot touched (called on any crash)
-* Expiry is config driven (EXPIRY_MODE = CURRENT | NEXT)
-* Lot size read from the scrip master
-* Optional limit-then-market execution to reduce slippage
-* One batched LTP call per loop; data-feed-loss watchdog (alert, then forced exit)
-* Paper-trade mode (default ON) -- logs what it WOULD do, places no orders
-* Late-start / holiday / stale-quote protection, margin check, run lock file
-* Per-side roll cap (configurable) and no more silent "N/A" exit reasons
-
-V3.2 Fixes (No Ghost Positions / Fixed Gap / No Hedges / Market Orders)
----------------
-* Removed Hedge logic entirely to prevent roll-inversion margin spikes
-* Gap filter now explicitly uses the Previous Day Close via getMarketData("FULL") instead of the live Close
-* ORDER_MODE defaults to MARKET to prevent orderBook polling deadlocks during the 9:50 AM rush
-* Before EVERY exit order the broker's position book is read; the bot only trades what is
-  actually open (already-closed legs are skipped, partial quantities are respected)
-* Pending/open orders on the bot's symbols are cancelled before exit and after it
-* After the 3:10 PM square-off the account is verified FLAT
+* Enhanced Observability: Detailed console prints for intermediate mathematical 
+  variables (OHLC data, strike offsets, and roll thresholds) for manual debugging.
 """
 import sys
 import os
@@ -36,6 +17,18 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional, Dict, List
 from zoneinfo import ZoneInfo
+
+# ==========================================
+# 0. AUTO-LOAD CONFIG FOR MANUAL RUNS
+# ==========================================
+CONFIG_ENV_PATH = "/etc/trade-config/config.env"
+if os.path.exists(CONFIG_ENV_PATH):
+    with open(CONFIG_ENV_PATH, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
 
 import pandas as pd
 import pyotp
@@ -84,14 +77,14 @@ if missing_env:
     print(f"CRITICAL: missing environment variables: {', '.join(missing_env)}")
     sys.exit(1)
 
-STRATEGY_VERSION = "V3.2"
+STRATEGY_VERSION = "V4.1_ZERO_TOUCH"
 
 # --- Mode -------------------------------------------------------------
-PAPER_MODE = env_bool("PAPER_MODE", True)          # SAFE DEFAULT: no real orders
+PAPER_MODE = env_bool("PAPER_MODE", True)          
 PAPER_SLIPPAGE_PTS = env_float("PAPER_SLIPPAGE_PTS", 0.5)
 
 # --- Strategy rules ---------------------------------------------------
-NUM_LOTS = env_int("NUM_LOTS", 5)
+NUM_LOTS = env_int("NUM_LOTS", 3)
 FALLBACK_LOT_SIZE = env_int("FALLBACK_LOT_SIZE", 65)
 ENTRY_HOUR, ENTRY_MIN = 9, 50
 ENTRY_GRACE_MIN = env_int("ENTRY_GRACE_MIN", 5)
@@ -108,7 +101,7 @@ MAX_ROLLS_PER_SIDE = env_int("MAX_ROLLS_PER_SIDE", 1)
 EXPIRY_MODE = os.environ.get("EXPIRY_MODE", "NEXT").upper()
 
 # --- Execution --------------------------------------------------------
-ORDER_MODE = os.environ.get("ORDER_MODE", "MARKET").upper()  # Defaulted to MARKET for speed & reliability
+ORDER_MODE = "MARKET"
 MARKET_WAIT_SECS = env_int("MARKET_WAIT_SECS", 15)
 ORDER_POLL_SECS = 1.0
 
@@ -119,9 +112,8 @@ DATA_FAIL_EXIT_SECS = env_int("DATA_FAIL_EXIT_SECS", 60)
 
 # --- Safety -----------------------------------------------------------
 MIN_REQUIRED_MARGIN = env_float("MIN_REQUIRED_MARGIN", 0.0)
-HOLIDAYS = {d.strip() for d in os.environ.get("MARKET_HOLIDAYS", "").split(",") if d.strip()}
 
-# --- Charges (VERIFY against current Angel One / exchange schedules) ---
+# --- Charges ---
 BROKERAGE_PER_ORDER = env_float("BROKERAGE_PER_ORDER", 20.0)
 STT_SELL_PCT = env_float("STT_SELL_PCT", 0.0015)
 EXCHANGE_PCT = env_float("EXCHANGE_PCT", 0.000355299)
@@ -220,7 +212,7 @@ class Bot:
             try:
                 res = self.smart.generateSession(CLIENT_CODE, PIN, pyotp.TOTP(TOTP_SECRET).now())
                 if res and res.get("status"):
-                    print("SmartAPI session authenticated.")
+                    print("➜ SmartAPI session authenticated.")
                     return
                 print(f"Session attempt {attempt} rejected: {res}")
             except Exception as e:
@@ -291,17 +283,10 @@ class Bot:
                 res = self.smart.getMarketData("FULL", {"NSE": [tok]})
                 if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                     q = res["data"]["fetched"][0]
-                    trade_date = None
-                    try:
-                        trade_date = datetime.datetime.strptime(
-                            str(q.get("exchTradeTime", "")), "%d-%b-%Y %H:%M:%S").date()
-                    except Exception:
-                        pass
-                    # FIX: Safely parse previousClose or fallback to live close
                     pc = float(q.get("previousClose", 0) or q.get("pc", 0) or q.get("close", 0) or 0)
                     return {"ltp": float(q.get("ltp", 0) or 0), "open": float(q.get("open", 0) or 0),
                             "high": float(q.get("high", 0) or 0), "low": float(q.get("low", 0) or 0),
-                            "close": pc, "trade_date": trade_date}
+                            "close": pc}
             except Exception as e:
                 print(f"OHLC error ({tok}): {e}")
         return None
@@ -309,13 +294,13 @@ class Bot:
     def check_filters(self):
         o = self.spot_ohlc()
         if not o or o["ltp"] <= 0 or o["open"] <= 0 or o["close"] <= 0:
-            return False, 0.0, 0.0, 0.0, "No valid Nifty OHLC (holiday / market closed / data issue)."
-        # if o["trade_date"] and o["trade_date"] != now_ist().date():
-        #     return False, o["ltp"], 0.0, 0.0, "Stale quote date - market likely closed today (holiday?)."
+            return False, 0.0, 0.0, 0.0, "No valid Nifty OHLC feed available. Market closed or feed down."
         
-        # FIX: Gap calculated against Previous Day Close
         gap_pct = (o["open"] - o["close"]) / o["close"] * 100.0     
         orb = o["high"] - o["low"]
+        
+        print(f"➜ API OHLC Feed -> Open: {o['open']}, High: {o['high']}, Low: {o['low']}, PrevClose: {o['close']}")
+        print(f"➜ Filter Math   -> Gap Calc: {gap_pct:+.2f}% | ORB Calc: {orb:.1f} pts")
         
         if abs(gap_pct) > MAX_GAP_PERCENT:
             return False, o["ltp"], gap_pct, orb, f"Opening gap {gap_pct:+.2f}% exceeds {MAX_GAP_PERCENT}%."
@@ -330,6 +315,7 @@ class Bot:
             res = self.smart.rmsLimit()
             data = res.get("data") or {}
             avail = float(data.get("net") or data.get("availablecash") or 0)
+            print(f"➜ Margin Check  -> Available: ₹{avail:,.0f} | Required: ₹{MIN_REQUIRED_MARGIN:,.0f}")
             return avail >= MIN_REQUIRED_MARGIN, f"available ₹{avail:,.0f} vs required ₹{MIN_REQUIRED_MARGIN:,.0f}"
         except Exception as e:
             return False, f"margin check failed: {e}"
@@ -395,7 +381,6 @@ class Bot:
             print(f"[paper] {side} {qty} {symbol} @ {fill:.2f}")
             return round(fill, 2)
 
-        # FIX: Always force MARKET orders to prevent orderbook polling deadlock
         oid2 = self._place(symbol, token, side, qty, "MARKET", 0)
         info2 = self._wait_terminal(oid2, MARKET_WAIT_SECS)
         st2 = self._status(info2)
@@ -469,8 +454,7 @@ class Bot:
             try:
                 self.smart.cancelOrder(o.get("orderid"), o.get("variety") or "NORMAL")
                 cancelled += 1
-                print(f"Cancelled pending order {o.get('orderid')} {o.get('tradingsymbol')} "
-                      f"({self._status(o)}) {reason}")
+                print(f"Cancelled pending order {o.get('orderid')} {o.get('tradingsymbol')} ({self._status(o)}) {reason}")
             except Exception as e:
                 print(f"Cancel failed for {o.get('orderid')}: {e}")
         if cancelled:
@@ -498,340 +482,4 @@ class Bot:
                     leg.active, status = False, "already_flat"
                     px = ref_ltp or leg.entry_px
                     leg.exit_px = px
-                    pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * leg.qty
-                    self.realized += pnl
-                    self.save_state()
-                    tg(f"ℹ️ {leg.symbol} is already flat at the broker - no order sent.")
-                    return pnl, status
-                if (actual < 0) != (expected < 0):
-                    msg = (f"{leg.symbol}: broker net qty {actual} has the OPPOSITE direction to the "
-                           f"bot's record ({expected}). No order sent.")
-                    tg(f"🚨 {msg} CHECK MANUALLY.")
-                    raise OrderError(msg)
-                if abs(actual) != abs(expected):
-                    tg(f"⚠️ {leg.symbol}: broker net qty {actual} differs from bot record {expected}. "
-                       f"Closing the broker quantity ({abs(actual)}).")
-                    qty_to_close, status = abs(actual), "partial"
-
-        px = self.execute(leg.symbol, leg.token, close_side, qty_to_close, ref_ltp, force_market)
-        self.ledger.record(close_side, px, qty_to_close)
-        leg.exit_px, leg.active = px, False
-        pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * qty_to_close
-        self.realized += pnl
-        self.save_state()
-        return pnl, status
-
-    def verify_flat(self) -> bool:
-        if PAPER_MODE:
-            return True
-        for rnd in range(1, FLAT_VERIFY_ROUNDS + 1):
-            time.sleep(2)
-            self.cancel_pending_orders(f"(post-exit check, round {rnd})")
-            net = self.get_net_positions()
-            leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
-            pend = self.open_orders()
-            if leftover == {} and pend == []:
-                tg("✅ VERIFIED FLAT: no open positions or pending orders on the bot's symbols.")
-                return True
-            if leftover is None or pend is None:
-                print(f"verify_flat round {rnd}: could not read positions/orders")
-                continue
-            if leftover:
-                tg(f"⚠️ Round {rnd}: still open after exit: {leftover}. Closing again.")
-                self.emergency_square_off(f"post-exit leftovers {leftover}")
-        net = self.get_net_positions()
-        pend = self.open_orders()
-        leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
-        tg(f"🚨🚨 NOT VERIFIED FLAT after {FLAT_VERIFY_ROUNDS} rounds.\n"
-           f"Positions: {leftover if leftover is not None else 'UNREADABLE'}\n"
-           f"Pending orders: {len(pend) if pend is not None else 'UNREADABLE'}\n"
-           f"OPEN ANGEL ONE AND CLOSE / CANCEL MANUALLY NOW.")
-        return False
-
-    def active(self, role=None) -> List[Leg]:
-        return [l for l in self.legs if l.active and (role is None or l.role == role)]
-
-    def emergency_square_off(self, reason=""):
-        if PAPER_MODE:
-            tg(f"🛑 [paper] emergency square-off triggered: {reason}")
-            return
-        tg(f"🛑 EMERGENCY SQUARE-OFF: {reason}")
-        self.cancel_pending_orders("before emergency square-off")
-        positions = None
-        for i in range(POSITION_READ_TRIES):
-            try:
-                res = self.smart.position()
-                if res and res.get("status"):
-                    positions = res.get("data") or []
-                    break
-            except Exception as e:
-                print(f"position() error (try {i + 1}): {e}")
-            time.sleep(0.7 * (i + 1))
-        if positions is None:
-            tg("🚨 Could not read positions. CLOSE POSITIONS MANUALLY IN ANGEL ONE NOW.")
-            return
-        todo = []
-        for p in positions:
-            if p.get("exchange") != "NFO" or p.get("tradingsymbol") not in self.traded_symbols:
-                continue
-            if str(p.get("producttype") or "INTRADAY").upper() != "INTRADAY":
-                continue
-            net = int(float(p.get("netqty", 0) or 0))
-            if net != 0:
-                todo.append((0 if net < 0 else 1, p["tradingsymbol"], str(p["symboltoken"]), net))
-        todo.sort()
-        failed = []
-        for _, sym, tok, net in todo:
-            side = "BUY" if net < 0 else "SELL"
-            try:
-                oid = self._place(sym, tok, side, abs(net), "MARKET", 0)
-                info = self._wait_terminal(oid, MARKET_WAIT_SECS)
-                if self._status(info) != "complete":
-                    failed.append(sym)
-            except Exception as e:
-                print(f"Emergency close failed for {sym}: {e}")
-                failed.append(sym)
-        if failed:
-            tg(f"🚨 STILL OPEN after emergency exit: {', '.join(failed)}. CLOSE MANUALLY NOW.")
-        else:
-            tg(f"✅ Emergency square-off complete ({len(todo)} positions closed).")
-
-    def save_state(self):
-        if not self.lock_path:
-            return
-        try:
-            with open(self.lock_path, "w") as f:
-                json.dump({"paper": PAPER_MODE, "expiry": str(self.expiry), "realized": self.realized,
-                           "legs": [l.__dict__ for l in self.legs]}, f, indent=1)
-        except Exception as e:
-            print(f"State save failed: {e}")
-
-    def log_sheet(self, row):
-        headers = ["Date", "Timestamp", "Strategy_Version", "Session_Status", "Nifty_Spot_950", "Gap_Pct",
-                   "ORB_915_950_Pts", "Initial_CE_Symbol", "Initial_PE_Symbol", "Initial_Combined_Premium",
-                   "Final_CE_Symbol", "Final_PE_Symbol", "Active_Qty", "Rolled_Status", "Exit_Reason",
-                   "Gross_PnL", "Charges", "Net_PnL"]
-        try:
-            if not os.path.exists(SERVICE_ACCOUNT_FILE):
-                raise FileNotFoundError(SERVICE_ACCOUNT_FILE)
-            ws = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2).sheet1
-            if not ws.row_values(1):
-                ws.append_row(headers)
-            ws.append_row(row)
-        except Exception as e:
-            print(f"Sheet logging failed: {e}")
-            tg(f"⚠️ SHEET LOGGING FAILED ({e}). Please log this trade manually.")
-
-    def version_tag(self):
-        return f"{STRATEGY_VERSION} {'PAPER' if PAPER_MODE else 'LIVE'}"
-
-    def try_roll(self, opt_type, spot):
-        shorts = self.active("SHORT_" + opt_type)
-        if not shorts or self.rolls[opt_type] >= MAX_ROLLS_PER_SIDE:
-            return
-        short = shorts[0]
-        if opt_type == "CE":
-            triggered = spot >= short.strike - SPOT_ROLL_BUFFER
-            new_strike = short.strike + ROLL_DISTANCE_PTS
-        else:
-            triggered = spot <= short.strike + SPOT_ROLL_BUFFER
-            new_strike = short.strike - ROLL_DISTANCE_PTS
-        if not triggered:
-            return
-        
-        contract = self.find_contract(new_strike, opt_type)
-        if not contract:
-            self.rolls[opt_type] = MAX_ROLLS_PER_SIDE
-            tg(f"⚠️ {opt_type} roll skipped: strike {new_strike} not listed. Position unchanged.")
-            return
-            
-        old_sym = short.symbol
-        leg_pnl, close_status = self.close_leg(short, self.last_q.get(short.token))
-        self.rolls[opt_type] += 1
-        
-        if close_status == "already_flat":
-            self.rolls[opt_type] = MAX_ROLLS_PER_SIDE
-            tg(f"⚠️ {opt_type} roll cancelled: {old_sym} was already closed at the broker. No new leg opened.")
-            return
-            
-        new_ltp = self.get_ltp_retry("NFO", contract["token"])
-        new_leg = self.open_leg("SHORT_" + opt_type, opt_type, new_strike, contract, "SELL", new_ltp)
-        tg(f"🔄 {opt_type} {old_sym} rolled to {new_leg.symbol} @ ₹{new_leg.entry_px:.2f}\nBooked leg P&L: ₹{leg_pnl:,.2f}")
-
-    def run(self):
-        today = now_ist().date()
-        if today.weekday() >= 5 or str(today) in HOLIDAYS:
-            print("Weekend / configured holiday - nothing to do.")
-            return
-
-        self.lock_path = f"run_lock_{today}_{'paper' if PAPER_MODE else 'live'}.json"
-        if os.path.exists(self.lock_path):
-            tg(f"⚠️ Bot already ran today ({self.lock_path} exists). Not re-entering. Check Angel One for open positions.")
-            self.lock_path = ""
-            return
-
-        entry_time = at_ist(today, ENTRY_HOUR, ENTRY_MIN)
-        exit_time = at_ist(today, EXIT_HOUR, EXIT_MIN)
-        if now_ist() > entry_time + datetime.timedelta(minutes=ENTRY_GRACE_MIN):
-            tg(f"⚠️ Started too late ({now_ist():%H:%M:%S} IST). Skipping today.")
-            return
-
-        self.login()
-        self.load_master()
-        print(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'} | Expiry: {self.expiry} ({EXPIRY_MODE})")
-        print("Waiting for 9:50 AM IST ...")
-        wait_until(entry_time)
-
-        today_str = str(today)
-        ok, spot, gap_pct, orb, msg = self.check_filters()
-        if not ok:
-            tg(f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {msg}")
-            self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
-                            round(spot, 2), round(gap_pct, 2), round(orb, 2), "N/A", "N/A", 0.0,
-                            "N/A", "N/A", 0, "No", msg, 0.0, 0.0, 0.0])
-            return
-
-        atm = int(round(spot / 50.0) * 50)
-        atm_ce, atm_pe = self.find_contract(atm, "CE"), self.find_contract(atm, "PE")
-        if not atm_ce or not atm_pe:
-            tg(f"⚠️ SKIPPED: ATM {atm} contracts not found for {self.expiry}.")
-            return
-            
-        q = self.get_ltps({"NFO": [atm_ce["token"], atm_pe["token"]]})
-        if atm_ce["token"] not in q or atm_pe["token"] not in q:
-            tg("⚠️ SKIPPED: could not read ATM straddle prices.")
-            return
-            
-        offset = (q[atm_ce["token"]] + q[atm_pe["token"]]) * DELTA_WIDTH_MULTIPLIER
-        ce_strike = int(round((spot + offset) / 50.0) * 50)
-        pe_strike = int(round((spot - offset) / 50.0) * 50)
-        ce_c, pe_c = self.find_contract(ce_strike, "CE"), self.find_contract(pe_strike, "PE")
-        
-        if not ce_c or not pe_c:
-            tg(f"⚠️ SKIPPED: required strikes not listed (CE {ce_strike}, PE {pe_strike}).")
-            return
-
-        lot = ce_c["lotsize"]
-        self.qty = NUM_LOTS * lot
-
-        margin_ok, margin_msg = self.check_margin()
-        if not margin_ok:
-            tg(f"⚠️ SKIPPED: insufficient margin ({margin_msg}).")
-            return
-
-        open(self.lock_path, "w").close()
-        ltps = self.get_ltps({"NFO": [c["token"] for c in (ce_c, pe_c) if c]})
-        
-        short_ce = self.open_leg("SHORT_CE", "CE", ce_strike, ce_c, "SELL", ltps.get(ce_c["token"]))
-        short_pe = self.open_leg("SHORT_PE", "PE", pe_strike, pe_c, "SELL", ltps.get(pe_c["token"]))
-
-        initial_premium = short_ce.entry_px + short_pe.entry_px
-        max_loss = initial_premium * MAX_PREMIUM_LOSS_PCT * self.qty
-        initial_ce_sym, initial_pe_sym = short_ce.symbol, short_pe.symbol
-
-        tg(f"🟢 STRANGLE DEPLOYED ({NUM_LOTS} lots | {self.qty} qty | {now_ist():%H:%M})\nExpiry: {self.expiry} | Spot: {spot:.2f} | Gap {gap_pct:+.2f}% | ORB {orb:.0f} pts\nCE {short_ce.symbol} @ ₹{short_ce.entry_px:.2f} | PE {short_pe.symbol} @ ₹{short_pe.entry_px:.2f}\nCombined premium ₹{initial_premium:.2f}\nHard SL: -₹{max_loss:,.0f} ({int(MAX_PREMIUM_LOSS_PCT * 100)}% of premium)")
-        self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "ENTERED",
-                        round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
-                        round(initial_premium, 2), initial_ce_sym, initial_pe_sym, self.qty, "No",
-                        "OPEN", 0.0, 0.0, 0.0])
-
-        exit_reason, force_market = "N/A", False
-        last_ok, feed_alerted = time.time(), False
-        last_slot = now_ist().hour * 2 + now_ist().minute // 30
-
-        while True:
-            now = now_ist()
-            if now >= exit_time:
-                exit_reason = "Time Exit (3:10 PM)"
-                break
-
-            active_legs = self.active()
-            need = [NIFTY_SPOT_TOKEN] + [l.token for l in active_legs]
-            q = self.get_ltps({"NSE": [NIFTY_SPOT_TOKEN], "NFO": [l.token for l in active_legs]})
-            
-            if any(t not in q for t in need):
-                stale = time.time() - last_ok
-                if stale >= DATA_FAIL_EXIT_SECS:
-                    exit_reason, force_market = f"Data feed lost {int(stale)}s - forced exit", True
-                    break
-                if stale >= DATA_FAIL_ALERT_SECS and not feed_alerted:
-                    tg(f"⚠️ No market data for {int(stale)}s. Forced exit at {DATA_FAIL_EXIT_SECS}s.")
-                    feed_alerted = True
-                time.sleep(1)
-                continue
-                
-            last_ok, feed_alerted = time.time(), False
-            self.last_q = q
-            spot_now = q[NIFTY_SPOT_TOKEN]
-
-            open_pnl = sum(((l.entry_px - q[l.token]) if l.side == "SELL" else (q[l.token] - l.entry_px)) * l.qty
-                           for l in active_legs)
-            total_pnl = self.realized + open_pnl
-
-            slot = now.hour * 2 + now.minute // 30
-            if slot != last_slot and now.minute % 30 == 0:
-                last_slot = slot
-                tg(f"⏱️ {now:%I:%M %p}: P&L ₹{total_pnl:,.0f} | Spot {spot_now:.2f}")
-
-            if total_pnl <= -max_loss:
-                exit_reason = f"Hard SL ({int(MAX_PREMIUM_LOSS_PCT * 100)}% premium loss)"
-                break
-
-            try:
-                self.try_roll("CE", spot_now)
-                self.try_roll("PE", spot_now)
-            except OrderError as e:
-                exit_reason, force_market = f"Roll order failed: {e}", True
-                break
-
-            time.sleep(POLL_SECS)
-
-        self.cancel_pending_orders("at exit time")
-        failures = []
-        for leg in sorted(self.active(), key=lambda l: 0 if l.side == "SELL" else 1):
-            try:
-                self.close_leg(leg, self.last_q.get(leg.token), force_market)
-            except Exception as e:
-                failures.append(leg.symbol)
-                print(f"Exit failed for {leg.symbol}: {e}")
-                
-        if failures:
-            self.emergency_square_off(f"normal exit failed for {', '.join(failures)}")
-            
-        flat_ok = self.verify_flat()
-        if not flat_ok:
-            exit_reason += " | NOT VERIFIED FLAT - CHECK BROKER"
-
-        gross = self.realized
-        charges = self.ledger.charges()
-        net = gross - charges
-        rolled = "No" if not any(self.rolls.values()) else "+".join(k for k, v in self.rolls.items() if v) + " rolled"
-
-        def last_sym(role, default):
-            m = [l.symbol for l in self.legs if l.role == role]
-            return m[-1] if m else default
-
-        tg(f"🏁 BOT CLOSED | {exit_reason}\nGross ₹{gross:+,.2f} | Charges ₹{charges:,.2f} | Net ₹{net:+,.2f}")
-        self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "TRADED",
-                        round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
-                        round(initial_premium, 2), last_sym("SHORT_CE", "N/A"), last_sym("SHORT_PE", "N/A"),
-                        self.qty, rolled, exit_reason, round(gross, 2), round(charges, 2), round(net, 2)])
-        try:
-            self.smart.terminateSession(CLIENT_CODE)
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    bot = Bot()
-    try:
-        bot.run()
-    except Exception as e:
-        print(f"CRITICAL FAILURE:\n{traceback.format_exc()}")
-        tg(f"🚨 FATAL BOT CRASH 🚨\n{e}\nAttempting emergency square-off...")
-        try:
-            if bot.smart and bot.traded_symbols:
-                bot.emergency_square_off(f"crash: {e}")
-                bot.verify_flat()
-        except Exception as e2:
-            tg(f"🚨 Emergency square-off itself failed: {e2}. CLOSE POSITIONS MANUALLY NOW.")
-        sys.exit(1)
+                    pnl = ((leg.entry_
