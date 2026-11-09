@@ -2,10 +2,11 @@
 """
 adaptive_strangle_v4.py  --  Nifty intraday short strangle bot (Zero-Touch Edition)
 
-V4.1 Upgrades
+V4.2 Upgrades
 ---------------
-* Enhanced Observability: Detailed console prints for intermediate mathematical 
-  variables (OHLC data, strike offsets, and roll thresholds) for manual debugging.
+* Universal Skip Logging: Added central `abort_and_log` function. The bot now writes a 
+  "SKIPPED" row to the Google Sheet for ALL abort scenarios (Weekends, Holidays, Late Starts, 
+  Missing Contracts, Margin Failures) and generates a lock file to prevent duplicate logging.
 """
 import sys
 import os
@@ -77,7 +78,7 @@ if missing_env:
     print(f"CRITICAL: missing environment variables: {', '.join(missing_env)}")
     sys.exit(1)
 
-STRATEGY_VERSION = "V4.1_ZERO_TOUCH"
+STRATEGY_VERSION = "V4.2_ZERO_TOUCH"
 
 # --- Mode -------------------------------------------------------------
 PAPER_MODE = env_bool("PAPER_MODE", True)          
@@ -639,8 +640,24 @@ class Bot:
 
     def run(self):
         today = now_ist().date()
+        self.lock_path = f"run_lock_{today}_{'paper' if PAPER_MODE else 'live'}.json"
+
+        # Check lock first to avoid spamming the sheet if triggered multiple times
+        if os.path.exists(self.lock_path):
+            tg(f"⚠️ Bot already ran or skipped today ({self.lock_path} exists). Not re-entering.")
+            return
+
+        def abort_and_log(reason, spot=0.0, gap=0.0, orb=0.0):
+            # Create the lock file so we don't log this again if triggered manually later today
+            open(self.lock_path, "w").close()
+            today_str = str(today)
+            tg(f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {reason}")
+            self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
+                            round(spot, 2), round(gap, 2), round(orb, 2), "N/A", "N/A", 0.0,
+                            "N/A", "N/A", 0, "No", reason, 0.0, 0.0, 0.0])
+
         if today.weekday() >= 5:
-            print("Weekend - nothing to do.")
+            abort_and_log("Weekend - Non-trading day")
             return
 
         try:
@@ -648,18 +665,12 @@ class Bot:
             nse = mcal.get_calendar('BSE') 
             schedule = nse.schedule(start_date=str(today), end_date=str(today))
             if schedule.empty:
-                tg(f"📅 AUTO-HOLIDAY DETECTED: Exchange is officially closed today ({today}). Sleeping.")
+                abort_and_log(f"Auto-Holiday detected: Exchange is officially closed.")
                 return
         except ImportError:
             print("⚠️ pandas_market_calendars not installed. Cannot auto-verify holidays. Proceeding...")
         except Exception as e:
             print(f"Auto-holiday API check failed: {e}")
-
-        self.lock_path = f"run_lock_{today}_{'paper' if PAPER_MODE else 'live'}.json"
-        if os.path.exists(self.lock_path):
-            tg(f"⚠️ Bot already ran today ({self.lock_path} exists). Not re-entering.")
-            self.lock_path = ""
-            return
 
         entry_time = at_ist(today, ENTRY_HOUR, ENTRY_MIN)
         exit_time = at_ist(today, EXIT_HOUR, EXIT_MIN)
@@ -673,7 +684,7 @@ class Bot:
         print("--------------------------------------------------")
 
         if now_ist() > grace_limit:
-            tg(f"⚠️ Started too late ({now_ist():%H:%M:%S} IST). Cutoff was {grace_limit:%H:%M:%S} IST. Skipping today.")
+            abort_and_log(f"Started too late (cutoff was {grace_limit:%H:%M:%S} IST).")
             return
 
         self.login()
@@ -682,13 +693,9 @@ class Bot:
         print("Waiting for 9:50 AM IST ...")
         wait_until(entry_time)
 
-        today_str = str(today)
         ok, spot, gap_pct, orb, msg = self.check_filters()
         if not ok:
-            tg(f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {msg}")
-            self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
-                            round(spot, 2), round(gap_pct, 2), round(orb, 2), "N/A", "N/A", 0.0,
-                            "N/A", "N/A", 0, "No", msg, 0.0, 0.0, 0.0])
+            abort_and_log(msg, spot, gap_pct, orb)
             return
 
         atm = int(round(spot / 50.0) * 50)
@@ -697,12 +704,12 @@ class Bot:
         print(f"➜ Strike Math   -> Spot: {spot:.2f} | Selected ATM: {atm}")
         
         if not atm_ce or not atm_pe:
-            tg(f"⚠️ SKIPPED: ATM {atm} contracts not found for {self.expiry}.")
+            abort_and_log(f"ATM {atm} contracts not found for expiry {self.expiry}.", spot, gap_pct, orb)
             return
             
         q = self.get_ltps({"NFO": [atm_ce["token"], atm_pe["token"]]})
         if atm_ce["token"] not in q or atm_pe["token"] not in q:
-            tg("⚠️ SKIPPED: could not read ATM straddle prices.")
+            abort_and_log("Could not read ATM straddle prices from feed.", spot, gap_pct, orb)
             return
             
         offset = (q[atm_ce["token"]] + q[atm_pe["token"]]) * DELTA_WIDTH_MULTIPLIER
@@ -716,7 +723,7 @@ class Bot:
         ce_c, pe_c = self.find_contract(ce_strike, "CE"), self.find_contract(pe_strike, "PE")
         
         if not ce_c or not pe_c:
-            tg(f"⚠️ SKIPPED: required strikes not listed (CE {ce_strike}, PE {pe_strike}).")
+            abort_and_log(f"Required target strikes not listed (CE {ce_strike}, PE {pe_strike}).", spot, gap_pct, orb)
             return
 
         lot = ce_c["lotsize"]
@@ -724,9 +731,10 @@ class Bot:
 
         margin_ok, margin_msg = self.check_margin()
         if not margin_ok:
-            tg(f"⚠️ SKIPPED: insufficient margin ({margin_msg}).")
+            abort_and_log(f"Insufficient margin: {margin_msg}", spot, gap_pct, orb)
             return
 
+        # Deploy Strangle
         open(self.lock_path, "w").close()
         ltps = self.get_ltps({"NFO": [c["token"] for c in (ce_c, pe_c) if c]})
         
@@ -743,6 +751,7 @@ class Bot:
         print(f"➜ PE Roll Trigger-> Spot <= {short_pe.strike + SPOT_ROLL_BUFFER:.2f}")
         print("--------------------------------------------------")
 
+        today_str = str(today)
         tg(f"🟢 STRANGLE DEPLOYED ({NUM_LOTS} lots | {self.qty} qty | {now_ist():%H:%M})\nExpiry: {self.expiry} | Spot: {spot:.2f} | Gap {gap_pct:+.2f}% | ORB {orb:.0f} pts\nCE {short_ce.symbol} @ ₹{short_ce.entry_px:.2f} | PE {short_pe.symbol} @ ₹{short_pe.entry_px:.2f}\nCombined premium ₹{initial_premium:.2f}\nHard SL: -₹{max_loss:,.0f} ({int(MAX_PREMIUM_LOSS_PCT * 100)}% of premium)")
         self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "ENTERED",
                         round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
