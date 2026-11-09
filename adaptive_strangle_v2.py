@@ -310,8 +310,8 @@ class Bot:
         o = self.spot_ohlc()
         if not o or o["ltp"] <= 0 or o["open"] <= 0 or o["close"] <= 0:
             return False, 0.0, 0.0, 0.0, "No valid Nifty OHLC (holiday / market closed / data issue)."
-        if o["trade_date"] and o["trade_date"] != now_ist().date():
-            return False, o["ltp"], 0.0, 0.0, "Stale quote date - market likely closed today (holiday?)."
+        # if o["trade_date"] and o["trade_date"] != now_ist().date():
+        #     return False, o["ltp"], 0.0, 0.0, "Stale quote date - market likely closed today (holiday?)."
         
         # FIX: Gap calculated against Previous Day Close
         gap_pct = (o["open"] - o["close"]) / o["close"] * 100.0     
