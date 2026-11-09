@@ -482,4 +482,370 @@ class Bot:
                     leg.active, status = False, "already_flat"
                     px = ref_ltp or leg.entry_px
                     leg.exit_px = px
-                    pnl = ((leg.entry_
+                    pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * leg.qty
+                    self.realized += pnl
+                    self.save_state()
+                    tg(f"ℹ️ {leg.symbol} is already flat at the broker - no order sent.")
+                    return pnl, status
+                if (actual < 0) != (expected < 0):
+                    msg = (f"{leg.symbol}: broker net qty {actual} has the OPPOSITE direction to the bot's record ({expected}). No order sent.")
+                    tg(f"🚨 {msg} CHECK MANUALLY.")
+                    raise OrderError(msg)
+                if abs(actual) != abs(expected):
+                    tg(f"⚠️ {leg.symbol}: broker net qty {actual} differs from bot record {expected}. Closing the broker quantity ({abs(actual)}).")
+                    qty_to_close, status = abs(actual), "partial"
+
+        px = self.execute(leg.symbol, leg.token, close_side, qty_to_close, ref_ltp, force_market)
+        self.ledger.record(close_side, px, qty_to_close)
+        leg.exit_px, leg.active = px, False
+        pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * qty_to_close
+        self.realized += pnl
+        self.save_state()
+        return pnl, status
+
+    def verify_flat(self) -> bool:
+        if PAPER_MODE:
+            return True
+        for rnd in range(1, FLAT_VERIFY_ROUNDS + 1):
+            time.sleep(2)
+            self.cancel_pending_orders(f"(post-exit check, round {rnd})")
+            net = self.get_net_positions()
+            leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
+            pend = self.open_orders()
+            if leftover == {} and pend == []:
+                tg("✅ VERIFIED FLAT: no open positions or pending orders on the bot's symbols.")
+                return True
+            if leftover is None or pend is None:
+                print(f"verify_flat round {rnd}: could not read positions/orders")
+                continue
+            if leftover:
+                tg(f"⚠️ Round {rnd}: still open after exit: {leftover}. Closing again.")
+                self.emergency_square_off(f"post-exit leftovers {leftover}")
+        net = self.get_net_positions()
+        pend = self.open_orders()
+        leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
+        tg(f"🚨🚨 NOT VERIFIED FLAT after {FLAT_VERIFY_ROUNDS} rounds.\nPositions: {leftover if leftover is not None else 'UNREADABLE'}\nPending orders: {len(pend) if pend is not None else 'UNREADABLE'}\nOPEN ANGEL ONE AND CLOSE / CANCEL MANUALLY NOW.")
+        return False
+
+    def active(self, role=None) -> List[Leg]:
+        return [l for l in self.legs if l.active and (role is None or l.role == role)]
+
+    def emergency_square_off(self, reason=""):
+        if PAPER_MODE:
+            tg(f"🛑 [paper] emergency square-off triggered: {reason}")
+            return
+        tg(f"🛑 EMERGENCY SQUARE-OFF: {reason}")
+        self.cancel_pending_orders("before emergency square-off")
+        positions = None
+        for i in range(POSITION_READ_TRIES):
+            try:
+                res = self.smart.position()
+                if res and res.get("status"):
+                    positions = res.get("data") or []
+                    break
+            except Exception as e:
+                print(f"position() error (try {i + 1}): {e}")
+            time.sleep(0.7 * (i + 1))
+        if positions is None:
+            tg("🚨 Could not read positions. CLOSE POSITIONS MANUALLY IN ANGEL ONE NOW.")
+            return
+        todo = []
+        for p in positions:
+            if p.get("exchange") != "NFO" or p.get("tradingsymbol") not in self.traded_symbols:
+                continue
+            if str(p.get("producttype") or "INTRADAY").upper() != "INTRADAY":
+                continue
+            net = int(float(p.get("netqty", 0) or 0))
+            if net != 0:
+                todo.append((0 if net < 0 else 1, p["tradingsymbol"], str(p["symboltoken"]), net))
+        todo.sort()
+        failed = []
+        for _, sym, tok, net in todo:
+            side = "BUY" if net < 0 else "SELL"
+            try:
+                oid = self._place(sym, tok, side, abs(net), "MARKET", 0)
+                info = self._wait_terminal(oid, MARKET_WAIT_SECS)
+                if self._status(info) != "complete":
+                    failed.append(sym)
+            except Exception as e:
+                print(f"Emergency close failed for {sym}: {e}")
+                failed.append(sym)
+        if failed:
+            tg(f"🚨 STILL OPEN after emergency exit: {', '.join(failed)}. CLOSE MANUALLY NOW.")
+        else:
+            tg(f"✅ Emergency square-off complete ({len(todo)} positions closed).")
+
+    def save_state(self):
+        if not self.lock_path:
+            return
+        try:
+            with open(self.lock_path, "w") as f:
+                json.dump({"paper": PAPER_MODE, "expiry": str(self.expiry), "realized": self.realized,
+                           "legs": [l.__dict__ for l in self.legs]}, f, indent=1)
+        except Exception as e:
+            print(f"State save failed: {e}")
+
+    def log_sheet(self, row):
+        headers = ["Date", "Timestamp", "Strategy_Version", "Session_Status", "Nifty_Spot_950", "Gap_Pct",
+                   "ORB_915_950_Pts", "Initial_CE_Symbol", "Initial_PE_Symbol", "Initial_Combined_Premium",
+                   "Final_CE_Symbol", "Final_PE_Symbol", "Active_Qty", "Rolled_Status", "Exit_Reason",
+                   "Gross_PnL", "Charges", "Net_PnL"]
+        try:
+            if not os.path.exists(SERVICE_ACCOUNT_FILE):
+                raise FileNotFoundError(SERVICE_ACCOUNT_FILE)
+            ws = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2).sheet1
+            if not ws.row_values(1):
+                ws.append_row(headers)
+            ws.append_row(row)
+        except Exception as e:
+            print(f"Sheet logging failed: {e}")
+            tg(f"⚠️ SHEET LOGGING FAILED ({e}). Please log this trade manually.")
+
+    def version_tag(self):
+        return f"{STRATEGY_VERSION} {'PAPER' if PAPER_MODE else 'LIVE'}"
+
+    def try_roll(self, opt_type, spot):
+        shorts = self.active("SHORT_" + opt_type)
+        if not shorts or self.rolls[opt_type] >= MAX_ROLLS_PER_SIDE:
+            return
+        short = shorts[0]
+        if opt_type == "CE":
+            triggered = spot >= short.strike - SPOT_ROLL_BUFFER
+            new_strike = short.strike + ROLL_DISTANCE_PTS
+        else:
+            triggered = spot <= short.strike + SPOT_ROLL_BUFFER
+            new_strike = short.strike - ROLL_DISTANCE_PTS
+        if not triggered:
+            return
+        
+        contract = self.find_contract(new_strike, opt_type)
+        if not contract:
+            self.rolls[opt_type] = MAX_ROLLS_PER_SIDE
+            tg(f"⚠️ {opt_type} roll skipped: strike {new_strike} not listed. Position unchanged.")
+            return
+            
+        old_sym = short.symbol
+        leg_pnl, close_status = self.close_leg(short, self.last_q.get(short.token))
+        self.rolls[opt_type] += 1
+        
+        if close_status == "already_flat":
+            self.rolls[opt_type] = MAX_ROLLS_PER_SIDE
+            tg(f"⚠️ {opt_type} roll cancelled: {old_sym} was already closed at the broker. No new leg opened.")
+            return
+            
+        new_ltp = self.get_ltp_retry("NFO", contract["token"])
+        new_leg = self.open_leg("SHORT_" + opt_type, opt_type, new_strike, contract, "SELL", new_ltp)
+        tg(f"🔄 {opt_type} {old_sym} rolled to {new_leg.symbol} @ ₹{new_leg.entry_px:.2f}\nBooked leg P&L: ₹{leg_pnl:,.2f}")
+
+    def run(self):
+        today = now_ist().date()
+        if today.weekday() >= 5:
+            print("Weekend - nothing to do.")
+            return
+
+        try:
+            import pandas_market_calendars as mcal
+            nse = mcal.get_calendar('BSE') 
+            schedule = nse.schedule(start_date=str(today), end_date=str(today))
+            if schedule.empty:
+                tg(f"📅 AUTO-HOLIDAY DETECTED: Exchange is officially closed today ({today}). Sleeping.")
+                return
+        except ImportError:
+            print("⚠️ pandas_market_calendars not installed. Cannot auto-verify holidays. Proceeding...")
+        except Exception as e:
+            print(f"Auto-holiday API check failed: {e}")
+
+        self.lock_path = f"run_lock_{today}_{'paper' if PAPER_MODE else 'live'}.json"
+        if os.path.exists(self.lock_path):
+            tg(f"⚠️ Bot already ran today ({self.lock_path} exists). Not re-entering.")
+            self.lock_path = ""
+            return
+
+        entry_time = at_ist(today, ENTRY_HOUR, ENTRY_MIN)
+        exit_time = at_ist(today, EXIT_HOUR, EXIT_MIN)
+        grace_limit = entry_time + datetime.timedelta(minutes=ENTRY_GRACE_MIN)
+
+        print("--------------------------------------------------")
+        print(f"➜ Configured Entry Time : {entry_time.strftime('%H:%M:%S %Z')}")
+        print(f"➜ Configured Exit Time  : {exit_time.strftime('%H:%M:%S %Z')}")
+        print(f"➜ Configured Grace Limit: {grace_limit.strftime('%H:%M:%S %Z')} (Grace: {ENTRY_GRACE_MIN} mins)")
+        print(f"➜ Current System Time   : {now_ist().strftime('%H:%M:%S %Z')}")
+        print("--------------------------------------------------")
+
+        if now_ist() > grace_limit:
+            tg(f"⚠️ Started too late ({now_ist():%H:%M:%S} IST). Cutoff was {grace_limit:%H:%M:%S} IST. Skipping today.")
+            return
+
+        self.login()
+        self.load_master()
+        print(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'} | Expiry: {self.expiry} ({EXPIRY_MODE})")
+        print("Waiting for 9:50 AM IST ...")
+        wait_until(entry_time)
+
+        today_str = str(today)
+        ok, spot, gap_pct, orb, msg = self.check_filters()
+        if not ok:
+            tg(f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {msg}")
+            self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
+                            round(spot, 2), round(gap_pct, 2), round(orb, 2), "N/A", "N/A", 0.0,
+                            "N/A", "N/A", 0, "No", msg, 0.0, 0.0, 0.0])
+            return
+
+        atm = int(round(spot / 50.0) * 50)
+        atm_ce, atm_pe = self.find_contract(atm, "CE"), self.find_contract(atm, "PE")
+        
+        print(f"➜ Strike Math   -> Spot: {spot:.2f} | Selected ATM: {atm}")
+        
+        if not atm_ce or not atm_pe:
+            tg(f"⚠️ SKIPPED: ATM {atm} contracts not found for {self.expiry}.")
+            return
+            
+        q = self.get_ltps({"NFO": [atm_ce["token"], atm_pe["token"]]})
+        if atm_ce["token"] not in q or atm_pe["token"] not in q:
+            tg("⚠️ SKIPPED: could not read ATM straddle prices.")
+            return
+            
+        offset = (q[atm_ce["token"]] + q[atm_pe["token"]]) * DELTA_WIDTH_MULTIPLIER
+        ce_strike = int(round((spot + offset) / 50.0) * 50)
+        pe_strike = int(round((spot - offset) / 50.0) * 50)
+        
+        print(f"➜ Strike Math   -> ATM CE LTP: {q[atm_ce['token']]} | ATM PE LTP: {q[atm_pe['token']]}")
+        print(f"➜ Strike Math   -> Multiplier Offset: {offset:.2f}")
+        print(f"➜ Target Strikes-> CE: {ce_strike} | PE: {pe_strike}")
+        
+        ce_c, pe_c = self.find_contract(ce_strike, "CE"), self.find_contract(pe_strike, "PE")
+        
+        if not ce_c or not pe_c:
+            tg(f"⚠️ SKIPPED: required strikes not listed (CE {ce_strike}, PE {pe_strike}).")
+            return
+
+        lot = ce_c["lotsize"]
+        self.qty = NUM_LOTS * lot
+
+        margin_ok, margin_msg = self.check_margin()
+        if not margin_ok:
+            tg(f"⚠️ SKIPPED: insufficient margin ({margin_msg}).")
+            return
+
+        open(self.lock_path, "w").close()
+        ltps = self.get_ltps({"NFO": [c["token"] for c in (ce_c, pe_c) if c]})
+        
+        short_ce = self.open_leg("SHORT_CE", "CE", ce_strike, ce_c, "SELL", ltps.get(ce_c["token"]))
+        short_pe = self.open_leg("SHORT_PE", "PE", pe_strike, pe_c, "SELL", ltps.get(pe_c["token"]))
+
+        initial_premium = short_ce.entry_px + short_pe.entry_px
+        max_loss = initial_premium * MAX_PREMIUM_LOSS_PCT * self.qty
+        initial_ce_sym, initial_pe_sym = short_ce.symbol, short_pe.symbol
+        
+        print("--------------------------------------------------")
+        print(f"➜ Execution     -> Total Lots: {NUM_LOTS} (Qty {self.qty})")
+        print(f"➜ CE Roll Trigger-> Spot >= {short_ce.strike - SPOT_ROLL_BUFFER:.2f}")
+        print(f"➜ PE Roll Trigger-> Spot <= {short_pe.strike + SPOT_ROLL_BUFFER:.2f}")
+        print("--------------------------------------------------")
+
+        tg(f"🟢 STRANGLE DEPLOYED ({NUM_LOTS} lots | {self.qty} qty | {now_ist():%H:%M})\nExpiry: {self.expiry} | Spot: {spot:.2f} | Gap {gap_pct:+.2f}% | ORB {orb:.0f} pts\nCE {short_ce.symbol} @ ₹{short_ce.entry_px:.2f} | PE {short_pe.symbol} @ ₹{short_pe.entry_px:.2f}\nCombined premium ₹{initial_premium:.2f}\nHard SL: -₹{max_loss:,.0f} ({int(MAX_PREMIUM_LOSS_PCT * 100)}% of premium)")
+        self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "ENTERED",
+                        round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
+                        round(initial_premium, 2), initial_ce_sym, initial_pe_sym, self.qty, "No",
+                        "OPEN", 0.0, 0.0, 0.0])
+
+        exit_reason, force_market = "N/A", False
+        last_ok, feed_alerted = time.time(), False
+        last_slot = now_ist().hour * 2 + now_ist().minute // 30
+
+        while True:
+            now = now_ist()
+            if now >= exit_time:
+                exit_reason = "Time Exit (3:10 PM)"
+                break
+
+            active_legs = self.active()
+            need = [NIFTY_SPOT_TOKEN] + [l.token for l in active_legs]
+            q = self.get_ltps({"NSE": [NIFTY_SPOT_TOKEN], "NFO": [l.token for l in active_legs]})
+            
+            if any(t not in q for t in need):
+                stale = time.time() - last_ok
+                if stale >= DATA_FAIL_EXIT_SECS:
+                    exit_reason, force_market = f"Data feed lost {int(stale)}s - forced exit", True
+                    break
+                if stale >= DATA_FAIL_ALERT_SECS and not feed_alerted:
+                    tg(f"⚠️ No market data for {int(stale)}s. Forced exit at {DATA_FAIL_EXIT_SECS}s.")
+                    feed_alerted = True
+                time.sleep(1)
+                continue
+                
+            last_ok, feed_alerted = time.time(), False
+            self.last_q = q
+            spot_now = q[NIFTY_SPOT_TOKEN]
+
+            open_pnl = sum(((l.entry_px - q[l.token]) if l.side == "SELL" else (q[l.token] - l.entry_px)) * l.qty
+                           for l in active_legs)
+            total_pnl = self.realized + open_pnl
+
+            slot = now.hour * 2 + now.minute // 30
+            if slot != last_slot and now.minute % 30 == 0:
+                last_slot = slot
+                tg(f"⏱️ {now:%I:%M %p}: P&L ₹{total_pnl:,.0f} | Spot {spot_now:.2f}")
+
+            if total_pnl <= -max_loss:
+                exit_reason = f"Hard SL ({int(MAX_PREMIUM_LOSS_PCT * 100)}% premium loss)"
+                break
+
+            try:
+                self.try_roll("CE", spot_now)
+                self.try_roll("PE", spot_now)
+            except OrderError as e:
+                exit_reason, force_market = f"Roll order failed: {e}", True
+                break
+
+            time.sleep(POLL_SECS)
+
+        self.cancel_pending_orders("at exit time")
+        failures = []
+        for leg in sorted(self.active(), key=lambda l: 0 if l.side == "SELL" else 1):
+            try:
+                self.close_leg(leg, self.last_q.get(leg.token), force_market)
+            except Exception as e:
+                failures.append(leg.symbol)
+                print(f"Exit failed for {leg.symbol}: {e}")
+                
+        if failures:
+            self.emergency_square_off(f"normal exit failed for {', '.join(failures)}")
+            
+        flat_ok = self.verify_flat()
+        if not flat_ok:
+            exit_reason += " | NOT VERIFIED FLAT - CHECK BROKER"
+
+        gross = self.realized
+        charges = self.ledger.charges()
+        net = gross - charges
+        rolled = "No" if not any(self.rolls.values()) else "+".join(k for k, v in self.rolls.items() if v) + " rolled"
+
+        def last_sym(role, default):
+            m = [l.symbol for l in self.legs if l.role == role]
+            return m[-1] if m else default
+
+        tg(f"🏁 BOT CLOSED | {exit_reason}\nGross ₹{gross:+,.2f} | Charges ₹{charges:,.2f} | Net ₹{net:+,.2f}")
+        self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "TRADED",
+                        round(spot, 2), round(gap_pct, 2), round(orb, 2), initial_ce_sym, initial_pe_sym,
+                        round(initial_premium, 2), last_sym("SHORT_CE", "N/A"), last_sym("SHORT_PE", "N/A"),
+                        self.qty, rolled, exit_reason, round(gross, 2), round(charges, 2), round(net, 2)])
+        try:
+            self.smart.terminateSession(CLIENT_CODE)
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    bot = Bot()
+    try:
+        bot.run()
+    except Exception as e:
+        print(f"CRITICAL FAILURE:\n{traceback.format_exc()}")
+        tg(f"🚨 FATAL BOT CRASH 🚨\n{e}\nAttempting emergency square-off...")
+        try:
+            if bot.smart and bot.traded_symbols:
+                bot.emergency_square_off(f"crash: {e}")
+                bot.verify_flat()
+        except Exception as e2:
+            tg(f"🚨 Emergency square-off itself failed: {e2}. CLOSE POSITIONS MANUALLY NOW.")
+        sys.exit(1)
