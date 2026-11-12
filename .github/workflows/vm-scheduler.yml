@@ -1,114 +1,38 @@
-name: Automated VM Start and Stop Scheduler
+name: VM Scheduler
 
 on:
   schedule:
-    # 8:30 AM IST (3:00 UTC, Mon-Fri) -> Gives a 30 min buffer so VM is guaranteed UP by 9:00 AM IST
-    - cron: '0 3 * * 1-5'
-    # 4:00 PM IST (10:30 UTC, Mon-Fri) -> Triggers STOP at 4:00 PM IST
-    - cron: '30 10 * * 1-5'
+    - cron: '0 3 * * 1-5' # 8:30 AM IST (Monday-Friday)
   workflow_dispatch:
-    inputs:
-      action_type:
-        description: 'Action to perform'
-        required: true
-        default: 'start_or_sync'
-        type: choice
-        options:
-          - start_or_sync
-          - stop
 
 env:
-  PROJECT_ID: "streamlit-db-503313"
-  VM_NAME: "angel-one-auto-trading-bot-v2"
-  ZONE: "us-central1-c"
-  STATIC_IP_NAME: "algo-vm-ip"
+  PROJECT_ID: "your-gcp-project-id" # Keep your existing project ID
+  ZONE: "your-gcp-zone"             # Keep your existing zone
+  VM_NAME: "your-vm-name"           # Keep your existing VM name
 
 jobs:
   manage-vm:
     runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: '${{ secrets.GCP_SA_JSON }}'
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Determine Action
-        id: check-time
+      - name: Start GCP VM & Update Secrets
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            INPUT_ACTION="${{ github.event.inputs.action_type }}"
-            if [ "$INPUT_ACTION" = "stop" ]; then
-              echo "action=stop" >> $GITHUB_OUTPUT
-            else
-              echo "action=start_or_sync" >> $GITHUB_OUTPUT
-            fi
-          else
-            UTC_HOUR=$(date -u +%H)
-            echo "Current UTC Hour: $UTC_HOUR"
-            # 3:00 UTC (start) gives hour 03. 10:30 UTC (stop) gives hour 10.
-            if [ "$UTC_HOUR" -lt 10 ]; then
-              echo "action=start_or_sync" >> $GITHUB_OUTPUT
-            else
-              echo "action=stop" >> $GITHUB_OUTPUT
-            fi
-          fi
+          gcloud compute instances add-metadata ${{ env.VM_NAME }} \
+            --zone ${{ env.ZONE }} \
+            --metadata api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",dhan-client-id="${{ secrets.DHAN_CLIENT_ID }}",dhan-access-token="${{ secrets.DHAN_ACCESS_TOKEN }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${{ secrets.GCP_SA_B64 }}"
 
-      - name: Start VM or Live-Sync Code if Running
-        if: steps.check-time.outputs.action == 'start_or_sync'
-        env:
-          GCP_SA_RAW: ${{ secrets.GCP_SA_KEY }}
-        run: |
-          echo "Checking if VM instance ${{ env.VM_NAME }} exists..."
-          GCP_SA_B64=$(echo -n "$GCP_SA_RAW" | base64 -w 0)
-          
-          if gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
-              STATUS=$(gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --format='get(status)')
-              
-              if [ "$STATUS" = "RUNNING" ]; then
-                  echo "VM is already running. Performing LIVE-SYNC of code & secrets without restarting VM..."
-                  gcloud compute instances add-metadata ${{ env.VM_NAME }} \
-                      --zone=${{ env.ZONE }} \
-                      --project=${{ env.PROJECT_ID }} \
-                      --metadata-from-file=startup-script=startup.sh \
-                      --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
-                  
-                  gcloud compute ssh kumar_sanjeev_pune@${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="cd ~/trading-bot && git fetch --all && git reset --hard origin/main && pip3 install --break-system-packages -r requirements.txt" || echo "SSH sync completed."
-              else
-                  echo "VM exists but is stopped. Starting instance..."
-                  gcloud compute instances start ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }}
-              fi
-          else
-              echo "VM does not exist. Creating fresh Ubuntu 24.04 instance with startup.sh..."
-              gcloud compute instances create ${{ env.VM_NAME }} \
-                  --zone=${{ env.ZONE }} \
-                  --project=${{ env.PROJECT_ID }} \
-                  --machine-type=e2-medium \
-                  --image-family=ubuntu-2404-lts-amd64 \
-                  --image-project=ubuntu-os-cloud \
-                  --boot-disk-size=20GB \
-                  --tags=http-server,https-server \
-                  --address=${{ env.STATIC_IP_NAME }} \
-                  --no-service-account \
-                  --no-scopes \
-                  --metadata-from-file=startup-script=startup.sh \
-                  --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
-          fi
-
-      - name: Stop VM Instance
-        if: steps.check-time.outputs.action == 'stop'
-        run: |
-          echo "Checking if VM exists before stopping..."
-          if gcloud compute instances describe ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
-              echo "Stopping VM instance ${{ env.VM_NAME }}..."
-              gcloud compute instances stop ${{ env.VM_NAME }} \
-                  --zone=${{ env.ZONE }} \
-                  --project=${{ env.PROJECT_ID }}
-          else
-              echo "VM does not exist. Nothing to stop."
-          fi
+          gcloud compute instances start ${{ env.VM_NAME }} --zone ${{ env.ZONE }}
