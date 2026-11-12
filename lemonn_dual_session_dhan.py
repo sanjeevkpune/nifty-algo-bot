@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 lemonn_dual_session_dhan.py -- Nifty & Sensex Dual-Session Options Selling Bot
-Integrated via DhanHQ API.
+Integrated via DhanHQ API. Standalone execution with Auto-TOTP Login.
 """
 import sys
 import os
@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+import pyotp
 import gspread
 from dhanhq import dhanhq
 
@@ -31,7 +32,9 @@ def now_ist(): return datetime.datetime.now(IST)
 def at_ist(date, hour, minute): return datetime.datetime.combine(date, datetime.time(hour, minute), tzinfo=IST)
 
 DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID")
-DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN")
+DHAN_PIN = os.environ.get("DHAN_PIN")
+DHAN_TOTP_SECRET = os.environ.get("DHAN_TOTP_SECRET")
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GSHEET_ID_V2 = os.environ.get("GSHEET_ID_V2")
@@ -40,8 +43,6 @@ SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.j
 # ==============================================================
 # DHAN-SPECIFIC 4-WEEK PAPER TRADING OVERRIDE
 # ==============================================================
-# This forces the Dhan bot into Paper Mode until December 10, 2026.
-# After this date, it respects the global PAPER_MODE env variable.
 PAPER_MODE_END_DATE = datetime.date(2026, 12, 10)
 if now_ist().date() <= PAPER_MODE_END_DATE:
     PAPER_MODE = True
@@ -56,8 +57,9 @@ ORDER_POLL_SECS = 1.0
 def tg(message: str):
     tag = "[PAPER] " if PAPER_MODE else ""
     print(f"{tag}{message}")
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{tag}{message}"}, timeout=5)
-    except: pass
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{tag}{message}"}, timeout=5)
+        except: pass
 
 def wait_until(target):
     while True:
@@ -91,21 +93,38 @@ class LemonnDhanBot:
         self.realized_pnl = 0.0
         
         wd = now_ist().weekday()
-        if wd in [0, 1, 4]: # Mon, Tue, Fri -> NIFTY
+        if wd in [0, 1, 4]: 
             self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "NIFTY", "NFO", "NSE_FNO", "NSE", "13"
             self.strike_step, self.m_entry, self.m_exit, self.a_entry, self.a_exit = 50, (9, 16), (14, 15), (14, 16), (15, 28)
-        elif wd in [2, 3]: # Wed, Thu -> SENSEX
+        elif wd in [2, 3]: 
             self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "SENSEX", "BFO", "BSE_FNO", "BSE", "1"
             self.strike_step, self.m_entry, self.m_exit, self.a_entry, self.a_exit = 100, (9, 16), (13, 30), (13, 35), (15, 28)
         else: self.idx_name = "NONE"
 
     def login(self):
-        if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN: raise RuntimeError("Missing Dhan API credentials.")
-        self.dhan = dhanhq(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
+        if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET: 
+            raise RuntimeError("Missing Dhan API credentials (DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET).")
+        
+        # 1. Generate live TOTP
         try:
-            if 'data' in self.dhan.get_fund_limits(): return
-        except: pass
-        raise RuntimeError("Dhan authentication failed.")
+            totp_code = pyotp.TOTP(DHAN_TOTP_SECRET).now()
+        except Exception as e:
+            raise RuntimeError(f"Failed to generate TOTP code: {e}")
+
+        # 2. Fetch fresh 24-hour Access Token
+        url = f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp_code}"
+        try:
+            res = requests.post(url, timeout=15)
+            data = res.json()
+            if "accessToken" in data:
+                fresh_token = data["accessToken"]
+                self.dhan = dhanhq(client_id=DHAN_CLIENT_ID, access_token=fresh_token)
+                print("➜ DhanHQ API dynamically authenticated via TOTP.")
+                return
+            else:
+                raise RuntimeError(f"Token generation failed: {data}")
+        except Exception as e:
+            raise RuntimeError(f"Dhan API auto-login failed: {e}")
 
     def load_master(self):
         df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv", low_memory=False)
@@ -113,6 +132,7 @@ class LemonnDhanBot:
         df["strike"] = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
         df["expirydate"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], errors="coerce").dt.date
         df["lotsize"] = pd.to_numeric(df["SEM_LOT_REGULAR"], errors="coerce")
+        
         today = now_ist().date()
         self.options_df = df[df["expirydate"] >= today].copy()
         expiries = sorted(self.options_df["expirydate"].dropna().unique())
@@ -123,15 +143,20 @@ class LemonnDhanBot:
         for _ in range(3):
             try:
                 res = self.dhan.market_quote(exchange_segment=exch, security_id=token)
-                if res and res.get('status') == 'success' and 'data' in res: return float(res['data'].get('LTP', 0))
+                if res and res.get('status') == 'success' and 'data' in res: 
+                    return float(res['data'].get('LTP', 0))
             except: pass
             time.sleep(0.5)
         return 0.0
 
-    def get_spot(self): return self.get_dhan_ltp(self.dhan.NSE if self.spot_exch == "NSE" else self.dhan.BSE, self.spot_token)
+    def get_spot(self): 
+        dhan_spot_exch = self.dhan.NSE if self.spot_exch == "NSE" else self.dhan.BSE
+        return self.get_dhan_ltp(dhan_spot_exch, self.spot_token)
 
     def find_contract(self, strike, opt_type):
-        m = self.options_df[(self.options_df["expirydate"] == self.expiry) & (self.options_df["strike"] == float(strike)) & (self.options_df["SEM_OPTION_TYPE"] == opt_type)]
+        m = self.options_df[(self.options_df["expirydate"] == self.expiry) & 
+                            (self.options_df["strike"] == float(strike)) & 
+                            (self.options_df["SEM_OPTION_TYPE"] == opt_type)]
         if m.empty: return None
         return {"symbol": str(m.iloc[0]["SEM_TRADING_SYMBOL"]), "token": str(m.iloc[0]["SEM_SMST_SECURITY_ID"]), "lotsize": int(m.iloc[0]["lotsize"])}
 
@@ -140,8 +165,10 @@ class LemonnDhanBot:
             px = ref_ltp or self.get_dhan_ltp(self.dhan_exch_seg, token)
             self.traded_symbols.add(symbol)
             return round(px + PAPER_SLIPPAGE_PTS if side == "BUY" else max(0.05, px - PAPER_SLIPPAGE_PTS), 2)
+            
+        dhan_side = self.dhan.SELL if side == "SELL" else self.dhan.BUY
         try:
-            res = self.dhan.place_order(security_id=str(token), exchange_segment=self.dhan_exch_seg, transaction_type=self.dhan.SELL if side == "SELL" else self.dhan.BUY, quantity=int(qty), order_type=self.dhan.MARKET, product_type=self.dhan.INTRA, price=0)
+            res = self.dhan.place_order(security_id=str(token), exchange_segment=self.dhan_exch_seg, transaction_type=dhan_side, quantity=int(qty), order_type=self.dhan.MARKET, product_type=self.dhan.INTRA, price=0)
             if res.get('status') == 'success':
                 oid = res['data'].get('orderId')
                 for _ in range(15):
@@ -158,8 +185,10 @@ class LemonnDhanBot:
         ce, pe = self.find_contract(ce_strike, "CE"), self.find_contract(pe_strike, "PE")
         if not ce or not pe: return tg(f"⚠️ {session_name} Skipped: Strikes not found.")
         qty = NUM_LOTS * ce["lotsize"]
+        
         ce_px = self.execute_market(ce["symbol"], ce["token"], "SELL", qty, self.get_dhan_ltp(self.dhan_exch_seg, ce["token"]))
         pe_px = self.execute_market(pe["symbol"], pe["token"], "SELL", qty, self.get_dhan_ltp(self.dhan_exch_seg, pe["token"]))
+        
         ce_sl, pe_sl = round(ce_px * 1.50, 1), round(pe_px * 1.50, 1)
         self.legs.extend([Leg(session_name, "CE", ce_strike, ce["symbol"], ce["token"], "SELL", qty, ce_px, ce_sl, self.dhan_exch_seg), Leg(session_name, "PE", pe_strike, pe["symbol"], pe["token"], "SELL", qty, pe_px, pe_sl, self.dhan_exch_seg)])
         tg(f"🟢 {session_name} DEPLOYED ({self.idx_name})\nCE {ce['symbol']} @ ₹{ce_px:.2f} (SL: ₹{ce_sl:.2f})\nPE {pe['symbol']} @ ₹{pe_px:.2f} (SL: ₹{pe_sl:.2f})")
@@ -182,6 +211,7 @@ class LemonnDhanBot:
         for leg in [l for l in self.legs if l.active]: self.close_leg(leg, self.get_dhan_ltp(leg.exch_seg, leg.token), "TIME_EXIT")
 
     def log_sheet(self, date_str):
+        if not GSHEET_ID_V2 or not os.path.exists(SERVICE_ACCOUNT_FILE): return
         try: ws = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2).worksheet("Lemonn_Log")
         except:
             try:
@@ -189,6 +219,7 @@ class LemonnDhanBot:
                 ws = sh.add_worksheet(title="Lemonn_Log", rows="1000", cols="12")
                 ws.append_row(["Date", "Index", "Session", "CE_Symbol", "CE_Entry", "CE_Exit", "CE_Reason", "PE_Symbol", "PE_Entry", "PE_Exit", "PE_Reason", "Session_PnL"])
             except: return
+            
         for session in ["MORNING_OTM2", "AFTERNOON_ATM"]:
             s_legs = [l for l in self.legs if l.session == session]
             if len(s_legs) == 2:
@@ -197,29 +228,36 @@ class LemonnDhanBot:
                 ws.append_row([date_str, self.idx_name, session, ce.symbol, ce.entry_px, ce.exit_px, ce.exit_reason, pe.symbol, pe.entry_px, pe.exit_px, pe.exit_reason, round(pnl, 2)])
 
     def run(self):
-        if self.idx_name == "NONE": return
+        if self.idx_name == "NONE": return tg("Weekend - Nothing to trade.")
         today = now_ist().date()
         try:
             import pandas_market_calendars as mcal
             if mcal.get_calendar('BSE').schedule(start_date=str(today), end_date=str(today)).empty: return tg("📅 Exchange Holiday. Sleeping.")
         except: pass
+        
         self.login()
         self.load_master()
         tg(f"🚀 LEMONN DUAL-SESSION (DhanHQ | {self.idx_name} | {NUM_LOTS} Lots)")
 
+        # 1. MORNING OTM 2 SESSION
         wait_until(at_ist(today, *self.m_entry))
         spot = self.get_spot()
         if spot > 0:
             atm = round(spot / self.strike_step) * self.strike_step
             self.deploy_session("MORNING_OTM2", atm + (2 * self.strike_step), atm - (2 * self.strike_step))
             self.monitor_until(at_ist(today, *self.m_exit))
+        else:
+            tg("⚠️ Unable to fetch Spot Price for Morning Session.")
 
+        # 2. AFTERNOON ATM SESSION
         wait_until(at_ist(today, *self.a_entry))
         spot = self.get_spot()
         if spot > 0:
             atm = round(spot / self.strike_step) * self.strike_step
             self.deploy_session("AFTERNOON_ATM", atm, atm)
             self.monitor_until(at_ist(today, *self.a_exit))
+        else:
+            tg("⚠️ Unable to fetch Spot Price for Afternoon Session.")
 
         self.log_sheet(str(today))
         tg(f"🏁 DUAL-SESSION COMPLETE | Total Gross PnL: ₹{self.realized_pnl:,.2f}")
