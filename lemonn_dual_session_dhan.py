@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 lemonn_dual_session_dhan.py -- Nifty & Sensex Dual-Session Options Selling Bot
-Integrated via DhanHQ API. Standalone execution with Auto-TOTP Login.
+Integrated via DhanHQ API v2.0. Uses Direct REST Auth for stability.
 """
 import sys
 import os
@@ -16,7 +16,7 @@ import pandas as pd
 import requests
 import pyotp
 import gspread
-from dhanhq import dhanhq
+from dhanhq import DhanContext, dhanhq
 
 CONFIG_ENV_PATH = "/etc/trade-config/config.env"
 if os.path.exists(CONFIG_ENV_PATH):
@@ -43,6 +43,7 @@ SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.j
 # ==============================================================
 # DHAN-SPECIFIC 4-WEEK PAPER TRADING OVERRIDE
 # ==============================================================
+# Forces the Dhan bot into Paper Mode until December 10, 2026.
 PAPER_MODE_END_DATE = datetime.date(2026, 12, 10)
 if now_ist().date() <= PAPER_MODE_END_DATE:
     PAPER_MODE = True
@@ -93,38 +94,49 @@ class LemonnDhanBot:
         self.realized_pnl = 0.0
         
         wd = now_ist().weekday()
-        if wd in [0, 1, 4]: 
+        if wd in [0, 1, 4]: # Mon, Tue, Fri -> NIFTY
             self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "NIFTY", "NFO", "NSE_FNO", "NSE", "13"
             self.strike_step, self.m_entry, self.m_exit, self.a_entry, self.a_exit = 50, (9, 16), (14, 15), (14, 16), (15, 28)
-        elif wd in [2, 3]: 
+        elif wd in [2, 3]: # Wed, Thu -> SENSEX
             self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "SENSEX", "BFO", "BSE_FNO", "BSE", "1"
             self.strike_step, self.m_entry, self.m_exit, self.a_entry, self.a_exit = 100, (9, 16), (13, 30), (13, 35), (15, 28)
         else: self.idx_name = "NONE"
 
     def login(self):
         if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET: 
-            raise RuntimeError("Missing Dhan API credentials (DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET).")
+            raise RuntimeError("Missing Dhan API credentials.")
+            
+        print(f"🔑 Authenticating Dhan HQ API for {DHAN_CLIENT_ID}...")
         
-        # 1. Generate live TOTP
-        try:
+        for attempt in range(1, 4):
             totp_code = pyotp.TOTP(DHAN_TOTP_SECRET).now()
-        except Exception as e:
-            raise RuntimeError(f"Failed to generate TOTP code: {e}")
-
-        # 2. Fetch fresh 24-hour Access Token
-        url = f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp_code}"
-        try:
-            res = requests.post(url, timeout=15)
-            data = res.json()
-            if "accessToken" in data:
-                fresh_token = data["accessToken"]
-                self.dhan = dhanhq(client_id=DHAN_CLIENT_ID, access_token=fresh_token)
-                print("➜ DhanHQ API dynamically authenticated via TOTP.")
-                return
-            else:
-                raise RuntimeError(f"Token generation failed: {data}")
-        except Exception as e:
-            raise RuntimeError(f"Dhan API auto-login failed: {e}")
+            url = f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp_code}"
+            headers = {"Accept": "application/json"}
+            
+            try:
+                response = requests.post(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "accessToken" in data:
+                        fresh_token = data["accessToken"]
+                        context = DhanContext(DHAN_CLIENT_ID, fresh_token)
+                        self.dhan = dhanhq(context)
+                        
+                        if 'data' in self.dhan.get_fund_limits():
+                            print("✅ Dhan SDK Initialized Successfully.")
+                            return
+                elif response.status_code == 400 and attempt < 3:
+                    print("⚠️ TOTP mismatch (likely time shift). Retrying in 5 seconds...")
+                    time.sleep(5)
+                    continue
+                else:
+                    raise RuntimeError(f"Auth API Failed: {response.text}")
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(f"Dhan authentication crashed: {e}")
+                time.sleep(5)
+                
+        raise RuntimeError("Dhan authentication failed after 3 attempts.")
 
     def load_master(self):
         df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv", low_memory=False)
@@ -132,7 +144,6 @@ class LemonnDhanBot:
         df["strike"] = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
         df["expirydate"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], errors="coerce").dt.date
         df["lotsize"] = pd.to_numeric(df["SEM_LOT_REGULAR"], errors="coerce")
-        
         today = now_ist().date()
         self.options_df = df[df["expirydate"] >= today].copy()
         expiries = sorted(self.options_df["expirydate"].dropna().unique())
@@ -142,21 +153,21 @@ class LemonnDhanBot:
     def get_dhan_ltp(self, exch, token):
         for _ in range(3):
             try:
-                res = self.dhan.market_quote(exchange_segment=exch, security_id=token)
-                if res and res.get('status') == 'success' and 'data' in res: 
-                    return float(res['data'].get('LTP', 0))
+                # v2.0 SDK uses ticker_data
+                quote = self.dhan.ticker_data(securities={exch: [str(token)]})
+                if isinstance(quote, dict) and quote.get('status') == 'success' and 'data' in quote:
+                    key = f"{exch}:{token}"
+                    return float(quote['data'].get(key, {}).get('last_price', 0))
             except: pass
             time.sleep(0.5)
         return 0.0
 
     def get_spot(self): 
-        dhan_spot_exch = self.dhan.NSE if self.spot_exch == "NSE" else self.dhan.BSE
+        dhan_spot_exch = "NSE" if self.spot_exch == "NSE" else "BSE"
         return self.get_dhan_ltp(dhan_spot_exch, self.spot_token)
 
     def find_contract(self, strike, opt_type):
-        m = self.options_df[(self.options_df["expirydate"] == self.expiry) & 
-                            (self.options_df["strike"] == float(strike)) & 
-                            (self.options_df["SEM_OPTION_TYPE"] == opt_type)]
+        m = self.options_df[(self.options_df["expirydate"] == self.expiry) & (self.options_df["strike"] == float(strike)) & (self.options_df["SEM_OPTION_TYPE"] == opt_type)]
         if m.empty: return None
         return {"symbol": str(m.iloc[0]["SEM_TRADING_SYMBOL"]), "token": str(m.iloc[0]["SEM_SMST_SECURITY_ID"]), "lotsize": int(m.iloc[0]["lotsize"])}
 
@@ -165,16 +176,15 @@ class LemonnDhanBot:
             px = ref_ltp or self.get_dhan_ltp(self.dhan_exch_seg, token)
             self.traded_symbols.add(symbol)
             return round(px + PAPER_SLIPPAGE_PTS if side == "BUY" else max(0.05, px - PAPER_SLIPPAGE_PTS), 2)
-            
-        dhan_side = self.dhan.SELL if side == "SELL" else self.dhan.BUY
         try:
+            dhan_side = self.dhan.SELL if side == "SELL" else self.dhan.BUY
             res = self.dhan.place_order(security_id=str(token), exchange_segment=self.dhan_exch_seg, transaction_type=dhan_side, quantity=int(qty), order_type=self.dhan.MARKET, product_type=self.dhan.INTRA, price=0)
-            if res.get('status') == 'success':
+            if isinstance(res, dict) and res.get('status') == 'success':
                 oid = res['data'].get('orderId')
                 for _ in range(15):
                     time.sleep(ORDER_POLL_SECS)
                     ob = self.dhan.get_order_list()
-                    if ob and ob.get('status') == 'success':
+                    if isinstance(ob, dict) and ob.get('status') == 'success':
                         for o in ob.get('data', []):
                             if str(o.get('orderId')) == str(oid) and o.get('orderStatus') == 'TRADED':
                                 return float(o.get('averagePrice') or ref_ltp)
