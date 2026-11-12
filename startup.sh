@@ -1,66 +1,9 @@
-#!/bin/bash
-set -e
+# ... [Keep the top half of your existing startup script] ...
 
-# Fix for fatal: $HOME not set when running as root during GCP boot
-export HOME=/root
-
-REPO_URL="https://github.com/sanjeevkpune/nifty-algo-bot.git"
-USER_NAME="kumar_sanjeev_pune"
-TARGET_DIR="/home/${USER_NAME}/trading-bot"
-
-echo "1. Setting system timezone to Asia/Kolkata..."
-timedatectl set-timezone Asia/Kolkata
-
-echo "2. Allocating 2GB Swap File for memory stability..."
-if [ ! -f /swapfile ]; then
-    fallocate -l 2G /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    echo '/swapfile none swap sw 0 0' >> /etc/fstab
-fi
-
-echo "3. Installing system packages (Ubuntu 24.04 / Python 3.12)..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends git python3-pip python3-dev build-essential cron nano curl ca-certificates
-
-echo "4. Setting up user & cloning repository..."
-set +e  
-set -x  
-if ! id -u "$USER_NAME" >/dev/null 2>&1; then
-    useradd -m -s /bin/bash "$USER_NAME"
-fi
-mkdir -p "$TARGET_DIR"
-cd "$TARGET_DIR"
-
-if [ -d ".git" ]; then
-    git fetch origin main
-    git reset --hard origin/main
-else
-    git clone "$REPO_URL" .
-fi
-set +x  
-set -e  
-
-echo "5. Installing Python dependencies..."
-# Added DhanHQ
-pip3 install --break-system-packages -r requirements.txt || pip3 install --break-system-packages --ignore-installed -r requirements.txt
-pip3 install --break-system-packages dhanhq
-
-echo "6. Fetching secrets from GCP Metadata..."
-META_URL="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
-HEADER="Metadata-Flavor: Google"
-
-# Angel One Secrets
-API_KEY=$(curl -sf -H "$HEADER" "$META_URL/api-key")
-CLIENT_CODE=$(curl -sf -H "$HEADER" "$META_URL/client-code")
-PIN=$(curl -sf -H "$HEADER" "$META_URL/pin")
-TOTP_SECRET=$(curl -sf -H "$HEADER" "$META_URL/totp-secret")
-
-# Dhan Secrets
+# Dhan Secrets (Updated for Dynamic Login)
 DHAN_CLIENT_ID=$(curl -sf -H "$HEADER" "$META_URL/dhan-client-id")
-DHAN_ACCESS_TOKEN=$(curl -sf -H "$HEADER" "$META_URL/dhan-access-token")
+DHAN_PIN=$(curl -sf -H "$HEADER" "$META_URL/dhan-pin")
+DHAN_TOTP_SECRET=$(curl -sf -H "$HEADER" "$META_URL/dhan-totp-secret")
 
 # Shared Secrets
 TELEGRAM_BOT_TOKEN=$(curl -sf -H "$HEADER" "$META_URL/telegram-token")
@@ -83,7 +26,8 @@ TOTP_SECRET=${TOTP_SECRET}
 
 # Dhan
 DHAN_CLIENT_ID=${DHAN_CLIENT_ID}
-DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN}
+DHAN_PIN=${DHAN_PIN}
+DHAN_TOTP_SECRET=${DHAN_TOTP_SECRET}
 
 # Shared
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -121,23 +65,4 @@ FLAT_VERIFY_ROUNDS=3
 EOF
 chmod 644 /etc/trade-config/config.env
 
-chown -R ${USER_NAME}:${USER_NAME} $TARGET_DIR
-
-echo "7. Configuring Crontab for Dual Brokers..."
-cat <<'EOF' > /tmp/crontab.txt
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-# 1. Dhan Lemonn Dual-Session (Starts at 9:14 AM)
-14 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 lemonn_dual_session_dhan.py >> /home/kumar_sanjeev_pune/trading-bot/lemonn_dhan_log.log 2>&1
-
-# 2. Angel One Adaptive Strangle (Starts at 9:39 AM)
-39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
-EOF
-
-crontab -u $USER_NAME /tmp/crontab.txt
-rm -f /tmp/crontab.txt
-systemctl enable cron
-systemctl restart cron
-
-echo "Startup script completed successfully at $(date)"
+# ... [Keep the bottom half of your existing startup script] ...
