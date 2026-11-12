@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 env:
-  PROJECT_ID: "your-gcp-project-id" # Keep your existing project ID
-  ZONE: "your-gcp-zone"             # Keep your existing zone
-  VM_NAME: "your-vm-name"           # Keep your existing VM name
+  PROJECT_ID: "streamlit-db-503313" # Keep your existing project ID
+  ZONE: "us-central1-c"             # Keep your existing zone
+  VM_NAME: "angel-one-auto-trading-bot-v2"           # Keep your existing VM name
 
 jobs:
   manage-vm:
