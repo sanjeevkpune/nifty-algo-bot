@@ -1,6 +1,22 @@
 #!/bin/bash
 set -e
 
+echo "=== System Optimization & Time Sync ==="
+sudo apt-get update
+# Install chrony to fix TOTP drift, along with Python and Git
+sudo apt-get install -y chrony python3-pip git python3-venv
+
+# Force system clock synchronization immediately
+sudo systemctl enable chrony
+sudo systemctl restart chrony
+chronyc -a makestep
+
+echo "=== Installing Python Dependencies ==="
+# Using --break-system-packages for Ubuntu 24.04 compliance
+sudo pip3 install --break-system-packages \
+    requests pandas urllib3 gspread google-auth \
+    pyotp SmartApi-python pandas_market_calendars dhanhq
+    
 # Fix for fatal: $HOME not set when running as root during GCP boot
 export HOME=/root
 
@@ -77,6 +93,11 @@ TELEGRAM_CHAT_ID=$(curl -sf -H "$HEADER" "$META_URL/telegram-chat")
 GSHEET_ID_V2=$(curl -sf -H "$HEADER" "$META_URL/gsheet-v2")
 GCP_SA_B64=$(curl -sf -H "$HEADER" "$META_URL/gcp-sa-b64")
 
+# Dhan Secrets (Updated for Dynamic Login)
+DHAN_CLIENT_ID=$(curl -sf -H "$HEADER" "$META_URL/dhan-client-id")
+DHAN_PIN=$(curl -sf -H "$HEADER" "$META_URL/dhan-pin")
+DHAN_TOTP_SECRET=$(curl -sf -H "$HEADER" "$META_URL/dhan-totp-secret")
+
 # Decode Google Service Account JSON into the trading directory
 if [ -n "$GCP_SA_B64" ]; then
     echo "$GCP_SA_B64" | base64 -d > "${TARGET_DIR}/service_account.json"
@@ -92,6 +113,14 @@ TOTP_SECRET=${TOTP_SECRET}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 GSHEET_ID_V2=${GSHEET_ID_V2}
+
+
+# Dhan
+DHAN_CLIENT_ID=${DHAN_CLIENT_ID}
+DHAN_PIN=${DHAN_PIN}
+DHAN_TOTP_SECRET=${DHAN_TOTP_SECRET}
+DHAN_NUM_LOTS=2
+DHAN_PAPER_MODE=0
 
 # --- COMPLETE BOT CONFIGURATION VARIABLES ---
 PAPER_MODE=0
@@ -131,6 +160,9 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Angel One Strategy (9:39 AM IST)
 39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
+
+# Dhan (Dual-Session Lemonn): Runs at 9:12 AM
+12 09 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 lemonn_dual_session_dhan.py >> /var/log/dhan.log 2>&1 
 EOF
 
 crontab -u $USER_NAME /tmp/crontab.txt
