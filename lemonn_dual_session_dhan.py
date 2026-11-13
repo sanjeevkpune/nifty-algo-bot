@@ -43,15 +43,15 @@ SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.j
 # ==============================================================
 # DHAN-SPECIFIC 4-WEEK PAPER TRADING OVERRIDE
 # ==============================================================
-# Forces the Dhan bot into Paper Mode until December 10, 2026.
-PAPER_MODE_END_DATE = datetime.date(2026, 12, 10)
+# Forces the Dhan bot into Paper Mode until December 31, 2026.
+PAPER_MODE_END_DATE = datetime.date(2026, 12, 31)
 if now_ist().date() <= PAPER_MODE_END_DATE:
     PAPER_MODE = True
 else:
-    PAPER_MODE = os.environ.get("PAPER_MODE", "0").strip() in ("1", "true")
+    PAPER_MODE = os.environ.get("DHAN_PAPER_MODE", "0").strip() in ("1", "true")
 # ==============================================================
 
-NUM_LOTS = int(os.environ.get("DHAN_NUM_LOTS", "2"))
+NUM_LOTS = int(os.environ.get("DHAN_NUM_LOTS", "5"))
 PAPER_SLIPPAGE_PTS = 0.5
 ORDER_POLL_SECS = 1.0
 
