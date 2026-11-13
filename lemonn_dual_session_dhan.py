@@ -43,7 +43,6 @@ SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.j
 # ==============================================================
 # DHAN-SPECIFIC 4-WEEK PAPER TRADING OVERRIDE
 # ==============================================================
-# Forces the Dhan bot into Paper Mode until December 31, 2026.
 PAPER_MODE_END_DATE = datetime.date(2026, 12, 31)
 if now_ist().date() <= PAPER_MODE_END_DATE:
     PAPER_MODE = True
@@ -104,17 +103,17 @@ class LemonnDhanBot:
 
     def login(self):
         if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET: 
-            raise RuntimeError("Missing Dhan API credentials.")
+            raise RuntimeError("Missing Dhan API credentials in /etc/trade-config/config.env")
             
         print(f"🔑 Authenticating Dhan HQ API for {DHAN_CLIENT_ID}...")
         
-        for attempt in range(1, 4):
+        for attempt in range(1, 6): # Increased to 5 attempts to handle connection timeouts
             totp_code = pyotp.TOTP(DHAN_TOTP_SECRET).now()
             url = f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp_code}"
             headers = {"Accept": "application/json"}
             
             try:
-                response = requests.post(url, headers=headers, timeout=10)
+                response = requests.post(url, headers=headers, timeout=30)
                 if response.status_code == 200:
                     data = response.json()
                     if "accessToken" in data:
@@ -125,25 +124,29 @@ class LemonnDhanBot:
                         if 'data' in self.dhan.get_fund_limits():
                             print("✅ Dhan SDK Initialized Successfully.")
                             return
-                elif response.status_code == 400 and attempt < 3:
-                    print("⚠️ TOTP mismatch (likely time shift). Retrying in 5 seconds...")
-                    time.sleep(5)
-                    continue
-                else:
-                    raise RuntimeError(f"Auth API Failed: {response.text}")
-            except Exception as e:
-                if attempt == 3:
-                    raise RuntimeError(f"Dhan authentication crashed: {e}")
-                time.sleep(5)
                 
-        raise RuntimeError("Dhan authentication failed after 3 attempts.")
+                print(f"⚠️ Attempt {attempt} Rejected - HTTP {response.status_code}: {response.text}")
+                
+            except requests.exceptions.Timeout:
+                print(f"⚠️ Attempt {attempt} Timed Out: Dhan's auth server is responding too slowly.")
+            except requests.exceptions.ConnectionError:
+                print(f"⚠️ Attempt {attempt} Connection Error: VM lost network access to Dhan.")
+            except Exception as e:
+                print(f"⚠️ Attempt {attempt} Crashed: {e}")
+                
+            if attempt < 5:
+                print("⏳ Waiting 10 seconds before retry...")
+                time.sleep(10)
+                
+        raise RuntimeError("Dhan authentication failed after 5 attempts due to persistent network or credential issues.")
 
     def load_master(self):
         df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv", low_memory=False)
         df = df[(df["SEM_CUSTOM_SYMBOL"] == self.idx_name) & (df["SEM_EXM_EXCH_ID"] == self.exch_seg)].copy()
         df["strike"] = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
         df["expirydate"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], errors="coerce").dt.date
-        df["lotsize"] = pd.to_numeric(df["SEM_LOT_REGULAR"], errors="coerce")
+        # FIXED: V2 SDK Master uses SEM_LOT_SIZE instead of SEM_LOT_REGULAR
+        df["lotsize"] = pd.to_numeric(df["SEM_LOT_SIZE"], errors="coerce") 
         today = now_ist().date()
         self.options_df = df[df["expirydate"] >= today].copy()
         expiries = sorted(self.options_df["expirydate"].dropna().unique())
@@ -153,13 +156,33 @@ class LemonnDhanBot:
     def get_dhan_ltp(self, exch, token):
         for _ in range(3):
             try:
-                # v2.0 SDK uses ticker_data
                 quote = self.dhan.ticker_data(securities={exch: [str(token)]})
                 if isinstance(quote, dict) and quote.get('status') == 'success' and 'data' in quote:
                     key = f"{exch}:{token}"
                     return float(quote['data'].get(key, {}).get('last_price', 0))
             except: pass
             time.sleep(0.5)
+        return 0.0
+
+    def check_market_gap(self):
+        dhan_spot_exch = "NSE" if self.spot_exch == "NSE" else "BSE"
+        
+        for _ in range(3):
+            try:
+                quote = self.dhan.ticker_data(securities={dhan_spot_exch: [str(self.spot_token)]})
+                if isinstance(quote, dict) and quote.get('status') == 'success' and 'data' in quote:
+                    key = f"{dhan_spot_exch}:{self.spot_token}"
+                    data = quote['data'].get(key, {})
+                    
+                    ltp = float(data.get('last_price', 0))
+                    prev_close = float(data.get('previous_close', 0))
+                    
+                    if prev_close > 0 and ltp > 0:
+                        gap_pct = abs((ltp - prev_close) / prev_close) * 100
+                        tg(f"📊 Market Gap: {gap_pct:.2f}% (Prev Close: {prev_close}, Open: {ltp})")
+                        return gap_pct
+            except: pass
+            time.sleep(1)
         return 0.0
 
     def get_spot(self): 
@@ -178,6 +201,7 @@ class LemonnDhanBot:
             return round(px + PAPER_SLIPPAGE_PTS if side == "BUY" else max(0.05, px - PAPER_SLIPPAGE_PTS), 2)
         try:
             dhan_side = self.dhan.SELL if side == "SELL" else self.dhan.BUY
+            # FIXED: Removed order_flag constant
             res = self.dhan.place_order(security_id=str(token), exchange_segment=self.dhan_exch_seg, transaction_type=dhan_side, quantity=int(qty), order_type=self.dhan.MARKET, product_type=self.dhan.INTRA, price=0)
             if isinstance(res, dict) and res.get('status') == 'success':
                 oid = res['data'].get('orderId')
@@ -248,6 +272,13 @@ class LemonnDhanBot:
         self.login()
         self.load_master()
         tg(f"🚀 LEMONN DUAL-SESSION (DhanHQ | {self.idx_name} | {NUM_LOTS} Lots)")
+
+        # --- GAP FILTER ---
+        wait_until(at_ist(today, 9, 15))
+        gap_pct = self.check_market_gap()
+        if gap_pct > 0.50:
+             tg(f"🛑 High Volatility Alert: Market gapped by {gap_pct:.2f}%. Halting strategy for the day.")
+             return 
 
         # 1. MORNING OTM 2 SESSION
         wait_until(at_ist(today, *self.m_entry))
