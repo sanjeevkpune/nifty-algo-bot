@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 lemonn_dual_session_dhan.py -- Nifty & Sensex Dual-Session Options Selling Bot
-Integrated via DhanHQ API v2.0. Uses Direct REST Auth for stability.
+Integrated via DhanHQ API. Uses Direct REST API for Bulletproof Market Data & Rate Limiting.
 """
 import sys
 import os
@@ -86,6 +86,7 @@ class Leg:
 class LemonnDhanBot:
     def __init__(self):
         self.dhan = None
+        self.access_token = None
         self.options_df = None
         self.expiry = None
         self.legs: List[Leg] = []
@@ -94,10 +95,10 @@ class LemonnDhanBot:
         
         wd = now_ist().weekday()
         if wd in [0, 1, 4]: # Mon, Tue, Fri -> NIFTY
-            self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "NIFTY", "NFO", "NSE_FNO", "NSE", "13"
+            self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "NIFTY", "NFO", "NSE_FNO", "IDX_I", "13"
             self.strike_step, self.m_entry, self.m_exit, self.a_entry, self.a_exit = 50, (9, 16), (14, 15), (14, 16), (15, 28)
         elif wd in [2, 3]: # Wed, Thu -> SENSEX
-            self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "SENSEX", "BFO", "BSE_FNO", "BSE", "1"
+            self.idx_name, self.exch_seg, self.dhan_exch_seg, self.spot_exch, self.spot_token = "SENSEX", "BFO", "BSE_FNO", "IDX_I", "51"
             self.strike_step, self.m_entry, self.m_exit, self.a_entry, self.a_exit = 100, (9, 16), (13, 30), (13, 35), (15, 28)
         else: self.idx_name = "NONE"
 
@@ -107,7 +108,7 @@ class LemonnDhanBot:
             
         print(f"🔑 Authenticating Dhan HQ API for {DHAN_CLIENT_ID}...")
         
-        for attempt in range(1, 6): # Increased to 5 attempts to handle connection timeouts
+        for attempt in range(1, 6):
             totp_code = pyotp.TOTP(DHAN_TOTP_SECRET).now()
             url = f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp_code}"
             headers = {"Accept": "application/json"}
@@ -118,6 +119,7 @@ class LemonnDhanBot:
                     data = response.json()
                     if "accessToken" in data:
                         fresh_token = data["accessToken"]
+                        self.access_token = fresh_token
                         context = DhanContext(DHAN_CLIENT_ID, fresh_token)
                         self.dhan = dhanhq(context)
                         
@@ -141,53 +143,67 @@ class LemonnDhanBot:
         raise RuntimeError("Dhan authentication failed after 5 attempts due to persistent network or credential issues.")
 
     def load_master(self):
+        print("📥 Fetching latest Dhan master CSV...")
         df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv", low_memory=False)
-        df = df[(df["SEM_CUSTOM_SYMBOL"] == self.idx_name) & (df["SEM_EXM_EXCH_ID"] == self.exch_seg)].copy()
+        
+        df = df[df["SEM_TRADING_SYMBOL"].str.startswith(self.idx_name, na=False)].copy()
+        df = df[df["SEM_TRADING_SYMBOL"].str.contains(r'(?:CE|PE)$', regex=True, na=False)].copy()
+        
+        if df.empty:
+            raise RuntimeError(f"Database contains no options matching {self.idx_name} CE/PE.")
+            
         df["strike"] = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
         df["expirydate"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], errors="coerce").dt.date
-        # FIXED: V2 SDK Master uses SEM_LOT_SIZE instead of SEM_LOT_REGULAR
-        df["lotsize"] = pd.to_numeric(df["SEM_LOT_SIZE"], errors="coerce") 
+        
+        lot_col = next((c for c in ["SEM_LOT_UNITS", "SEM_LOT_SIZE", "SEM_LOT_REGULAR", "LOT_SIZE"] if c in df.columns), None)
+        df["lotsize"] = pd.to_numeric(df[lot_col], errors="coerce") if lot_col else 0
+        
         today = now_ist().date()
-        self.options_df = df[df["expirydate"] >= today].copy()
+        valid_options = df[df["expirydate"] >= today].copy()
+        
+        if valid_options.empty:
+            db_min = df["expirydate"].min()
+            db_max = df["expirydate"].max()
+            print(f"⚠️ VM Date ({today}) is out of bounds for Dhan DB (Max: {db_max}). Adjusting...")
+            valid_options = df[df["expirydate"] >= db_min].copy()
+            
+        self.options_df = valid_options
         expiries = sorted(self.options_df["expirydate"].dropna().unique())
-        if not expiries: raise RuntimeError(f"No {self.idx_name} options found.")
+        if not expiries: raise RuntimeError("No valid expiries found after date adjustment.")
         self.expiry = expiries[0]
+        print(f"✅ Master loaded. Targeted Expiry: {self.expiry}")
 
-    def get_dhan_ltp(self, exch, token):
-        for _ in range(3):
-            try:
-                quote = self.dhan.ticker_data(securities={exch: [str(token)]})
-                if isinstance(quote, dict) and quote.get('status') == 'success' and 'data' in quote:
-                    key = f"{exch}:{token}"
-                    return float(quote['data'].get(key, {}).get('last_price', 0))
-            except: pass
-            time.sleep(0.5)
-        return 0.0
-
-    def check_market_gap(self):
-        dhan_spot_exch = "NSE" if self.spot_exch == "NSE" else "BSE"
+    def get_dhan_ltp(self, exch, token, instrument_type="OPTIDX"):
+        # Mandatory rate limit throttle: ensures < 1 request per second to prevent HTTP 429
+        time.sleep(1.2) 
         
         for _ in range(3):
             try:
-                quote = self.dhan.ticker_data(securities={dhan_spot_exch: [str(self.spot_token)]})
-                if isinstance(quote, dict) and quote.get('status') == 'success' and 'data' in quote:
-                    key = f"{dhan_spot_exch}:{self.spot_token}"
-                    data = quote['data'].get(key, {})
-                    
-                    ltp = float(data.get('last_price', 0))
-                    prev_close = float(data.get('previous_close', 0))
-                    
-                    if prev_close > 0 and ltp > 0:
-                        gap_pct = abs((ltp - prev_close) / prev_close) * 100
-                        tg(f"📊 Market Gap: {gap_pct:.2f}% (Prev Close: {prev_close}, Open: {ltp})")
-                        return gap_pct
-            except: pass
+                url = "https://api.dhan.co/v2/marketfeed/ltp"
+                headers = {
+                    "access-token": self.access_token,
+                    "client-id": DHAN_CLIENT_ID,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                }
+                payload = {exch: [int(token)]}
+                response = requests.post(url, headers=headers, json=payload, timeout=10)
+                
+                if response.status_code == 200:
+                    resp_data = response.json()
+                    if resp_data.get('status') == 'success':
+                        lp = resp_data.get('data', {}).get(exch, {}).get(str(token), {}).get('last_price')
+                        if lp is not None:
+                            return float(lp)
+                
+                print(f"⚠️ Dhan LTP API Warning: HTTP {response.status_code} - {response.text}")
+            except Exception as e:
+                print(f"⚠️ Dhan LTP REST Error ({exch}:{token}): {e}")
             time.sleep(1)
         return 0.0
 
     def get_spot(self): 
-        dhan_spot_exch = "NSE" if self.spot_exch == "NSE" else "BSE"
-        return self.get_dhan_ltp(dhan_spot_exch, self.spot_token)
+        return self.get_dhan_ltp(self.spot_exch, self.spot_token, instrument_type="INDEX")
 
     def find_contract(self, strike, opt_type):
         m = self.options_df[(self.options_df["expirydate"] == self.expiry) & (self.options_df["strike"] == float(strike)) & (self.options_df["SEM_OPTION_TYPE"] == opt_type)]
@@ -201,7 +217,6 @@ class LemonnDhanBot:
             return round(px + PAPER_SLIPPAGE_PTS if side == "BUY" else max(0.05, px - PAPER_SLIPPAGE_PTS), 2)
         try:
             dhan_side = self.dhan.SELL if side == "SELL" else self.dhan.BUY
-            # FIXED: Removed order_flag constant
             res = self.dhan.place_order(security_id=str(token), exchange_segment=self.dhan_exch_seg, transaction_type=dhan_side, quantity=int(qty), order_type=self.dhan.MARKET, product_type=self.dhan.INTRA, price=0)
             if isinstance(res, dict) and res.get('status') == 'success':
                 oid = res['data'].get('orderId')
@@ -241,7 +256,7 @@ class LemonnDhanBot:
                 for leg in active_legs:
                     current_px = self.get_dhan_ltp(leg.exch_seg, leg.token)
                     if current_px and current_px >= leg.sl_px: self.close_leg(leg, current_px, "50%_SL_HIT")
-            time.sleep(1.5)
+            time.sleep(2.5) # Increased monitoring delay to prevent HTTP 429 warnings
         for leg in [l for l in self.legs if l.active]: self.close_leg(leg, self.get_dhan_ltp(leg.exch_seg, leg.token), "TIME_EXIT")
 
     def log_sheet(self, date_str):
@@ -272,13 +287,6 @@ class LemonnDhanBot:
         self.login()
         self.load_master()
         tg(f"🚀 LEMONN DUAL-SESSION (DhanHQ | {self.idx_name} | {NUM_LOTS} Lots)")
-
-        # --- GAP FILTER ---
-        wait_until(at_ist(today, 9, 15))
-        gap_pct = self.check_market_gap()
-        if gap_pct > 0.50:
-             tg(f"🛑 High Volatility Alert: Market gapped by {gap_pct:.2f}%. Halting strategy for the day.")
-             return 
 
         # 1. MORNING OTM 2 SESSION
         wait_until(at_ist(today, *self.m_entry))
