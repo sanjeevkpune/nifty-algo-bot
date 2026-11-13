@@ -162,7 +162,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 39 9 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 adaptive_strangle_v2.py >> /home/kumar_sanjeev_pune/trading-bot/algo_trade_v2.log 2>&1
 
 # Dhan (Dual-Session Lemonn): Runs at 9:12 AM
-12 09 * * 1-5 set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 lemonn_dual_session_dhan.py >> /var/log/dhan.log 2>&1 
+12 09 * * 1-5 /bin/bash -c 'source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 lemonn_dual_session_dhan.py >> /home/kumar_sanjeev_pune/trading-bot/cron_trade.log 2>&1' 
 EOF
 
 crontab -u $USER_NAME /tmp/crontab.txt
