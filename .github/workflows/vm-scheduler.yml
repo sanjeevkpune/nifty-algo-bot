@@ -76,7 +76,7 @@ jobs:
                       --zone=${{ env.ZONE }} \
                       --project=${{ env.PROJECT_ID }} \
                       --metadata-from-file=startup-script=startup.sh \
-                      --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
+                      --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",dhan-client-id="${{ secrets.DHAN_CLIENT_ID }}",dhan-pin="${{ secrets.DHAN_PIN }}",dhan-totp-secret="${{ secrets.DHAN_TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
                   
                   gcloud compute ssh kumar_sanjeev_pune@${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="cd ~/trading-bot && git fetch --all && git reset --hard origin/main && pip3 install --break-system-packages -r requirements.txt" || echo "SSH sync completed."
               else
@@ -97,7 +97,7 @@ jobs:
                   --no-service-account \
                   --no-scopes \
                   --metadata-from-file=startup-script=startup.sh \
-                  --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
+                  --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",dhan-client-id="${{ secrets.DHAN_CLIENT_ID }}",dhan-pin="${{ secrets.DHAN_PIN }}",dhan-totp-secret="${{ secrets.DHAN_TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}"
           fi
 
       - name: Stop VM Instance
