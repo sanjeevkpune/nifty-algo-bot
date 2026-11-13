@@ -85,7 +85,7 @@ PAPER_MODE = env_bool("PAPER_MODE", True)
 PAPER_SLIPPAGE_PTS = env_float("PAPER_SLIPPAGE_PTS", 0.5)
 
 # --- Strategy rules ---------------------------------------------------
-NUM_LOTS = env_int("NUM_LOTS", 3)
+NUM_LOTS = env_int("NUM_LOTS", 4)
 FALLBACK_LOT_SIZE = env_int("FALLBACK_LOT_SIZE", 65)
 ENTRY_HOUR, ENTRY_MIN = 9, 50
 ENTRY_GRACE_MIN = env_int("ENTRY_GRACE_MIN", 5)
