@@ -153,6 +153,7 @@ EOF
 chmod 644 /etc/trade-config/config.env
 
 chown -R ${USER_NAME}:${USER_NAME} $TARGET_DIR
+chmod +x /home/kumar_sanjeev_pune/trading-bot/cleanup_logs.sh
 
 echo "7. Configuring Crontab for Angel One (09:39)..."
 cat <<'EOF' > /tmp/crontab.txt
