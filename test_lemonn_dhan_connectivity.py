@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 test_lemonn_dhan_connectivity.py
-Pre-flight checks for lemonn_dual_session_final_dhan_v3.py against your real
+Pre-flight checks for dhan_improved_with_filters.py against your real
 Dhan account. READ-ONLY by default: nothing is bought or sold.
 
 Usage
     python3 test_lemonn_dhan_connectivity.py                 # read-only checks, NIFTY + SENSEX
     python3 test_lemonn_dhan_connectivity.py --index NIFTY   # one index only
-    python3 test_lemonn_dhan_connectivity.py --bot /path/lemonn_dual_session_final_dhan_v3.py
+    python3 test_lemonn_dhan_connectivity.py --bot /path/dhan_improved_with_filters.py
     python3 test_lemonn_dhan_connectivity.py --order-test    # ALSO places + cancels 2 test orders
 
 --order-test (market hours only, asks you to type YES first):
@@ -330,7 +330,7 @@ def order_test(m, bot, index):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bot", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                   "lemonn_dual_session_final_dhan_v3.py"))
+                                                   "dhan_improved_with_filters.py"))
     ap.add_argument("--index", choices=["NIFTY", "SENSEX", "BOTH"], default="BOTH")
     ap.add_argument("--order-test", action="store_true")
     args = ap.parse_args()
