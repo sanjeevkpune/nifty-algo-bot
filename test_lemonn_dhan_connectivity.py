@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 test_lemonn_dhan_connectivity.py
-Pre-flight checks for dhan_improved_with_filters.py against your real
+Pre-flight checks for lemonn_dual_session_final_dhan_v3.py against your real
 Dhan account. READ-ONLY by default: nothing is bought or sold.
 
 Usage
     python3 test_lemonn_dhan_connectivity.py                 # read-only checks, NIFTY + SENSEX
     python3 test_lemonn_dhan_connectivity.py --index NIFTY   # one index only
-    python3 test_lemonn_dhan_connectivity.py --bot /path/dhan_improved_with_filters.py
+    python3 test_lemonn_dhan_connectivity.py --bot /path/lemonn_dual_session_final_dhan_v3.py
     python3 test_lemonn_dhan_connectivity.py --order-test    # ALSO places + cancels 2 test orders
 
 --order-test (market hours only, asks you to type YES first):
@@ -136,8 +136,8 @@ def check_account(bot):
         rec("PASS", area, "Fund limits", f"available ₹{float(bal or 0):,.0f}, "
             f"utilised ₹{float(d.get('utilizedAmount') or 0):,.0f}")
         if bal is not None and float(bal) < 900000:
-            rec("WARN", area, "Margin", "5-lot short straddle/strangle needed ~₹9.4L in the backtest; "
-                "live trades may be rejected for margin")
+            rec("WARN", area, "Margin", f"₹{float(bal):,.0f} free; Tradetron's estimate for this 5-lot book was "
+                "~₹9.4L - live 5-lot orders are likely to be rejected for margin")
     elif fl is not None:
         rec("FAIL", area, "Fund limits", str(fl)[:200])
 
@@ -330,7 +330,7 @@ def order_test(m, bot, index):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bot", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                   "dhan_improved_with_filters.py"))
+                                                   "lemonn_dual_session_final_dhan_v3.py"))
     ap.add_argument("--index", choices=["NIFTY", "SENSEX", "BOTH"], default="BOTH")
     ap.add_argument("--order-test", action="store_true")
     args = ap.parse_args()
@@ -349,6 +349,7 @@ def main():
         m = first if idx == indices[0] else load_bot(args.bot, idx)
         bot = m.LemonnDualSessionBot()
         bot.dhan, bot.access_token = base.dhan, base.access_token   # reuse one login
+        bot._last_feed_call = time.time()                            # keep the 1 req/sec throttle across indices
         check_index(m, bot, idx)
         if args.order_test and bot.options_df is not None:
             safe(f"ORDERS {idx}", "Order test", order_test, m, bot, idx)
