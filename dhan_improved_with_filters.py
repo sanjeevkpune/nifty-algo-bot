@@ -124,6 +124,9 @@ PROFILES = {
 }
 _WD = now_ist().weekday()
 INDEX = "SENSEX" if _WD in (2, 3) else "NIFTY"
+# Testing only: LEMONN_FORCE_INDEX=NIFTY|SENSEX overrides the weekday choice
+if os.environ.get("LEMONN_FORCE_INDEX", "").upper() in PROFILES:
+    INDEX = os.environ["LEMONN_FORCE_INDEX"].upper()
 P = PROFILES[INDEX]
 STRIKE_STEP = P["step"]
 MAX_ORB_PTS = P["orb"]
