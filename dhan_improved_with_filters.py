@@ -1,30 +1,79 @@
 #!/usr/bin/env python3
 """
-lemonn_dual_session_dhan.py (v2.1 Institutional Upgrade)
-Nifty & Sensex Dual-Session Options Selling Bot via DhanHQ V2 REST & SDK.
-Includes:
-  1. Batched Multi-Token LTP & OHLC Fetching (Zero HTTP 429s)
-  2. 0.50% Opening Gap & 9:15-9:50 AM (140-Pt Nifty / 450-Pt Sensex) ORB Filter
-  3. Premium-Matched Strangle & Synthetic-Future ATM Straddle Strike Selection
-  4. Surviving-Leg SL-to-Cost (+10% Buffer) on 50% Stop-Loss Hit
-  5. Morning-to-Afternoon Chop Circuit Breaker
-  6. Limit-Chase Order Execution with Market Fallback
+lemonn_dual_session_final_dhan_v3.py  (v3.0)
+NIFTY + SENSEX dual-session options selling bot for DhanHQ v2.
+
+Mirrors Tradetron strategy "Lemonn Dual Session NIFTY+SENSEX Final"
+(template 999489342, backtest BID 999403058261120), the bot's original split:
+
+  * Mon / Tue / Fri -> NIFTY  (NSE_FNO, strike step 50,  ORB limit 140 pts)
+    Wed / Thu       -> SENSEX (BSE_FNO, strike step 100, ORB limit 450 pts)
+    Nearest weekly expiry, 5 lots MIS (lot size read from Dhan's scrip master).
+  * Day skipped if the index opens more than 0.50% away from the previous close.
+  * MORNING 09:50-10:00: only if the 09:15-09:50 range is within the ORB limit.
+    Premium-matched OTM1-OTM4 short strangle (default OTM2).
+    50% stop per leg; once one leg is stopped, the survivor's stop moves to
+    entry + 10%. Time exit 14:15 (NIFTY) / 13:30 (SENSEX).
+  * AFTERNOON 14:16-14:30 (NIFTY) / 13:35-13:45 (SENSEX): skipped if both
+    morning legs were stopped or the morning realised P&L is <= -12,000.
+    Synthetic-future ATM short straddle (spot + CE_atm - PE_atm), same stops.
+    Time exit 15:28.
+
+What changed from your v2.1 file (the trading rules above are unchanged):
+  1. Fill-or-flag order execution. v2.1 returned the reference price even when
+     an order was rejected or never filled, so the bot could "think" it held a
+     position it did not have. v3 polls the real order status, steps the limit
+     price twice, then converts to MARKET, and returns the actual average fill
+     and filled quantity, or None.
+  2. Leg-risk unwind. If the CE sells but the PE fails, the CE is bought back
+     immediately, so a single naked leg is never left open.
+  3. Exchange-side stop-loss orders. Every short leg gets a resting
+     STOP_LOSS (SL-limit) BUY order at the exchange, so the stop works even if
+     the VM, network or script dies. The monitor loop watches those orders,
+     chases a stop that gaps through its limit, and modifies the survivor's
+     stop to cost + 10%. Paper mode keeps the software stop.
+  4. Crash-safe state. Legs, phase and realised P&L are saved to a JSON file
+     after every change. On restart the bot reloads the file, reconciles it
+     with Dhan's positions and resumes monitoring instead of forgetting
+     the open trades.
+  5. Entry windows enforced (as in the backtest), so a late restart never
+     opens a fresh trade at a random time.
+  6. Scrip-master filter tightened: only the index's own options near the
+     current spot are used, so SENSEX50 / NIFTYNXT50 contracts can never be
+     picked by mistake, and the expiry chosen is the index's own nearest one.
+  7. Catastrophe guard (DAILY_HARD_STOP, default -45,000 total MTM): closes
+     everything and stops for the day. It is set beyond the worst backtested
+     day (about -31k), so it should not change normal results; it exists for
+     broker or data failures.
+  8. Holiday check uses the right exchange calendar for the day's index,
+     time exits cancel the resting stop first and handle the race where it
+     fills during cancellation.
+  9. Optional protection wings (HEDGE_ENABLED=1, NIFTY +/-500, SENSEX +/-1500).
+     OFF by default: its Tradetron backtest (BID 999403718261120) made less
+     than half the profit with a deeper drawdown, so it is not recommended.
 """
 import sys
 import os
+import json
 import time
 import datetime
-import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import pyotp
-import gspread
 from dhanhq import DhanContext, dhanhq
 
+try:
+    import gspread
+except Exception:  # sheet logging is optional
+    gspread = None
+
+# ==============================================================
+# CONFIG
+# ==============================================================
 CONFIG_ENV_PATH = "/etc/trade-config/config.env"
 if os.path.exists(CONFIG_ENV_PATH):
     with open(CONFIG_ENV_PATH, "r") as f:
@@ -33,6 +82,11 @@ if os.path.exists(CONFIG_ENV_PATH):
             if line and not line.startswith("#") and "=" in line:
                 key, val = line.split("=", 1)
                 os.environ.setdefault(key.strip(), val.strip())
+
+
+def env_bool(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+
 
 IST = ZoneInfo("Asia/Kolkata")
 def now_ist(): return datetime.datetime.now(IST)
@@ -46,35 +100,67 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GSHEET_ID_V2 = os.environ.get("GSHEET_ID_V2")
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
+STATE_DIR = os.environ.get("LEMONN_STATE_DIR", "/var/lib/lemonn")
 
-# ==============================================================
-# DHAN-SPECIFIC 4-WEEK PAPER TRADING OVERRIDE
-# ==============================================================
+# Paper trading until the end of 2026, then controlled by DHAN_PAPER_MODE
 PAPER_MODE_END_DATE = datetime.date(2026, 12, 31)
-if now_ist().date() <= PAPER_MODE_END_DATE:
-    PAPER_MODE = True
-else:
-    PAPER_MODE = os.environ.get("DHAN_PAPER_MODE", "0").strip() in ("1", "true")
-# ==============================================================
+PAPER_MODE = True if now_ist().date() <= PAPER_MODE_END_DATE else env_bool("DHAN_PAPER_MODE")
 
 NUM_LOTS = int(os.environ.get("DHAN_NUM_LOTS", "5"))
-PAPER_SLIPPAGE_PTS = 0.25  # Reduced from 0.50 due to Limit-Chase execution
-MAX_GAP_PCT = 0.50         # Halt day if opening gap > 0.50%
-MORNING_MAX_LOSS_CB = -12000.0  # Circuit breaker threshold for Afternoon session
-SL_COST_BUFFER = 1.10      # Move surviving leg SL to Entry + 10% buffer
+PAPER_SLIPPAGE_PTS = 0.25
+
+# --- Strategy rules (match the Tradetron v4 backtest) ---
+MAX_GAP_PCT = 0.50
+SL_MULT = 1.50                 # 50% stop on each short leg
+SL_COST_BUFFER = 1.10          # survivor stop -> entry + 10%
+MORNING_MAX_LOSS_CB = -12000.0
+
+# Per-index profile, chosen by weekday (Mon/Tue/Fri NIFTY, Wed/Thu SENSEX)
+PROFILES = {
+    "NIFTY": dict(exch_id="NSE", fno_seg="NSE_FNO", spot_token="13", step=50, orb=140.0,
+                  m_exit=(14, 15), a_entry=(14, 16), a_last=(14, 30), hedge=500, calendar="NSE"),
+    "SENSEX": dict(exch_id="BSE", fno_seg="BSE_FNO", spot_token="51", step=100, orb=450.0,
+                   m_exit=(13, 30), a_entry=(13, 35), a_last=(13, 45), hedge=1500, calendar="BSE"),
+}
+_WD = now_ist().weekday()
+INDEX = "SENSEX" if _WD in (2, 3) else "NIFTY"
+P = PROFILES[INDEX]
+STRIKE_STEP = P["step"]
+MAX_ORB_PTS = P["orb"]
+M_ENTRY, M_ENTRY_LAST, M_EXIT = (9, 50), (10, 0), P["m_exit"]
+A_ENTRY, A_ENTRY_LAST, A_EXIT = P["a_entry"], P["a_last"], (15, 28)
+
+# --- Risk / execution extras (do not change the rules) ---
+HEDGE_ENABLED = env_bool("HEDGE_ENABLED", "0")
+HEDGE_WIDTH_PTS = int(os.environ.get(f"HEDGE_WIDTH_PTS_{INDEX}", str(P["hedge"])))
+DAILY_HARD_STOP = float(os.environ.get("DAILY_HARD_STOP", "-45000"))
+SL_LIMIT_BUFFER_PCT = float(os.environ.get("SL_LIMIT_BUFFER_PCT", "0.05"))  # SL-limit = trigger + 5%
+USE_EXCHANGE_SL = env_bool("USE_EXCHANGE_SL", "1")
+
+SPOT_EXCH, SPOT_TOKEN = "IDX_I", P["spot_token"]
+FNO_SEG = P["fno_seg"]
+
+OPEN_STATUSES = ("PENDING", "TRANSIT", "PART_TRADED", "TRIGGER_PENDING")
+DEAD_STATUSES = ("REJECTED", "CANCELLED", "EXPIRED")
+
+
+def tick(px: float) -> float:
+    return round(max(0.05, px) * 20) / 20.0
+
 
 def tg(message: str):
     tag = "[PAPER] " if PAPER_MODE else ""
-    print(f"{tag}{message}")
+    print(f"{now_ist():%H:%M:%S} {tag}{message}", flush=True)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{tag}{message}"},
-                timeout=5
+                timeout=5,
             )
         except Exception:
             pass
+
 
 def wait_until(target):
     while True:
@@ -83,6 +169,7 @@ def wait_until(target):
             return
         time.sleep(min(rem, 1.0))
 
+
 @dataclass
 class Leg:
     session: str
@@ -90,518 +177,682 @@ class Leg:
     strike: int
     symbol: str
     token: str
-    side: str
+    side: str            # "SELL" = short premium leg, "BUY" = protection wing
     qty: int
     entry_px: float
-    sl_px: float
-    exch_seg: str
+    sl_px: float = 0.0   # only for short legs
+    is_hedge: bool = False
     active: bool = True
     sl_moved_to_cost: bool = False
+    sl_order_id: str = ""
+    sl_limit_px: float = 0.0
     exit_px: float = 0.0
     exit_reason: str = ""
 
-class LemonnDhanBot:
+    def pnl(self, px: float) -> float:
+        return (self.entry_px - px) * self.qty if self.side == "SELL" else (px - self.entry_px) * self.qty
+
+
+class LemonnDualSessionBot:
     def __init__(self):
         self.dhan = None
         self.access_token = None
         self.options_df = None
         self.expiry = None
+        self.lot_size = 0
+        self.today = now_ist().date()
         self.legs: List[Leg] = []
-        self.traded_symbols = set()
         self.realized_pnl = 0.0
+        self.phase = "init"     # init -> morning_open -> morning_done -> afternoon_open -> done
+        self.halted = False
+        self._last_feed_call = 0.0
+        self.state_path = os.path.join(STATE_DIR, f"lemonn_dual_{self.today:%Y%m%d}.json")
 
-        wd = now_ist().weekday()
-        if wd in [0, 1, 4]:  # Mon, Tue, Fri -> NIFTY
-            self.idx_name = "NIFTY"
-            self.exch_seg = "NFO"
-            self.dhan_exch_seg = "NSE_FNO"
-            self.spot_exch = "IDX_I"
-            self.spot_token = "13"
-            self.strike_step = 50
-            self.max_orb_pts = 140.0
-            # Morning entry shifted to 09:50 after 09:15-09:50 ORB check
-            self.m_entry, self.m_exit = (9, 50), (14, 15)
-            self.a_entry, self.a_exit = (14, 16), (15, 28)
-        elif wd in [2, 3]:  # Wed, Thu -> SENSEX
-            self.idx_name = "SENSEX"
-            self.exch_seg = "BFO"
-            self.dhan_exch_seg = "BSE_FNO"
-            self.spot_exch = "IDX_I"
-            self.spot_token = "51"
-            self.strike_step = 100
-            self.max_orb_pts = 450.0
-            self.m_entry, self.m_exit = (9, 50), (13, 30)
-            self.a_entry, self.a_exit = (13, 35), (15, 28)
-        else:
-            self.idx_name = "NONE"
+    # ----------------------------------------------------------
+    # State persistence
+    # ----------------------------------------------------------
+    def save_state(self):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump({
+                    "date": str(self.today), "phase": self.phase, "halted": self.halted,
+                    "realized_pnl": self.realized_pnl, "legs": [asdict(l) for l in self.legs],
+                }, fh, indent=1)
+            os.replace(tmp, self.state_path)
+        except Exception as e:
+            print(f"⚠️ State save failed: {e}")
 
+    def load_state(self) -> bool:
+        if not os.path.exists(self.state_path):
+            return False
+        try:
+            with open(self.state_path) as fh:
+                st = json.load(fh)
+            self.phase = st.get("phase", "init")
+            self.halted = st.get("halted", False)
+            self.realized_pnl = float(st.get("realized_pnl", 0.0))
+            self.legs = [Leg(**d) for d in st.get("legs", [])]
+            tg(f"♻️ Resumed state: phase={self.phase}, active legs={sum(l.active for l in self.legs)}, "
+               f"realised ₹{self.realized_pnl:,.0f}")
+            return True
+        except Exception as e:
+            tg(f"⚠️ Could not read state file ({e}). Starting fresh - CHECK BROKER POSITIONS MANUALLY.")
+            return False
+
+    # ----------------------------------------------------------
+    # Login / master
+    # ----------------------------------------------------------
     def login(self):
         if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET:
             raise RuntimeError("Missing Dhan API credentials in /etc/trade-config/config.env")
-
         print(f"🔑 Authenticating Dhan HQ API for {DHAN_CLIENT_ID}...")
         for attempt in range(1, 6):
             totp_code = pyotp.TOTP(DHAN_TOTP_SECRET).now()
-            url = f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp_code}"
-            headers = {"Accept": "application/json"}
-
+            url = (f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}"
+                   f"&pin={DHAN_PIN}&totp={totp_code}")
             try:
-                response = requests.post(url, headers=headers, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    if "accessToken" in data:
-                        self.access_token = data["accessToken"]
-                        context = DhanContext(DHAN_CLIENT_ID, self.access_token)
-                        self.dhan = dhanhq(context)
-
-                        if "data" in self.dhan.get_fund_limits():
-                            print("✅ Dhan SDK Initialized Successfully.")
-                            return
-                print(f"⚠️ Attempt {attempt} Rejected - HTTP {response.status_code}: {response.text}")
+                response = requests.post(url, headers={"Accept": "application/json"}, timeout=30)
+                if response.status_code == 200 and "accessToken" in response.json():
+                    self.access_token = response.json()["accessToken"]
+                    self.dhan = dhanhq(DhanContext(DHAN_CLIENT_ID, self.access_token))
+                    if "data" in self.dhan.get_fund_limits():
+                        print("✅ Dhan SDK Initialized Successfully.")
+                        return
+                print(f"⚠️ Attempt {attempt} rejected - HTTP {response.status_code}")
             except Exception as e:
-                print(f"⚠️ Attempt {attempt} Error: {e}")
-
+                print(f"⚠️ Attempt {attempt} error: {e}")
             if attempt < 5:
-                print("⏳ Waiting 10 seconds before retry...")
                 time.sleep(10)
-
         raise RuntimeError("Dhan authentication failed after 5 attempts.")
 
     def load_master(self):
         print("📥 Fetching latest Dhan master CSV...")
         df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv", low_memory=False)
-
-        df = df[df["SEM_TRADING_SYMBOL"].str.startswith(self.idx_name, na=False)].copy()
+        if "SEM_EXM_EXCH_ID" in df.columns:
+            df = df[df["SEM_EXM_EXCH_ID"].astype(str).str.upper().eq(P["exch_id"])]
+        if "SEM_INSTRUMENT_NAME" in df.columns:
+            df = df[df["SEM_INSTRUMENT_NAME"].astype(str).str.upper().eq("OPTIDX")]
+        # "NIFTY-Nov2026-24000-CE" style symbols; excludes NIFTYNXT50 / SENSEX50 etc.
+        df = df[df["SEM_TRADING_SYMBOL"].str.startswith(INDEX + "-", na=False)].copy()
         df = df[df["SEM_TRADING_SYMBOL"].str.contains(r"(?:CE|PE)$", regex=True, na=False)].copy()
-
         if df.empty:
-            raise RuntimeError(f"Database contains no options matching {self.idx_name} CE/PE.")
-
+            raise RuntimeError(f"Scrip master contains no {INDEX} CE/PE options.")
         df["strike"] = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
+        # Sanity: keep strikes within 15% of the current/previous spot
+        ref = self.get_spot() or float(self.spot_ohlc().get("close", 0) or 0)
+        if ref > 0:
+            df = df[(df["strike"] > ref * 0.85) & (df["strike"] < ref * 1.15)]
         df["expirydate"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], errors="coerce").dt.date
-
         lot_col = next((c for c in ["SEM_LOT_UNITS", "SEM_LOT_SIZE", "SEM_LOT_REGULAR", "LOT_SIZE"] if c in df.columns), None)
         df["lotsize"] = pd.to_numeric(df[lot_col], errors="coerce") if lot_col else 0
-
-        today = now_ist().date()
-        valid_options = df[df["expirydate"] >= today].copy()
-
-        if valid_options.empty:
-            db_min = df["expirydate"].min()
-            db_max = df["expirydate"].max()
-            print(f"⚠️ VM Date ({today}) is out of bounds for Dhan DB (Max: {db_max}). Adjusting...")
-            valid_options = df[df["expirydate"] >= db_min].copy()
-
-        self.options_df = valid_options
-        expiries = sorted(self.options_df["expirydate"].dropna().unique())
-        if not expiries:
-            raise RuntimeError("No valid expiries found after date adjustment.")
-        self.expiry = expiries[0]
-        print(f"✅ Master loaded. Targeted Expiry: {self.expiry}")
-
-    # ==============================================================
-    # UPGRADE 1: BATCHED MULTI-TOKEN LTP & OHLC FETCHING
-    # ==============================================================
-    def get_dhan_ltp_batch(self, exch: str, tokens: List[str]) -> Dict[str, float]:
-        """Fetches LTP for multiple tokens in a single HTTP request to prevent HTTP 429."""
-        if not tokens:
-            return {}
-        time.sleep(1.15)  # Strict <1 req/sec throttle
-        int_tokens = [int(t) for t in set(tokens)]
-        for _ in range(3):
-            try:
-                url = "https://api.dhan.co/v2/marketfeed/ltp"
-                headers = {
-                    "access-token": self.access_token,
-                    "client-id": DHAN_CLIENT_ID,
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
-                }
-                payload = {exch: int_tokens}
-                response = requests.post(url, headers=headers, json=payload, timeout=10)
-                if response.status_code == 200:
-                    resp_data = response.json()
-                    if resp_data.get("status") == "success":
-                        exch_data = resp_data.get("data", {}).get(exch, {})
-                        return {
-                            str(k): float(v.get("last_price", 0.0))
-                            for k, v in exch_data.items()
-                            if isinstance(v, dict) and v.get("last_price") is not None
-                        }
-                print(f"⚠️ Dhan Batch LTP Warning: HTTP {response.status_code} - {response.text}")
-            except Exception as e:
-                print(f"⚠️ Dhan Batch LTP REST Error ({exch}:{int_tokens}): {e}")
-            time.sleep(1.2)
-        return {}
-
-    def get_dhan_ltp(self, exch: str, token: str) -> float:
-        res = self.get_dhan_ltp_batch(exch, [str(token)])
-        return res.get(str(token), 0.0)
-
-    def get_spot(self) -> float:
-        return self.get_dhan_ltp(self.spot_exch, self.spot_token)
-
-    # ==============================================================
-    # UPGRADE 2: OPENING GAP (0.50%) & ORB (140-PT) FILTERS
-    # ==============================================================
-    def check_market_gap(self) -> bool:
-        """Returns True if Opening Gap exceeds MAX_GAP_PCT (0.50%), halting the day."""
-        time.sleep(1.15)
-        try:
-            url = "https://api.dhan.co/v2/marketfeed/ohlc"
-            headers = {
-                "access-token": self.access_token,
-                "client-id": DHAN_CLIENT_ID,
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            payload = {self.spot_exch: [int(self.spot_token)]}
-            response = requests.post(url, headers=headers, json=payload, timeout=10)
-            if response.status_code == 200:
-                resp_data = response.json()
-                spot_info = resp_data.get("data", {}).get(self.spot_exch, {}).get(str(self.spot_token), {})
-                ohlc = spot_info.get("ohlc", {})
-                open_px = float(ohlc.get("open", 0.0))
-                prev_close = float(ohlc.get("close", 0.0))
-                if open_px > 0 and prev_close > 0:
-                    gap_pct = abs(open_px - prev_close) / prev_close * 100.0
-                    if gap_pct > MAX_GAP_PCT:
-                        tg(f"🛑 Gap Filter Triggered: {self.idx_name} opened with {gap_pct:.2f}% gap (Open: {open_px}, Prev Close: {prev_close}) > {MAX_GAP_PCT}%. Halting for today.")
-                        return True
-                    tg(f"✅ Gap Filter Passed: {self.idx_name} Opening Gap is {gap_pct:.2f}% (Open: {open_px}).")
-                    return False
-        except Exception as e:
-            print(f"⚠️ Gap check warning: {e}")
-        return False
-
-    def check_opening_range(self, today: datetime.date) -> bool:
-        """Monitors 09:15-09:50 range via OHLC + live polling. Returns True if range > max_orb_pts."""
-        orb_end = at_ist(today, *self.m_entry)
-        high_px, low_px = 0.0, float("inf")
-
-        # Seed initial High/Low from Dhan's intraday OHLC endpoint
-        try:
-            time.sleep(1.15)
-            url = "https://api.dhan.co/v2/marketfeed/ohlc"
-            headers = {
-                "access-token": self.access_token,
-                "client-id": DHAN_CLIENT_ID,
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-            payload = {self.spot_exch: [int(self.spot_token)]}
-            resp = requests.post(url, headers=headers, json=payload, timeout=10).json()
-            ohlc = resp.get("data", {}).get(self.spot_exch, {}).get(str(self.spot_token), {}).get("ohlc", {})
-            if float(ohlc.get("high", 0)) > 0 and float(ohlc.get("low", 0)) > 0:
-                high_px = float(ohlc["high"])
-                low_px = float(ohlc["low"])
-        except Exception:
-            pass
-
-        if now_ist() < orb_end:
-            tg(f"🔍 Monitoring {self.idx_name} Opening Range until {self.m_entry[0]:02d}:{self.m_entry[1]:02d} (Limit: {self.max_orb_pts} pts)...")
-
-        while now_ist() < orb_end:
-            spot = self.get_spot()
-            if spot > 0:
-                high_px = max(high_px, spot)
-                low_px = min(low_px, spot)
-                curr_range = high_px - low_px
-                if curr_range > self.max_orb_pts:
-                    tg(f"🛑 ORB Filter Triggered: {self.idx_name} range hit {curr_range:.1f} pts (High: {high_px}, Low: {low_px}) > {self.max_orb_pts} pts. Skipping Morning Session.")
-                    return True
-            time.sleep(10)
-
-        if high_px > 0 and low_px < float("inf"):
-            final_range = high_px - low_px
-            if final_range > self.max_orb_pts:
-                tg(f"🛑 ORB Filter Triggered: {self.idx_name} range is {final_range:.1f} pts > {self.max_orb_pts} pts. Skipping Morning Session.")
-                return True
-            tg(f"✅ Opening Range Safe: {final_range:.1f} pts (High: {high_px}, Low: {low_px}).")
-        return False
+        valid = df[df["expirydate"] >= self.today].copy()
+        if valid.empty:
+            raise RuntimeError(f"No {INDEX} expiry on/after {self.today} in the scrip master.")
+        self.options_df = valid
+        self.expiry = sorted(valid["expirydate"].dropna().unique())[0]
+        lots = valid[valid["expirydate"] == self.expiry]["lotsize"].dropna()
+        self.lot_size = int(lots.mode().iloc[0]) if not lots.empty else 0
+        if self.lot_size <= 0:
+            raise RuntimeError(f"Could not read {INDEX} lot size from the scrip master.")
+        print(f"✅ Master loaded. Expiry {self.expiry}, lot size {self.lot_size}")
 
     def find_contract(self, strike: int, opt_type: str) -> Optional[Dict]:
         m = self.options_df[
-            (self.options_df["expirydate"] == self.expiry) &
-            (self.options_df["strike"] == float(strike)) &
-            (self.options_df["SEM_OPTION_TYPE"] == opt_type)
+            (self.options_df["expirydate"] == self.expiry)
+            & (self.options_df["strike"] == float(strike))
+            & (self.options_df["SEM_OPTION_TYPE"] == opt_type)
         ]
         if m.empty:
             return None
-        return {
-            "symbol": str(m.iloc[0]["SEM_TRADING_SYMBOL"]),
-            "token": str(m.iloc[0]["SEM_SMST_SECURITY_ID"]),
-            "lotsize": int(m.iloc[0]["lotsize"]),
-            "strike": int(strike)
-        }
+        return {"symbol": str(m.iloc[0]["SEM_TRADING_SYMBOL"]),
+                "token": str(m.iloc[0]["SEM_SMST_SECURITY_ID"]),
+                "strike": int(strike)}
 
-    # ==============================================================
-    # UPGRADE 3: PREMIUM-MATCHED & SYNTHETIC-FUTURE STRIKE SELECTION
-    # ==============================================================
-    def select_optimal_strikes(self, spot: float, session_name: str) -> Tuple[int, int]:
-        base_atm = round(spot / self.strike_step) * self.strike_step
+    # ----------------------------------------------------------
+    # Market data (batched, throttled to < 1 req/sec)
+    # ----------------------------------------------------------
+    def _feed(self, endpoint: str, payload: dict) -> dict:
+        for _ in range(3):
+            wait = 1.15 - (time.time() - self._last_feed_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_feed_call = time.time()
+            try:
+                r = requests.post(
+                    f"https://api.dhan.co/v2/marketfeed/{endpoint}",
+                    headers={"access-token": self.access_token, "client-id": DHAN_CLIENT_ID,
+                             "Content-Type": "application/json", "Accept": "application/json"},
+                    json=payload, timeout=10)
+                if r.status_code == 200 and r.json().get("status") == "success":
+                    return r.json().get("data", {})
+                print(f"⚠️ marketfeed/{endpoint} HTTP {r.status_code}")
+            except Exception as e:
+                print(f"⚠️ marketfeed/{endpoint} error: {e}")
+        return {}
 
-        if session_name == "MORNING_OTM2":
-            # Candidate OTM strikes: +1 to +4 steps for CE, -1 to -4 steps for PE
-            ce_candidates = [base_atm + (i * self.strike_step) for i in range(1, 5)]
-            pe_candidates = [base_atm - (i * self.strike_step) for i in range(1, 5)]
+    def ltp_batch(self, exch: str, tokens: List[str]) -> Dict[str, float]:
+        if not tokens:
+            return {}
+        data = self._feed("ltp", {exch: sorted({int(t) for t in tokens})}).get(exch, {})
+        return {str(k): float(v["last_price"]) for k, v in data.items()
+                if isinstance(v, dict) and v.get("last_price") is not None}
 
-            ce_contracts = {s: self.find_contract(s, "CE") for s in ce_candidates}
-            pe_contracts = {s: self.find_contract(s, "PE") for s in pe_candidates}
+    def get_spot(self) -> float:
+        return self.ltp_batch(SPOT_EXCH, [SPOT_TOKEN]).get(SPOT_TOKEN, 0.0)
 
-            tokens = [c["token"] for c in ce_contracts.values() if c] + [c["token"] for c in pe_contracts.values() if c]
-            ltp_map = self.get_dhan_ltp_batch(self.dhan_exch_seg, tokens)
+    def spot_ohlc(self) -> dict:
+        d = self._feed("ohlc", {SPOT_EXCH: [int(SPOT_TOKEN)]})
+        return d.get(SPOT_EXCH, {}).get(SPOT_TOKEN, {}).get("ohlc", {}) or {}
 
-            # Default fallback is OTM2
-            default_ce, default_pe = base_atm + (2 * self.strike_step), base_atm - (2 * self.strike_step)
-            ce_otm2_c = ce_contracts.get(default_ce)
-            pe_otm2_c = pe_contracts.get(default_pe)
-            if not ce_otm2_c or not pe_otm2_c:
-                return default_ce, default_pe
+    # ----------------------------------------------------------
+    # Filters
+    # ----------------------------------------------------------
+    def gap_too_big(self) -> bool:
+        ohlc = self.spot_ohlc()
+        o, pc = float(ohlc.get("open", 0) or 0), float(ohlc.get("close", 0) or 0)
+        if o > 0 and pc > 0:
+            gap = abs(o - pc) / pc * 100.0
+            if gap > MAX_GAP_PCT:
+                tg(f"🛑 Gap filter: {INDEX} opened {gap:.2f}% from previous close (> {MAX_GAP_PCT}%). No trades today.")
+                return True
+            tg(f"✅ Gap filter passed: {gap:.2f}%")
+            return False
+        tg("⚠️ Gap check could not read OHLC - proceeding (same as v2.1).")
+        return False
 
-            target_prem = (ltp_map.get(ce_otm2_c["token"], 0.0) + ltp_map.get(pe_otm2_c["token"], 0.0)) / 2.0
-            if target_prem <= 0:
-                return default_ce, default_pe
+    def orb_too_wide(self) -> bool:
+        orb_end = at_ist(self.today, *M_ENTRY)
+        ohlc = self.spot_ohlc()
+        hi = float(ohlc.get("high", 0) or 0)
+        lo = float(ohlc.get("low", 0) or 0) or float("inf")
+        if now_ist() < orb_end:
+            tg(f"🔍 Watching {INDEX} 09:15-09:50 range (limit {MAX_ORB_PTS:.0f} pts)...")
+        while now_ist() < orb_end:
+            s = self.get_spot()
+            if s > 0:
+                hi, lo = max(hi, s), min(lo, s)
+                if hi - lo > MAX_ORB_PTS:
+                    tg(f"🛑 ORB filter: range {hi - lo:.1f} pts > {MAX_ORB_PTS:.0f}. Skipping morning session.")
+                    return True
+            time.sleep(10)
+        if hi > 0 and lo < float("inf"):
+            if hi - lo > MAX_ORB_PTS:
+                tg(f"🛑 ORB filter: range {hi - lo:.1f} pts > {MAX_ORB_PTS:.0f}. Skipping morning session.")
+                return True
+            tg(f"✅ Opening range OK: {hi - lo:.1f} pts")
+        return False
 
-            # Find CE and PE pair with minimum premium mismatch around target_prem
-            best_pair = (default_ce, default_pe)
-            best_score = float("inf")
-            for cs, cc in ce_contracts.items():
-                for ps, pc in pe_contracts.items():
+    # ----------------------------------------------------------
+    # Strike selection (unchanged logic)
+    # ----------------------------------------------------------
+    def select_strikes(self, spot: float, session: str) -> Tuple[int, int]:
+        atm = int(round(spot / STRIKE_STEP) * STRIKE_STEP)
+        if session == "MORNING_OTM2":
+            ce_c = {atm + i * STRIKE_STEP: self.find_contract(atm + i * STRIKE_STEP, "CE") for i in range(1, 5)}
+            pe_c = {atm - i * STRIKE_STEP: self.find_contract(atm - i * STRIKE_STEP, "PE") for i in range(1, 5)}
+            d_ce, d_pe = atm + 2 * STRIKE_STEP, atm - 2 * STRIKE_STEP
+            if not ce_c.get(d_ce) or not pe_c.get(d_pe):
+                return d_ce, d_pe
+            toks = [c["token"] for c in list(ce_c.values()) + list(pe_c.values()) if c]
+            ltp = self.ltp_batch(FNO_SEG, toks)
+            target = (ltp.get(ce_c[d_ce]["token"], 0) + ltp.get(pe_c[d_pe]["token"], 0)) / 2.0
+            if target <= 0:
+                return d_ce, d_pe
+            best, best_score = (d_ce, d_pe), float("inf")
+            for cs, cc in ce_c.items():
+                for ps, pc in pe_c.items():
                     if not cc or not pc:
                         continue
-                    c_px = ltp_map.get(cc["token"], 0.0)
-                    p_px = ltp_map.get(pc["token"], 0.0)
+                    c_px, p_px = ltp.get(cc["token"], 0.0), ltp.get(pc["token"], 0.0)
                     if c_px > 5.0 and p_px > 5.0:
-                        diff = abs(c_px - p_px)
-                        dist_from_target = abs(((c_px + p_px) / 2.0) - target_prem)
-                        score = diff + (0.5 * dist_from_target)
+                        score = abs(c_px - p_px) + 0.5 * abs((c_px + p_px) / 2.0 - target)
                         if score < best_score:
-                            best_score = score
-                            best_pair = (cs, ps)
-            return best_pair
+                            best, best_score = (cs, ps), score
+            return best
+        ce, pe = self.find_contract(atm, "CE"), self.find_contract(atm, "PE")
+        if ce and pe:
+            ltp = self.ltp_batch(FNO_SEG, [ce["token"], pe["token"]])
+            c_px, p_px = ltp.get(ce["token"], 0.0), ltp.get(pe["token"], 0.0)
+            if c_px > 0 and p_px > 0:
+                k = int(round((spot + c_px - p_px) / STRIKE_STEP) * STRIKE_STEP)
+                return k, k
+        return atm, atm
 
-        else:
-            # AFTERNOON_ATM: Calculate Synthetic Future = Spot + CE_ATM - PE_ATM
-            ce_atm = self.find_contract(base_atm, "CE")
-            pe_atm = self.find_contract(base_atm, "PE")
-            if ce_atm and pe_atm:
-                ltp_map = self.get_dhan_ltp_batch(self.dhan_exch_seg, [ce_atm["token"], pe_atm["token"]])
-                ce_px = ltp_map.get(ce_atm["token"], 0.0)
-                pe_px = ltp_map.get(pe_atm["token"], 0.0)
-                if ce_px > 0 and pe_px > 0:
-                    synth_fut = spot + ce_px - pe_px
-                    synth_atm = round(synth_fut / self.strike_step) * self.strike_step
-                    return synth_atm, synth_atm
-            return base_atm, base_atm
+    # ----------------------------------------------------------
+    # Orders
+    # ----------------------------------------------------------
+    @staticmethod
+    def _data(res):
+        if not isinstance(res, dict) or res.get("status") != "success":
+            return None
+        d = res.get("data")
+        if isinstance(d, list):
+            return d[0] if d else None
+        return d
 
-    # ==============================================================
-    # UPGRADE 5: LIMIT-CHASE EXECUTION WITH MARKET FALLBACK
-    # ==============================================================
-    def execute_order(self, symbol: str, token: str, side: str, qty: int, ref_ltp: float = 0.0) -> float:
-        px = ref_ltp if ref_ltp > 0 else self.get_dhan_ltp(self.dhan_exch_seg, token)
-        if PAPER_MODE:
-            self.traded_symbols.add(symbol)
-            return round(px + PAPER_SLIPPAGE_PTS if side == "BUY" else max(0.05, px - PAPER_SLIPPAGE_PTS), 2)
-
+    def order_status(self, oid: str) -> dict:
         try:
-            dhan_side = self.dhan.SELL if side == "SELL" else self.dhan.BUY
-            # Aggressive limit price to capture fill without crossing deep slippage
-            limit_buf = -0.15 if side == "SELL" else 0.25
-            limit_px = round(max(0.05, px + limit_buf) * 20) / 20.0  # Round to 0.05 tick
-
-            res = self.dhan.place_order(
-                security_id=str(token),
-                exchange_segment=self.dhan_exch_seg,
-                transaction_type=dhan_side,
-                quantity=int(qty),
-                order_type=self.dhan.LIMIT,
-                product_type=self.dhan.INTRA,
-                price=limit_px
-            )
-            if isinstance(res, dict) and res.get("status") == "success":
-                oid = res["data"].get("orderId")
-                # Poll for 3 seconds for Limit Fill, then convert to Market on step 4
-                for step in range(8):
-                    time.sleep(1.0)
-                    ob = self.dhan.get_order_list()
-                    if isinstance(ob, dict) and ob.get("status") == "success":
-                        for o in ob.get("data", []):
-                            if str(o.get("orderId")) == str(oid):
-                                if o.get("orderStatus") == "TRADED":
-                                    return float(o.get("averagePrice") or limit_px)
-                                elif step == 3 and o.get("orderStatus") in ("PENDING", "TRANSIT"):
-                                    # Fallback to MARKET order to guarantee execution
-                                    try:
-                                        self.dhan.modify_order(
-                                            order_id=oid,
-                                            order_type=self.dhan.MARKET,
-                                            leg_name="ENTRY_LEG",
-                                            quantity=int(qty),
-                                            price=0,
-                                            trigger_price=0,
-                                            disclosed_quantity=0,
-                                            validity="DAY"
-                                        )
-                                    except Exception:
-                                        pass
+            d = self._data(self.dhan.get_order_by_id(oid)) or {}
         except Exception as e:
-            print(f"⚠️ Order execution error for {symbol}: {e}")
-        return px
+            print(f"⚠️ get_order_by_id({oid}) error: {e}")
+            d = {}
+        return {
+            "status": str(d.get("orderStatus", "")).upper(),
+            "avg": float(d.get("averageTradedPrice") or d.get("averagePrice") or 0) or 0.0,
+            "filled": int(d.get("filledQty") or 0),
+            "price": float(d.get("price") or 0),
+        }
 
-    def deploy_session(self, session_name: str, ce_strike: int, pe_strike: int):
-        ce = self.find_contract(ce_strike, "CE")
-        pe = self.find_contract(pe_strike, "PE")
-        if not ce or not pe:
-            return tg(f"⚠️ {session_name} Skipped: Strikes {ce_strike}/{pe_strike} not found.")
+    def _modify(self, oid: str, order_type: str, qty: int, price: float = 0.0, trigger: float = 0.0) -> bool:
+        try:
+            res = self.dhan.modify_order(order_id=oid, order_type=order_type, leg_name="ENTRY_LEG",
+                                         quantity=int(qty), price=price, trigger_price=trigger,
+                                         disclosed_quantity=0, validity="DAY")
+            return isinstance(res, dict) and res.get("status") == "success"
+        except Exception as e:
+            print(f"⚠️ modify_order({oid}) error: {e}")
+            return False
 
-        qty = NUM_LOTS * ce["lotsize"]
-        ltp_map = self.get_dhan_ltp_batch(self.dhan_exch_seg, [ce["token"], pe["token"]])
-        ce_ref = ltp_map.get(ce["token"], 0.0)
-        pe_ref = ltp_map.get(pe["token"], 0.0)
+    def _cancel(self, oid: str):
+        try:
+            self.dhan.cancel_order(oid)
+        except Exception as e:
+            print(f"⚠️ cancel_order({oid}) error: {e}")
 
-        if ce_ref <= 0 or pe_ref <= 0:
-            return tg(f"⚠️ {session_name} Aborted: Could not fetch valid option LTPs.")
+    def execute_order(self, symbol: str, token: str, side: str, qty: int, ref_px: float) -> Optional[Tuple[float, int]]:
+        """Returns (average fill price, filled qty) or None if nothing filled."""
+        if ref_px <= 0:
+            ref_px = self.ltp_batch(FNO_SEG, [token]).get(str(token), 0.0)
+        if PAPER_MODE:
+            if ref_px <= 0:
+                return None
+            px = ref_px + PAPER_SLIPPAGE_PTS if side == "BUY" else max(0.05, ref_px - PAPER_SLIPPAGE_PTS)
+            return round(px, 2), qty
 
-        ce_px = self.execute_order(ce["symbol"], ce["token"], "SELL", qty, ce_ref)
-        pe_px = self.execute_order(pe["symbol"], pe["token"], "SELL", qty, pe_ref)
+        sgn = 1 if side == "BUY" else -1
+        try:
+            res = self.dhan.place_order(
+                security_id=str(token), exchange_segment=FNO_SEG,
+                transaction_type=self.dhan.BUY if side == "BUY" else self.dhan.SELL,
+                quantity=int(qty), order_type=self.dhan.LIMIT, product_type=self.dhan.INTRA,
+                price=tick(ref_px + 0.25 if side == "BUY" else ref_px - 0.15))
+        except Exception as e:
+            tg(f"⚠️ place_order failed for {symbol} {side}: {e}")
+            return None
+        d = self._data(res)
+        if not d or not d.get("orderId"):
+            tg(f"⚠️ Order rejected for {symbol} {side}: {res}")
+            return None
+        oid = str(d["orderId"])
 
-        ce_sl = round(ce_px * 1.50, 1)
-        pe_sl = round(pe_px * 1.50, 1)
+        st = {}
+        for step in range(12):
+            time.sleep(1.0)
+            st = self.order_status(oid)
+            if st["status"] == "TRADED":
+                return (st["avg"] or ref_px), (st["filled"] or qty)
+            if st["status"] in DEAD_STATUSES:
+                break
+            if step == 2:     # step the limit 1% through the reference price
+                self._modify(oid, self.dhan.LIMIT, qty, tick(ref_px * (1 + sgn * 0.01)))
+            elif step == 5:   # then guarantee the fill
+                self._modify(oid, self.dhan.MARKET, qty)
+        if st.get("status") in OPEN_STATUSES:
+            self._cancel(oid)
+            time.sleep(1.0)
+            st = self.order_status(oid)
+        if st.get("filled", 0) > 0:
+            tg(f"⚠️ {symbol} {side}: only {st['filled']}/{qty} filled ({st.get('status')}).")
+            return (st["avg"] or ref_px), st["filled"]
+        tg(f"❌ {symbol} {side} NOT filled (status {st.get('status')}).")
+        return None
 
-        self.legs.extend([
-            Leg(session_name, "CE", ce_strike, ce["symbol"], ce["token"], "SELL", qty, ce_px, ce_sl, self.dhan_exch_seg),
-            Leg(session_name, "PE", pe_strike, pe["symbol"], pe["token"], "SELL", qty, pe_px, pe_sl, self.dhan_exch_seg)
-        ])
-        tg(
-            f"🟢 {session_name} DEPLOYED ({self.idx_name})\n"
-            f"CE {ce['symbol']} @ ₹{ce_px:.2f} (SL: ₹{ce_sl:.2f})\n"
-            f"PE {pe['symbol']} @ ₹{pe_px:.2f} (SL: ₹{pe_sl:.2f})"
-        )
+    def place_exchange_sl(self, leg: Leg) -> None:
+        """Resting SL-limit BUY order for a short leg."""
+        if PAPER_MODE or not USE_EXCHANGE_SL:
+            return
+        trig = tick(leg.sl_px)
+        lim = tick(trig * (1 + SL_LIMIT_BUFFER_PCT))
+        try:
+            res = self.dhan.place_order(
+                security_id=str(leg.token), exchange_segment=FNO_SEG, transaction_type=self.dhan.BUY,
+                quantity=int(leg.qty), order_type=getattr(self.dhan, "SL", "STOP_LOSS"),
+                product_type=self.dhan.INTRA, price=lim, trigger_price=trig)
+            d = self._data(res)
+            if d and d.get("orderId"):
+                leg.sl_order_id, leg.sl_limit_px = str(d["orderId"]), lim
+                return
+            tg(f"⚠️ Exchange SL rejected for {leg.symbol}: {res}. Software stop will be used.")
+        except Exception as e:
+            tg(f"⚠️ Exchange SL error for {leg.symbol}: {e}. Software stop will be used.")
 
-    def close_leg(self, leg: Leg, ref_ltp: float, reason: str):
-        px = self.execute_order(leg.symbol, leg.token, "BUY", leg.qty, ref_ltp)
+    def move_exchange_sl(self, leg: Leg):
+        if not leg.sl_order_id:
+            return
+        trig = tick(leg.sl_px)
+        lim = tick(trig * (1 + SL_LIMIT_BUFFER_PCT))
+        if self._modify(leg.sl_order_id, getattr(self.dhan, "SL", "STOP_LOSS"), leg.qty, lim, trig):
+            leg.sl_limit_px = lim
+        else:
+            tg(f"⚠️ Could not move exchange SL for {leg.symbol}; software stop at ₹{leg.sl_px:.2f} still active.")
+
+    # ----------------------------------------------------------
+    # Sessions
+    # ----------------------------------------------------------
+    def close_leg(self, leg: Leg, ref_px: float, reason: str) -> bool:
+        if not leg.active:
+            return True
+        # Cancel the resting stop first; if it filled meanwhile, book that fill instead.
+        if leg.sl_order_id and not PAPER_MODE:
+            self._cancel(leg.sl_order_id)
+            time.sleep(0.8)
+            st = self.order_status(leg.sl_order_id)
+            if st["status"] == "TRADED":
+                self._book_exit(leg, st["avg"] or leg.sl_px, "SL_HIT_EXCHANGE")
+                return True
+            leg.sl_order_id = ""
+        side = "BUY" if leg.side == "SELL" else "SELL"
+        fill = self.execute_order(leg.symbol, leg.token, side, leg.qty, ref_px)
+        if not fill:
+            tg(f"🚨 FAILED TO CLOSE {leg.symbol} ({reason}). Close it manually in Dhan now!")
+            return False
+        self._book_exit(leg, fill[0], reason)
+        return True
+
+    def _book_exit(self, leg: Leg, px: float, reason: str):
         leg.exit_px, leg.active, leg.exit_reason = px, False, reason
-        pnl = (leg.entry_px - px) * leg.qty
+        pnl = leg.pnl(px)
         self.realized_pnl += pnl
-        tg(f"🔴 CLOSED {leg.symbol} @ ₹{px:.2f} | Reason: {reason} | P&L: ₹{pnl:,.2f}")
+        self.save_state()
+        tg(f"🔴 CLOSED {leg.symbol} @ ₹{px:.2f} | {reason} | P&L ₹{pnl:,.0f} | Day ₹{self.realized_pnl:,.0f}")
 
-    # ==============================================================
-    # UPGRADE 4: SURVIVING-LEG SL-TO-COST (+10% BUFFER) IN MONITOR
-    # ==============================================================
+    def deploy_session(self, session: str, ce_strike: int, pe_strike: int) -> bool:
+        ce, pe = self.find_contract(ce_strike, "CE"), self.find_contract(pe_strike, "PE")
+        if not ce or not pe:
+            tg(f"⚠️ {session} skipped: strikes {ce_strike}/{pe_strike} not in the master.")
+            return False
+        qty = NUM_LOTS * self.lot_size
+        hedges = []
+        if HEDGE_ENABLED:
+            hce = self.find_contract(ce_strike + HEDGE_WIDTH_PTS, "CE")
+            hpe = self.find_contract(pe_strike - HEDGE_WIDTH_PTS, "PE")
+            if hce and hpe:
+                hedges = [("CE", hce), ("PE", hpe)]
+            else:
+                tg(f"⚠️ {session}: protection strikes not found - trading unhedged.")
+
+        toks = [ce["token"], pe["token"]] + [c["token"] for _, c in hedges]
+        ltp = self.ltp_batch(FNO_SEG, toks)
+        if ltp.get(ce["token"], 0) <= 0 or ltp.get(pe["token"], 0) <= 0:
+            tg(f"⚠️ {session} aborted: no valid option prices.")
+            return False
+
+        opened: List[Leg] = []
+
+        def unwind(why: str):
+            tg(f"↩️ {session} unwinding ({why}).")
+            for l in [l for l in opened if l.side == "SELL"] + [l for l in opened if l.side == "BUY"]:
+                self.close_leg(l, ltp.get(l.token, 0.0), "UNWIND")
+
+        # 1) Protection first (buying first lowers the margin needed for the sells)
+        for opt, c in hedges:
+            f = self.execute_order(c["symbol"], c["token"], "BUY", qty, ltp.get(c["token"], 0.0))
+            if not f:
+                unwind("protection leg failed")
+                return False
+            leg = Leg(session, opt, c["strike"], c["symbol"], c["token"], "BUY", f[1], f[0], is_hedge=True)
+            self.legs.append(leg); opened.append(leg); self.save_state()
+
+        # 2) Short legs
+        for opt, c in (("CE", ce), ("PE", pe)):
+            f = self.execute_order(c["symbol"], c["token"], "SELL", qty, ltp.get(c["token"], 0.0))
+            if not f:
+                unwind(f"{opt} sell failed")
+                return False
+            leg = Leg(session, opt, c["strike"], c["symbol"], c["token"], "SELL", f[1], f[0],
+                      sl_px=round(f[0] * SL_MULT, 1))
+            self.legs.append(leg); opened.append(leg); self.save_state()
+
+        for leg in opened:
+            if leg.side == "SELL":
+                self.place_exchange_sl(leg)
+        self.save_state()
+        lines = [f"{'BUY ' if l.is_hedge else 'SELL'} {l.symbol} x{l.qty} @ ₹{l.entry_px:.2f}"
+                 + ("" if l.is_hedge else f" (SL ₹{l.sl_px:.2f}{', exch' if l.sl_order_id else ''})")
+                 for l in opened]
+        tg(f"🟢 {session} DEPLOYED ({INDEX} {self.expiry})\n" + "\n".join(lines))
+        return True
+
+    # ----------------------------------------------------------
+    # Monitor
+    # ----------------------------------------------------------
+    def _on_stop(self, leg: Leg, px: float, reason: str):
+        """Book a stopped short leg and tighten the survivor (once per session)."""
+        was_cost = leg.sl_moved_to_cost
+        self._book_exit(leg, px, reason)
+        if was_cost:
+            return
+        for other in [l for l in self.legs if l.active and l.session == leg.session and l.side == "SELL"]:
+            new_sl = round(other.entry_px * SL_COST_BUFFER, 1)
+            if new_sl < other.sl_px:
+                other.sl_px, other.sl_moved_to_cost = new_sl, True
+                self.move_exchange_sl(other)
+                self.save_state()
+                tg(f"🛡️ {other.symbol} stop tightened to cost + 10% (₹{other.sl_px:.2f})")
+
+    def mtm(self, ltp: Dict[str, float]) -> float:
+        return self.realized_pnl + sum(l.pnl(ltp.get(l.token, l.entry_px)) for l in self.legs if l.active)
+
+    def close_all(self, ltp: Dict[str, float], reason: str):
+        for l in [l for l in self.legs if l.active and l.side == "SELL"] + \
+                 [l for l in self.legs if l.active and l.side == "BUY"]:
+            self.close_leg(l, ltp.get(l.token, 0.0), reason)
+
     def monitor_until(self, exit_time: datetime.datetime):
-        while now_ist() < exit_time:
-            active_legs = [l for l in self.legs if l.active]
-            if not active_legs:
+        gap_through = {}
+        while now_ist() < exit_time and not self.halted:
+            active = [l for l in self.legs if l.active]
+            if not any(l.side == "SELL" for l in active):
+                break
+            ltp = self.ltp_batch(FNO_SEG, [l.token for l in active])
+
+            # Catastrophe guard on total MTM
+            if ltp and self.mtm(ltp) <= DAILY_HARD_STOP:
+                tg(f"🚨 HARD STOP: day MTM ₹{self.mtm(ltp):,.0f} <= ₹{DAILY_HARD_STOP:,.0f}. Closing everything.")
+                self.close_all(ltp, "HARD_STOP")
+                self.halted = True
+                self.save_state()
                 break
 
-            tokens = [l.token for l in active_legs]
-            ltp_map = self.get_dhan_ltp_batch(self.dhan_exch_seg, tokens)
+            orders = {}
+            if not PAPER_MODE and any(l.sl_order_id for l in active):
+                try:
+                    ob = self.dhan.get_order_list()
+                    if isinstance(ob, dict) and ob.get("status") == "success":
+                        orders = {str(o.get("orderId")): o for o in ob.get("data", []) or []}
+                except Exception as e:
+                    print(f"⚠️ order list error: {e}")
 
-            for leg in active_legs:
-                current_px = ltp_map.get(str(leg.token), 0.0)
-                if current_px > 0 and current_px >= leg.sl_px:
-                    reason = "COST_SL_HIT" if leg.sl_moved_to_cost else "50%_SL_HIT"
-                    self.close_leg(leg, current_px, reason)
-
-                    # Tighten surviving leg SL to Entry Cost + 10% Buffer
-                    if reason == "50%_SL_HIT":
-                        for other in [l for l in self.legs if l.active and l.session == leg.session]:
-                            new_sl = round(other.entry_px * SL_COST_BUFFER, 1)
-                            if new_sl < other.sl_px:
-                                other.sl_px = new_sl
-                                other.sl_moved_to_cost = True
-                                tg(f"🛡️ {other.symbol} SL tightened to Cost+10% (₹{other.sl_px:.2f})")
-
+            for leg in [l for l in active if l.side == "SELL" and l.active]:
+                px = ltp.get(str(leg.token), 0.0)
+                reason = "COST_SL_HIT" if leg.sl_moved_to_cost else "50%_SL_HIT"
+                if leg.sl_order_id:
+                    o = orders.get(leg.sl_order_id)
+                    status = str(o.get("orderStatus", "")).upper() if o else ""
+                    if status == "TRADED":
+                        fill = float(o.get("averageTradedPrice") or o.get("averagePrice") or leg.sl_px)
+                        leg.sl_order_id = ""
+                        self._on_stop(leg, fill, reason)
+                        continue
+                    if status in DEAD_STATUSES:
+                        tg(f"⚠️ Exchange SL for {leg.symbol} is {status}; switching to software stop.")
+                        leg.sl_order_id = ""
+                    elif px > 0 and px > leg.sl_limit_px:
+                        # Price gapped through the SL limit: chase with MARKET after 2 checks
+                        gap_through[leg.token] = gap_through.get(leg.token, 0) + 1
+                        if gap_through[leg.token] >= 2:
+                            tg(f"⚡ {leg.symbol} gapped through SL limit (LTP ₹{px:.2f}); converting stop to MARKET.")
+                            self._modify(leg.sl_order_id, self.dhan.MARKET, leg.qty)
+                            gap_through[leg.token] = -10
+                        continue
+                    else:
+                        continue
+                # Software stop (paper mode, or exchange SL unavailable)
+                if px > 0 and px >= leg.sl_px:
+                    fill = self.execute_order(leg.symbol, leg.token, "BUY", leg.qty, px)
+                    if fill:
+                        self._on_stop(leg, fill[0], reason)
+                    else:
+                        tg(f"🚨 Stop on {leg.symbol} could not be executed - retrying next loop.")
             time.sleep(1.5)
 
-        # Time exit for remaining active legs in a single batched fetch
-        rem_legs = [l for l in self.legs if l.active]
-        if rem_legs:
-            ltp_map = self.get_dhan_ltp_batch(self.dhan_exch_seg, [l.token for l in rem_legs])
-            for leg in rem_legs:
-                ref_px = ltp_map.get(str(leg.token), 0.0) or self.get_dhan_ltp(leg.exch_seg, leg.token)
-                self.close_leg(leg, ref_px, "TIME_EXIT")
+        if not self.halted:
+            rem = [l for l in self.legs if l.active]
+            if rem:
+                ltp = self.ltp_batch(FNO_SEG, [l.token for l in rem])
+                self.close_all(ltp, "TIME_EXIT")
 
-    def log_sheet(self, date_str: str):
-        if not GSHEET_ID_V2 or not os.path.exists(SERVICE_ACCOUNT_FILE):
+    # ----------------------------------------------------------
+    # Reconciliation after restart
+    # ----------------------------------------------------------
+    def reconcile_positions(self):
+        if PAPER_MODE or not any(l.active for l in self.legs):
             return
         try:
-            ws = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2).worksheet("Lemonn_Log")
-        except Exception:
-            try:
-                sh = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2)
-                ws = sh.add_worksheet(title="Lemonn_Log", rows="1000", cols="12")
-                ws.append_row(["Date", "Index", "Session", "CE_Symbol", "CE_Entry", "CE_Exit", "CE_Reason", "PE_Symbol", "PE_Entry", "PE_Exit", "PE_Reason", "Session_PnL"])
-            except Exception:
-                return
+            res = self.dhan.get_positions()
+            rows = res.get("data", []) if isinstance(res, dict) else []
+        except Exception as e:
+            tg(f"⚠️ Could not read positions for reconciliation: {e}")
+            return
+        net = {}
+        for r in rows or []:
+            net[str(r.get("securityId"))] = net.get(str(r.get("securityId")), 0) + int(r.get("netQty") or 0)
+        for leg in [l for l in self.legs if l.active]:
+            expected = -leg.qty if leg.side == "SELL" else leg.qty
+            have = net.get(str(leg.token), 0)
+            if have == 0:
+                if leg.sl_order_id:
+                    st = self.order_status(leg.sl_order_id)
+                    if st["status"] == "TRADED":
+                        self._book_exit(leg, st["avg"] or leg.sl_px, "SL_HIT_EXCHANGE (while offline)")
+                        continue
+                px = self.ltp_batch(FNO_SEG, [leg.token]).get(str(leg.token), leg.entry_px)
+                tg(f"⚠️ {leg.symbol} is flat at the broker; marking closed at LTP ₹{px:.2f} (check fills).")
+                self._book_exit(leg, px, "FLAT_AT_BROKER")
+            elif have != expected:
+                tg(f"⚠️ {leg.symbol}: broker net qty {have}, expected {expected}. Please check manually.")
 
-        for session in ["MORNING_OTM2", "AFTERNOON_ATM"]:
-            s_legs = [l for l in self.legs if l.session == session]
-            if len(s_legs) == 2:
-                ce, pe = s_legs[0], s_legs[1]
-                pnl = ((ce.entry_px - ce.exit_px) * ce.qty) + ((pe.entry_px - pe.exit_px) * pe.qty)
-                ws.append_row([date_str, self.idx_name, session, ce.symbol, ce.entry_px, ce.exit_px, ce.exit_reason, pe.symbol, pe.entry_px, pe.exit_px, pe.exit_reason, round(pnl, 2)])
+    # ----------------------------------------------------------
+    # Logging
+    # ----------------------------------------------------------
+    def log_sheet(self):
+        if not gspread or not GSHEET_ID_V2 or not os.path.exists(SERVICE_ACCOUNT_FILE):
+            return
+        try:
+            sh = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2)
+            try:
+                ws = sh.worksheet("Lemonn_Dual_v3")
+            except Exception:
+                ws = sh.add_worksheet(title="Lemonn_Dual_v3", rows="2000", cols="12")
+                ws.append_row(["Date", "Index", "Session", "Leg", "Side", "Symbol", "Qty", "Entry", "Exit",
+                               "Reason", "Leg_PnL", "Paper"])
+            for l in self.legs:
+                ws.append_row([str(self.today), INDEX, l.session, l.opt_type + (" hedge" if l.is_hedge else ""),
+                               l.side, l.symbol, l.qty, l.entry_px, l.exit_px, l.exit_reason,
+                               round(l.pnl(l.exit_px), 2) if not l.active else "", PAPER_MODE])
+        except Exception as e:
+            print(f"⚠️ Sheet logging failed: {e}")
+
+    # ----------------------------------------------------------
+    # Main flow
+    # ----------------------------------------------------------
+    def _in_window(self, first, last) -> bool:
+        return at_ist(self.today, *first) <= now_ist() <= at_ist(self.today, *last)
 
     def run(self):
-        if self.idx_name == "NONE":
-            return tg("Weekend - Nothing to trade.")
-        today = now_ist().date()
+        if self.today.weekday() >= 5:
+            return tg("Weekend - nothing to trade.")
         try:
             import pandas_market_calendars as mcal
-            if mcal.get_calendar("BSE").schedule(start_date=str(today), end_date=str(today)).empty:
-                return tg("📅 Exchange Holiday. Sleeping.")
+            if mcal.get_calendar(P["calendar"]).schedule(start_date=str(self.today), end_date=str(self.today)).empty:
+                return tg("📅 NSE holiday. Sleeping.")
         except Exception:
             pass
 
+        self.load_state()
+        if self.phase == "done":
+            return tg("Today's sessions are already complete.")
         self.login()
         self.load_master()
-        tg(f"🚀 LEMONN DUAL-SESSION v2.1 (DhanHQ | {self.idx_name} | {NUM_LOTS} Lots)")
+        tg(f"🚀 LEMONN DUAL-SESSION v3.0 | {INDEX} | {NUM_LOTS} lots x {self.lot_size} | "
+           f"hedge {'ON ' + str(HEDGE_WIDTH_PTS) + 'pts' if HEDGE_ENABLED else 'OFF'} | "
+           f"exch SL {'ON' if USE_EXCHANGE_SL and not PAPER_MODE else 'OFF'}")
+        self.reconcile_positions()
 
-        # Check Opening Gap at 09:15 AM
-        wait_until(at_ist(today, 9, 15))
-        if self.check_market_gap():
-            return
+        # ---------------- MORNING ----------------
+        if self.phase == "init":
+            wait_until(at_ist(self.today, 9, 15))
+            if self.gap_too_big():
+                self.phase = "done"; self.save_state(); return
+            if not self.orb_too_wide():
+                wait_until(at_ist(self.today, *M_ENTRY))
+                if self._in_window(M_ENTRY, M_ENTRY_LAST):
+                    spot = self.get_spot()
+                    if spot > 0:
+                        ce_k, pe_k = self.select_strikes(spot, "MORNING_OTM2")
+                        if self.deploy_session("MORNING_OTM2", ce_k, pe_k):
+                            self.phase = "morning_open"; self.save_state()
+                    else:
+                        tg("⚠️ No spot price for the morning session.")
+                else:
+                    tg("⏰ Started after the 09:50-10:00 entry window - morning session skipped.")
+            if self.phase == "init":
+                self.phase = "morning_done"; self.save_state()
 
-        # 1. MORNING OTM2 SESSION (Monitors ORB until 09:50 AM)
-        orb_breached = self.check_opening_range(today)
-        if not orb_breached:
-            spot = self.get_spot()
-            if spot > 0:
-                ce_strike, pe_strike = self.select_optimal_strikes(spot, "MORNING_OTM2")
-                self.deploy_session("MORNING_OTM2", ce_strike, pe_strike)
-                self.monitor_until(at_ist(today, *self.m_exit))
+        if self.phase == "morning_open":
+            self.monitor_until(at_ist(self.today, *M_EXIT))
+            self.phase = "done" if self.halted else "morning_done"
+            self.save_state()
+
+        # ---------------- AFTERNOON ----------------
+        if self.phase == "morning_done":
+            m_sl = sum(1 for l in self.legs if l.session == "MORNING_OTM2" and l.side == "SELL"
+                       and l.exit_reason.startswith(("50%_SL", "COST_SL", "SL_HIT")))
+            if m_sl >= 2 or self.realized_pnl <= MORNING_MAX_LOSS_CB:
+                tg(f"🛑 Chop breaker: {m_sl} morning stops, realised ₹{self.realized_pnl:,.0f}. Afternoon skipped.")
+                self.phase = "done"; self.save_state()
             else:
-                tg("⚠️ Unable to fetch Spot Price for Morning Session.")
+                wait_until(at_ist(self.today, *A_ENTRY))
+                if self._in_window(A_ENTRY, A_ENTRY_LAST):
+                    spot = self.get_spot()
+                    if spot > 0:
+                        k, _ = self.select_strikes(spot, "AFTERNOON_ATM")
+                        if self.deploy_session("AFTERNOON_ATM", k, k):
+                            self.phase = "afternoon_open"; self.save_state()
+                    else:
+                        tg("⚠️ No spot price for the afternoon session.")
+                else:
+                    tg(f"⏰ Past the {A_ENTRY[0]}:{A_ENTRY[1]:02d}-{A_ENTRY_LAST[0]}:{A_ENTRY_LAST[1]:02d} entry window - afternoon session skipped.")
+                if self.phase == "morning_done":
+                    self.phase = "done"; self.save_state()
 
-        # ==============================================================
-        # UPGRADE 5: MORNING-TO-AFTERNOON CHOP CIRCUIT BREAKER
-        # ==============================================================
-        morning_sl_hits = sum(
-            1 for l in self.legs
-            if l.session == "MORNING_OTM2" and l.exit_reason in ("50%_SL_HIT", "COST_SL_HIT")
-        )
-        if morning_sl_hits >= 2 or self.realized_pnl <= MORNING_MAX_LOSS_CB:
-            tg(
-                f"🛑 Chop Circuit Breaker Triggered: Morning session hit {morning_sl_hits} SLs "
-                f"(Realized P&L: ₹{self.realized_pnl:,.2f}). Skipping Afternoon ATM Session."
-            )
-        else:
-            # 2. AFTERNOON ATM SESSION (Synthetic Future Centered)
-            wait_until(at_ist(today, *self.a_entry))
-            spot = self.get_spot()
-            if spot > 0:
-                ce_strike, pe_strike = self.select_optimal_strikes(spot, "AFTERNOON_ATM")
-                self.deploy_session("AFTERNOON_ATM", ce_strike, pe_strike)
-                self.monitor_until(at_ist(today, *self.a_exit))
-            else:
-                tg("⚠️ Unable to fetch Spot Price for Afternoon Session.")
+        if self.phase == "afternoon_open":
+            self.monitor_until(at_ist(self.today, *A_EXIT))
+            self.phase = "done"; self.save_state()
 
-        self.log_sheet(str(today))
-        tg(f"🏁 DUAL-SESSION COMPLETE | Total Gross PnL: ₹{self.realized_pnl:,.2f}")
+        self.log_sheet()
+        tg(f"🏁 DAY COMPLETE | Realised P&L (before charges): ₹{self.realized_pnl:,.0f}")
+
 
 if __name__ == "__main__":
+    bot = None
     try:
-        LemonnDhanBot().run()
+        bot = LemonnDualSessionBot()
+        bot.run()
     except Exception as e:
-        tg(f"🚨 FATAL BOT CRASH 🚨\n{e}")
+        open_legs = [l.symbol for l in (bot.legs if bot else []) if l.active]
+        tg(f"🚨 FATAL BOT CRASH 🚨\n{e}\nOpen legs: {open_legs or 'none'}. "
+           f"Exchange stops (if live) stay in place; restart the bot to resume.")
+        sys.exit(1)
