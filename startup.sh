@@ -169,7 +169,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 30 09 * * 1-5 /bin/bash -c 'source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 dhan_improved_with_filters.py >> /home/kumar_sanjeev_pune/trading-bot/dhan_improved.log 2>&1'
 
 # Run log cleanup daily at 00:00 AM
-0 0 * * * /home/kumar_sanjeev_pune/trading-bot/cleanup_logs.sh >/dev/null 2>&1
+00 09 * * * /home/kumar_sanjeev_pune/trading-bot/cleanup_logs.sh >/dev/null 2>&1
 
 # Check log sizes every hour against the 10MB limit using logrotate (user-mode)
 0 * * * * /usr/sbin/logrotate -s /home/kumar_sanjeev_pune/trading-bot/logrotate.status /home/kumar_sanjeev_pune/trading-bot/bot_logrotate.conf >/dev/null 2>&1
