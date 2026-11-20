@@ -100,7 +100,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GSHEET_ID_V2 = os.environ.get("GSHEET_ID_V2")
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
-STATE_DIR = os.environ.get("LEMONN_STATE_DIR", "/var/lib/lemonn")
+STATE_DIR = os.environ.get("LEMONN_STATE_DIR",
+                           os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"))
 
 # Paper trading until the end of 2026, then controlled by DHAN_PAPER_MODE
 PAPER_MODE_END_DATE = datetime.date(2026, 12, 31)
@@ -139,6 +140,7 @@ HEDGE_WIDTH_PTS = int(os.environ.get(f"HEDGE_WIDTH_PTS_{INDEX}", str(P["hedge"])
 DAILY_HARD_STOP = float(os.environ.get("DAILY_HARD_STOP", "-45000"))
 SL_LIMIT_BUFFER_PCT = float(os.environ.get("SL_LIMIT_BUFFER_PCT", "0.05"))  # SL-limit = trigger + 5%
 USE_EXCHANGE_SL = env_bool("USE_EXCHANGE_SL", "1")
+MIN_FREE_MARGIN = float(os.environ.get("MIN_FREE_MARGIN", "0"))  # skip a session if free funds are below this (0 = off)
 
 SPOT_EXCH, SPOT_TOKEN = "IDX_I", P["spot_token"]
 FNO_SEG = P["fno_seg"]
@@ -247,27 +249,69 @@ class LemonnDualSessionBot:
     # ----------------------------------------------------------
     # Login / master
     # ----------------------------------------------------------
+    def _token_cache_path(self) -> str:
+        return os.path.join(STATE_DIR, "dhan_token.json")
+
+    def _try_token(self, token: str) -> bool:
+        try:
+            self.access_token = token
+            self.dhan = dhanhq(DhanContext(DHAN_CLIENT_ID, token))
+            fl = self.dhan.get_fund_limits()
+            return isinstance(fl, dict) and fl.get("status") == "success" and "data" in fl
+        except Exception:
+            return False
+
     def login(self):
         if not DHAN_CLIENT_ID or not DHAN_PIN or not DHAN_TOTP_SECRET:
             raise RuntimeError("Missing Dhan API credentials in /etc/trade-config/config.env")
+        # 1) Reuse today's token if we already generated one (Dhan tokens last ~24h,
+        #    and generating a new one on every restart is slow and rate-limited).
+        try:
+            with open(self._token_cache_path()) as fh:
+                c = json.load(fh)
+            if c.get("date") == str(self.today) and self._try_token(c.get("token", "")):
+                print("✅ Reused today's Dhan access token.")
+                return
+        except Exception:
+            pass
         print(f"🔑 Authenticating Dhan HQ API for {DHAN_CLIENT_ID}...")
+        last_code = None
         for attempt in range(1, 6):
-            totp_code = pyotp.TOTP(DHAN_TOTP_SECRET).now()
+            totp = pyotp.TOTP(DHAN_TOTP_SECRET)
+            code = totp.now()
+            if code == last_code:  # never resend a TOTP that was already tried
+                time.sleep(30.5 - (time.time() % 30))
+                code = totp.now()
+            last_code = code
             url = (f"https://auth.dhan.co/app/generateAccessToken?dhanClientId={DHAN_CLIENT_ID}"
-                   f"&pin={DHAN_PIN}&totp={totp_code}")
+                   f"&pin={DHAN_PIN}&totp={code}")
             try:
                 response = requests.post(url, headers={"Accept": "application/json"}, timeout=30)
-                if response.status_code == 200 and "accessToken" in response.json():
-                    self.access_token = response.json()["accessToken"]
-                    self.dhan = dhanhq(DhanContext(DHAN_CLIENT_ID, self.access_token))
-                    if "data" in self.dhan.get_fund_limits():
+                body = {}
+                try:
+                    body = response.json()
+                except Exception:
+                    pass
+                if response.status_code == 200 and body.get("accessToken"):
+                    if self._try_token(body["accessToken"]):
+                        try:
+                            os.makedirs(STATE_DIR, exist_ok=True)
+                            path = self._token_cache_path()
+                            with open(path, "w") as fh:
+                                json.dump({"date": str(self.today), "token": body["accessToken"]}, fh)
+                            os.chmod(path, 0o600)
+                        except Exception as e:
+                            print(f"⚠️ Could not cache token: {e}")
                         print("✅ Dhan SDK Initialized Successfully.")
                         return
-                print(f"⚠️ Attempt {attempt} rejected - HTTP {response.status_code}")
+                # Show Dhan's reason (never the token itself)
+                reason = {k: v for k, v in body.items() if "token" not in k.lower()} if body else response.text[:200]
+                print(f"⚠️ Attempt {attempt} rejected - HTTP {response.status_code}: {reason}")
             except Exception as e:
                 print(f"⚠️ Attempt {attempt} error: {e}")
             if attempt < 5:
-                time.sleep(10)
+                # wait for the next TOTP window instead of a fixed 10 s
+                time.sleep(max(5.0, 30.5 - (time.time() % 30)))
         raise RuntimeError("Dhan authentication failed after 5 attempts.")
 
     def load_master(self):
@@ -591,6 +635,16 @@ class LemonnDualSessionBot:
         if ltp.get(ce["token"], 0) <= 0 or ltp.get(pe["token"], 0) <= 0:
             tg(f"⚠️ {session} aborted: no valid option prices.")
             return False
+
+        if MIN_FREE_MARGIN > 0 and not PAPER_MODE:
+            try:
+                d = self.dhan.get_fund_limits().get("data") or {}
+                free = float(d.get("availabelBalance", d.get("availableBalance", 0)) or 0)
+                if free < MIN_FREE_MARGIN:
+                    tg(f"🛑 {session} skipped: free margin ₹{free:,.0f} < MIN_FREE_MARGIN ₹{MIN_FREE_MARGIN:,.0f}.")
+                    return False
+            except Exception as e:
+                print(f"⚠️ Margin check failed ({e}); continuing.")
 
         opened: List[Leg] = []
 
