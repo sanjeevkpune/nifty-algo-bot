@@ -14,6 +14,8 @@ import time
 import json
 import datetime
 import traceback
+import signal
+import csv
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional, Dict, List
@@ -78,7 +80,7 @@ if missing_env:
     print(f"CRITICAL: missing environment variables: {', '.join(missing_env)}")
     sys.exit(1)
 
-STRATEGY_VERSION = "V4.2_ZERO_TOUCH"
+STRATEGY_VERSION = "V4.3_ZERO_TOUCH"
 
 # --- Mode -------------------------------------------------------------
 PAPER_MODE = env_bool("PAPER_MODE", True)          
@@ -107,6 +109,12 @@ MARKET_WAIT_SECS = env_int("MARKET_WAIT_SECS", 15)
 ORDER_POLL_SECS = 1.0
 
 # --- Monitoring -------------------------------------------------------
+API_TIMEOUT_SECS = env_int("API_TIMEOUT_SECS", 20)          # login / pre-entry calls
+MONITOR_TIMEOUT_SECS = env_int("MONITOR_TIMEOUT_SECS", 7)    # once positions are open: fail fast so SL checks stay fresh
+ORPHAN_AUTO_SQUAREOFF = env_bool("ORPHAN_AUTO_SQUAREOFF", True)
+LOCAL_LOG_FILE = os.environ.get("LOCAL_LOG_FILE", "trade_log_local.csv")
+MASTER_CACHE_FILE = os.environ.get("MASTER_CACHE_FILE", "scrip_master_nifty_cache.json")
+OHLC_RETRY_SECS = env_int("OHLC_RETRY_SECS", 120)
 POLL_SECS = env_float("POLL_SECS", 1.5)
 DATA_FAIL_ALERT_SECS = env_int("DATA_FAIL_ALERT_SECS", 15)
 DATA_FAIL_EXIT_SECS = env_int("DATA_FAIL_EXIT_SECS", 60)
@@ -206,9 +214,13 @@ class Bot:
         self.qty = 0
         self.last_q: Dict[str, float] = {}
         self.lock_path = ""
+        self.stop_requested = False
 
     def login(self):
-        self.smart = SmartConnect(api_key=API_KEY)
+        try:
+            self.smart = SmartConnect(api_key=API_KEY, timeout=API_TIMEOUT_SECS)
+        except TypeError:   # older SmartApi without a timeout argument
+            self.smart = SmartConnect(api_key=API_KEY)
         for attempt in range(1, 4):
             try:
                 res = self.smart.generateSession(CLIENT_CODE, PIN, pyotp.TOTP(TOTP_SECRET).now())
@@ -224,6 +236,7 @@ class Bot:
     def load_master(self):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         last_err = None
+        data = None
         for _ in range(3):
             try:
                 data = json.loads(urllib.request.urlopen(url, timeout=30).read())
@@ -231,8 +244,23 @@ class Bot:
             except Exception as e:
                 last_err = e
                 time.sleep(3)
+        if data is not None:
+            try:   # keep only Nifty options in a small local cache for outage fallback
+                slim = [r for r in data if r.get("name") == "NIFTY" and r.get("instrumenttype") == "OPTIDX"]
+                with open(MASTER_CACHE_FILE, "w") as f:
+                    json.dump(slim, f)
+            except Exception as e:
+                print(f"Scrip master cache write failed: {e}")
         else:
-            raise RuntimeError(f"Could not download scrip master: {last_err}")
+            try:
+                age_h = (time.time() - os.path.getmtime(MASTER_CACHE_FILE)) / 3600.0
+                if age_h > 96:
+                    raise RuntimeError(f"cache is {age_h:.0f}h old")
+                with open(MASTER_CACHE_FILE) as f:
+                    data = json.load(f)
+                tg(f"⚠️ Scrip master download failed ({last_err}). Using local cache ({age_h:.0f}h old).")
+            except Exception as ce:
+                raise RuntimeError(f"Could not download scrip master: {last_err}; cache unusable: {ce}")
         df = pd.DataFrame(data)
         df = df[(df["name"] == "NIFTY") & (df["instrumenttype"] == "OPTIDX")].copy()
         df["strike"] = pd.to_numeric(df["strike"], errors="coerce") / 100.0
@@ -278,19 +306,72 @@ class Bot:
             time.sleep(0.5 * (i + 1))
         return None
 
-    def spot_ohlc(self) -> Optional[Dict]:
+    def _ohlc_from_quote(self):
+        """FULL quote for the Nifty index. Logs the raw response so failures are diagnosable."""
         for tok in (NIFTY_SPOT_TOKEN, "26000"):
             try:
                 res = self.smart.getMarketData("FULL", {"NSE": [tok]})
-                if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
-                    q = res["data"]["fetched"][0]
-                    pc = float(q.get("previousClose", 0) or q.get("pc", 0) or q.get("close", 0) or 0)
-                    return {"ltp": float(q.get("ltp", 0) or 0), "open": float(q.get("open", 0) or 0),
-                            "high": float(q.get("high", 0) or 0), "low": float(q.get("low", 0) or 0),
-                            "close": pc}
+                fetched = ((res or {}).get("data") or {}).get("fetched") or []
+                if not (res and res.get("status") and fetched):
+                    print(f"OHLC quote token {tok}: unusable response: {res}")
+                    time.sleep(1.2)      # stay under the 1 req/sec limit
+                    continue
+                q = fetched[0]
+                pc = float(q.get("previousClose", 0) or q.get("pc", 0) or q.get("close", 0) or 0)
+                out = {"ltp": float(q.get("ltp", 0) or 0), "open": float(q.get("open", 0) or 0),
+                       "high": float(q.get("high", 0) or 0), "low": float(q.get("low", 0) or 0),
+                       "close": pc}
+                if out["ltp"] > 0 and out["open"] > 0 and out["close"] > 0:
+                    return out
+                print(f"OHLC quote token {tok}: zero/missing fields: {q}")
             except Exception as e:
-                print(f"OHLC error ({tok}): {e}")
+                print(f"OHLC quote error ({tok}): {e}")
+            time.sleep(1.2)
         return None
+
+    def _ohlc_from_candles(self):
+        """Fallback: today's 09:15-now 1-min candles + previous daily close from history."""
+        try:
+            today = now_ist().date()
+            now_s = now_ist().strftime("%Y-%m-%d %H:%M")
+            intra = self.smart.getCandleData({"exchange": "NSE", "symboltoken": NIFTY_SPOT_TOKEN,
+                "interval": "ONE_MINUTE", "fromdate": f"{today} 09:15", "todate": now_s})
+            time.sleep(1.2)
+            daily = self.smart.getCandleData({"exchange": "NSE", "symboltoken": NIFTY_SPOT_TOKEN,
+                "interval": "ONE_DAY", "fromdate": f"{today - datetime.timedelta(days=12)} 09:15",
+                "todate": f"{today} 09:50"})
+            c_in = (intra or {}).get("data") or []
+            c_d = (daily or {}).get("data") or []
+            prev = [c for c in c_d if not str(c[0]).startswith(str(today))]
+            if not c_in or not prev:
+                print(f"Candle fallback empty: intra={len(c_in)} daily={len(c_d)} | {intra} | {daily}")
+                return None
+            return {"ltp": float(c_in[-1][4]), "open": float(c_in[0][1]),
+                    "high": max(float(c[2]) for c in c_in), "low": min(float(c[3]) for c in c_in),
+                    "close": float(prev[-1][4])}
+        except Exception as e:
+            print(f"Candle fallback error: {e}")
+            return None
+
+    def spot_ohlc(self) -> Optional[Dict]:
+        deadline = time.time() + OHLC_RETRY_SECS
+        attempt = 0
+        while True:
+            attempt += 1
+            o = self._ohlc_from_quote()
+            if o:
+                if attempt > 1:
+                    tg(f"ℹ️ Nifty OHLC feed recovered on attempt {attempt}.")
+                return o
+            print(f"spot_ohlc: quote attempt {attempt} failed")
+            if time.time() >= deadline:
+                break
+            time.sleep(min(5, 1.5 * attempt))
+        print("spot_ohlc: quote feed failed, trying candle-data fallback")
+        o = self._ohlc_from_candles()
+        if o:
+            tg("ℹ️ Used candle-data fallback for Nifty OHLC (quote feed was unusable).")
+        return o
 
     def check_filters(self):
         o = self.spot_ohlc()
@@ -576,12 +657,21 @@ class Bot:
         else:
             tg(f"✅ Emergency square-off complete ({len(todo)} positions closed).")
 
+    def set_timeout(self, secs):
+        try:
+            self.smart.timeout = secs
+            print(f"➜ API timeout set to {secs}s")
+        except Exception as e:
+            print(f"Could not change API timeout: {e}")
+
     def save_state(self):
         if not self.lock_path:
             return
         try:
             with open(self.lock_path, "w") as f:
-                json.dump({"paper": PAPER_MODE, "expiry": str(self.expiry), "realized": self.realized,
+                json.dump({"status": "active" if self.active() else "flat", "pid": os.getpid(),
+                           "paper": PAPER_MODE, "expiry": str(self.expiry), "realized": self.realized,
+                           "qty": self.qty, "rolls": self.rolls,
                            "legs": [l.__dict__ for l in self.legs]}, f, indent=1)
         except Exception as e:
             print(f"State save failed: {e}")
@@ -591,6 +681,15 @@ class Bot:
                    "ORB_915_950_Pts", "Initial_CE_Symbol", "Initial_PE_Symbol", "Initial_Combined_Premium",
                    "Final_CE_Symbol", "Final_PE_Symbol", "Active_Qty", "Rolled_Status", "Exit_Reason",
                    "Gross_PnL", "Charges", "Net_PnL"]
+        try:   # local backup first: the sheet can fail, the disk rarely does
+            new_file = not os.path.exists(LOCAL_LOG_FILE)
+            with open(LOCAL_LOG_FILE, "a", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(headers)
+                w.writerow(row)
+        except Exception as e:
+            print(f"Local log write failed: {e}")
         try:
             if not os.path.exists(SERVICE_ACCOUNT_FILE):
                 raise FileNotFoundError(SERVICE_ACCOUNT_FILE)
@@ -638,18 +737,68 @@ class Bot:
         new_leg = self.open_leg("SHORT_" + opt_type, opt_type, new_strike, contract, "SELL", new_ltp)
         tg(f"🔄 {opt_type} {old_sym} rolled to {new_leg.symbol} @ ₹{new_leg.entry_px:.2f}\nBooked leg P&L: ₹{leg_pnl:,.2f}")
 
+    def handle_existing_lock(self):
+        """Lock exists: skipped/finished earlier, still running, or a previous run died with positions open."""
+        st = None
+        try:
+            with open(self.lock_path) as f:
+                st = json.load(f)
+        except Exception:
+            pass
+        if not st:
+            tg(f"⚠️ Bot already started today ({self.lock_path} exists, no state). Not re-entering.")
+            return
+        if st.get("status") != "active":
+            tg(f"⚠️ Bot already ran or skipped today ({st.get('status')}). Not re-entering.")
+            return
+        pid = st.get("pid")
+        alive = False
+        try:
+            if pid:
+                os.kill(int(pid), 0)
+                alive = True
+        except Exception:
+            alive = False
+        if alive:
+            tg(f"⚠️ Bot is already running (pid {pid}). Not starting a second copy.")
+            return
+        open_legs = [l for l in st.get("legs", []) if l.get("active")]
+        syms = ", ".join(f"{l.get('side')} {l.get('symbol')} x{l.get('qty')}" for l in open_legs)
+        tg(f"🚨 ORPHANED POSITIONS: a previous bot process (pid {pid}) died with legs still open: {syms}")
+        if not ORPHAN_AUTO_SQUAREOFF:
+            tg("ORPHAN_AUTO_SQUAREOFF is off. CLOSE THESE MANUALLY NOW.")
+            return
+        try:
+            self.login()
+            self.traded_symbols = {l["symbol"] for l in st.get("legs", []) if l.get("symbol")}
+            self.emergency_square_off("orphaned positions from a dead bot process")
+            self.verify_flat()
+            st["status"] = "flat"
+            for l in st.get("legs", []):
+                l["active"] = False
+            with open(self.lock_path, "w") as f:
+                json.dump(st, f, indent=1)
+        except Exception as e:
+            tg(f"🚨 Orphan square-off failed: {e}. CLOSE MANUALLY NOW.")
+
     def run(self):
         today = now_ist().date()
         self.lock_path = f"run_lock_{today}_{'paper' if PAPER_MODE else 'live'}.json"
 
-        # Check lock first to avoid spamming the sheet if triggered multiple times
-        if os.path.exists(self.lock_path):
-            tg(f"⚠️ Bot already ran or skipped today ({self.lock_path} exists). Not re-entering.")
+        # Atomically claim today's lock (no double-start race, e.g. cron + manual run)
+        try:
+            fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except FileExistsError:
+            self.handle_existing_lock()
             return
 
         def abort_and_log(reason, spot=0.0, gap=0.0, orb=0.0):
-            # Create the lock file so we don't log this again if triggered manually later today
-            open(self.lock_path, "w").close()
+            try:
+                with open(self.lock_path, "w") as lf:
+                    json.dump({"status": "skipped", "reason": reason}, lf)
+            except Exception:
+                pass
             today_str = str(today)
             tg(f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {reason}")
             self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
@@ -734,8 +883,8 @@ class Bot:
             abort_and_log(f"Insufficient margin: {margin_msg}", spot, gap_pct, orb)
             return
 
-        # Deploy Strangle
-        open(self.lock_path, "w").close()
+        # Deploy Strangle (lock already claimed atomically at start)
+        self.set_timeout(MONITOR_TIMEOUT_SECS)
         ltps = self.get_ltps({"NFO": [c["token"] for c in (ce_c, pe_c) if c]})
         
         short_ce = self.open_leg("SHORT_CE", "CE", ce_strike, ce_c, "SELL", ltps.get(ce_c["token"]))
@@ -764,6 +913,9 @@ class Bot:
 
         while True:
             now = now_ist()
+            if self.stop_requested:
+                exit_reason, force_market = "Stop signal received - exiting all positions", True
+                break
             if now >= exit_time:
                 exit_reason = "Time Exit (3:10 PM)"
                 break
@@ -844,8 +996,28 @@ class Bot:
         except Exception:
             pass
 
+def _install_signal_handlers(bot):
+    def _handler(signum, frame):
+        if bot.legs:
+            bot.stop_requested = True
+            print(f"Signal {signum} received - will square off and exit.")
+        else:
+            print(f"Signal {signum} received before entry - exiting.")
+            try:
+                if bot.lock_path and os.path.exists(bot.lock_path) and os.path.getsize(bot.lock_path) == 0:
+                    os.remove(bot.lock_path)
+            except Exception:
+                pass
+            sys.exit(0)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
+
 if __name__ == "__main__":
     bot = Bot()
+    _install_signal_handlers(bot)
     try:
         bot.run()
     except Exception as e:
@@ -855,6 +1027,12 @@ if __name__ == "__main__":
             if bot.smart and bot.traded_symbols:
                 bot.emergency_square_off(f"crash: {e}")
                 bot.verify_flat()
+            if bot.legs:
+                bot.log_sheet([str(now_ist().date()), now_ist().strftime("%H:%M:%S"), bot.version_tag(), "CRASHED",
+                               0, 0, 0, "N/A", "N/A", 0.0, "N/A", "N/A", bot.qty, "N/A",
+                               f"CRASH: {e}", round(bot.realized, 2), 0.0, 0.0])
+            elif bot.lock_path and os.path.exists(bot.lock_path) and os.path.getsize(bot.lock_path) == 0:
+                os.remove(bot.lock_path)   # failed before any order: allow a manual re-run today
         except Exception as e2:
             tg(f"🚨 Emergency square-off itself failed: {e2}. CLOSE POSITIONS MANUALLY NOW.")
         sys.exit(1)
