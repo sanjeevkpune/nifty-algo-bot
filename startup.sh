@@ -165,6 +165,12 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Dhan (Dual-Session Lemonn): Runs at 9:12 AM
 # 12 09 * * 1-5 /bin/bash -c 'source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 lemonn_dual_session_dhan.py >> /home/kumar_sanjeev_pune/trading-bot/cron_trade.log 2>&1' 
 
+# Lemonn v4 NIFTY sideways straddle (paper): starts 09:08, runs until the 15:20 exit
+08 09 * * 1-5 /bin/bash -c 'set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/flock -n /tmp/lemonn_v4.lock /usr/bin/python3 lemonn_nifty_sideways_v4_dhan.py >> /home/kumar_sanjeev_pune/trading-bot/dhan_v4.log 2>&1'
+
+# v4 watchdog: if the bot died during the day, restart it so it resumes its open trade
+5-55/10 9-15 * * 1-5 /bin/bash -c 'set -a && source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/flock -n /tmp/lemonn_v4.lock /usr/bin/python3 lemonn_nifty_sideways_v4_dhan.py >> /home/kumar_sanjeev_pune/trading-bot/dhan_v4.log 2>&1'
+
 # Improved Dhan (Dual-Session Lemonn): Runs at 9:30 AM
 30 09 * * 1-5 /bin/bash -c 'source /etc/trade-config/config.env && set +a && cd /home/kumar_sanjeev_pune/trading-bot && /usr/bin/python3 dhan_improved_with_filters.py >> /home/kumar_sanjeev_pune/trading-bot/dhan_improved.log 2>&1'
 
