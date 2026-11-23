@@ -145,7 +145,7 @@ class OrderError(Exception):
 # 2. HELPERS
 # ==========================================
 def tg(message: str):
-    tag = "[PAPER] " if PAPER_MODE else ""
+    tag = ("[PAPER] " if PAPER_MODE else "[LIVE] ") + "🟠 ANGEL ONE · Adaptive Strangle\n"
     print(f"{tag}{message}")
     try:
         requests.post(

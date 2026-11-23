@@ -149,12 +149,16 @@ OPEN_STATUSES = ("PENDING", "TRANSIT", "PART_TRADED", "TRIGGER_PENDING")
 DEAD_STATUSES = ("REJECTED", "CANCELLED", "EXPIRED")
 
 
+BOT_TAG = f"🔷 DHAN v3 · Dual-Session ({INDEX})"
+OTHER_BOT_STATE_PREFIXES = ["lemonn_v4_"]  # the other Dhan bot(s) on this account
+
+
 def tick(px: float) -> float:
     return round(max(0.05, px) * 20) / 20.0
 
 
 def tg(message: str):
-    tag = "[PAPER] " if PAPER_MODE else ""
+    tag = ("[PAPER] " if PAPER_MODE else "[LIVE] ") + BOT_TAG + "\n"
     print(f"{now_ist():%H:%M:%S} {tag}{message}", flush=True)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
@@ -239,8 +243,12 @@ class LemonnDualSessionBot:
             self.halted = st.get("halted", False)
             self.realized_pnl = float(st.get("realized_pnl", 0.0))
             self.legs = [Leg(**d) for d in st.get("legs", [])]
-            tg(f"♻️ Resumed state: phase={self.phase}, active legs={sum(l.active for l in self.legs)}, "
-               f"realised ₹{self.realized_pnl:,.0f}")
+            msg = (f"♻️ Resumed state: phase={self.phase}, active legs={sum(l.active for l in self.legs)}, "
+                   f"realised ₹{self.realized_pnl:,.0f}")
+            if self.phase in ("init", "done"):
+                print(msg)   # nothing to resume - no Telegram (the v4 watchdog checks every 10 min)
+            else:
+                tg(msg)
             return True
         except Exception as e:
             tg(f"⚠️ Could not read state file ({e}). Starting fresh - CHECK BROKER POSITIONS MANUALLY.")
@@ -774,6 +782,30 @@ class LemonnDualSessionBot:
     # ----------------------------------------------------------
     # Reconciliation after restart
     # ----------------------------------------------------------
+    def _other_bots_expected(self) -> Dict[str, int]:
+        """Net quantity per securityId that the OTHER Dhan bot expects to hold today.
+        Both bots trade on the same Dhan account and can hold the same NIFTY option,
+        so broker positions are the SUM of both bots' legs. Read from the other bot's
+        state file (same STATE_DIR, written atomically)."""
+        out: Dict[str, int] = {}
+        for prefix in OTHER_BOT_STATE_PREFIXES:
+            path = os.path.join(STATE_DIR, f"{prefix}{self.today:%Y%m%d}.json")
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path) as fh:
+                    st = json.load(fh)
+                for d in st.get("legs", []) or []:
+                    if not d.get("active"):
+                        continue
+                    q = int(d.get("qty") or 0)
+                    tok = str(d.get("token"))
+                    out[tok] = out.get(tok, 0) + (-q if d.get("side") == "SELL" else q)
+            except Exception as e:
+                tg(f"⚠️ Could not read the other bot's state ({os.path.basename(path)}): {e}. "
+                   f"Position check may be off - verify in Dhan.")
+        return out
+
     def reconcile_positions(self):
         if PAPER_MODE or not any(l.active for l in self.legs):
             return
@@ -786,20 +818,31 @@ class LemonnDualSessionBot:
         net = {}
         for r in rows or []:
             net[str(r.get("securityId"))] = net.get(str(r.get("securityId")), 0) + int(r.get("netQty") or 0)
-        for leg in [l for l in self.legs if l.active]:
-            expected = -leg.qty if leg.side == "SELL" else leg.qty
-            have = net.get(str(leg.token), 0)
+        # Remove what the other Dhan bot holds, so only THIS bot's share is compared.
+        others = self._other_bots_expected()
+        mine: Dict[str, int] = {}
+        for l in self.legs:
+            if l.active:
+                mine[str(l.token)] = mine.get(str(l.token), 0) + (-l.qty if l.side == "SELL" else l.qty)
+        for tok, own in mine.items():
+            legs = [l for l in self.legs if l.active and str(l.token) == tok]
+            have = net.get(tok, 0) - others.get(tok, 0)
+            if have == own:
+                continue
             if have == 0:
-                if leg.sl_order_id:
-                    st = self.order_status(leg.sl_order_id)
-                    if st["status"] == "TRADED":
-                        self._book_exit(leg, st["avg"] or leg.sl_px, "SL_HIT_EXCHANGE (while offline)")
-                        continue
-                px = self.ltp_batch(FNO_SEG, [leg.token]).get(str(leg.token), leg.entry_px)
-                tg(f"⚠️ {leg.symbol} is flat at the broker; marking closed at LTP ₹{px:.2f} (check fills).")
-                self._book_exit(leg, px, "FLAT_AT_BROKER")
-            elif have != expected:
-                tg(f"⚠️ {leg.symbol}: broker net qty {have}, expected {expected}. Please check manually.")
+                for leg in legs:
+                    if leg.sl_order_id:
+                        st = self.order_status(leg.sl_order_id)
+                        if st["status"] == "TRADED":
+                            self._book_exit(leg, st["avg"] or leg.sl_px, "SL_HIT_EXCHANGE (while offline)")
+                            continue
+                    px = self.ltp_batch(FNO_SEG, [leg.token]).get(str(leg.token), leg.entry_px)
+                    tg(f"⚠️ {leg.symbol} is flat at the broker (after the other bot's "
+                       f"{others.get(tok, 0)}); marking closed at LTP ₹{px:.2f} (check fills).")
+                    self._book_exit(leg, px, "FLAT_AT_BROKER")
+            else:
+                tg(f"⚠️ {legs[0].symbol}: broker net {net.get(tok, 0)}, other Dhan bot holds {others.get(tok, 0)}, "
+                   f"so this bot has {have} but expected {own}. Please check manually.")
 
     # ----------------------------------------------------------
     # Logging
@@ -840,7 +883,7 @@ class LemonnDualSessionBot:
 
         self.load_state()
         if self.phase == "done":
-            return tg("Today's sessions are already complete.")
+            return print("Today's sessions are already complete.")
         self.login()
         self.load_master()
         tg(f"🚀 LEMONN DUAL-SESSION v3.0 | {INDEX} | {NUM_LOTS} lots x {self.lot_size} | "
