@@ -1,0 +1,28 @@
+# Runtime files the VM creates inside ~/trading-bot. Never commit these.
+# (startup.sh only does `git reset --hard`, never `git clean`, so ignoring them
+#  does not delete or change anything on the VM.)
+
+# Credentials and config
+service_account.json
+*.env
+!*.env.example
+dhan_test_config.env
+
+# Bot state, locks and logs
+state/
+run_lock_*.json
+*.log
+*.log.*
+logs/
+logrotate.status
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
