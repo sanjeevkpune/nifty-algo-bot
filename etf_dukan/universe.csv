@@ -1,0 +1,94 @@
+symbol,type,include,name,sector,angel_symbol
+NIFTYBEES,ETF,Y,NIFTY 50,Broad market - large cap,NIFTYBEES-EQ
+SENSEXIETF,ETF,Y,BSE Sensex,Broad market - large cap,SENSEXIETF-EQ
+JUNIORBEES,ETF,Y,NIFTY Next 50,Broad market - large cap,JUNIORBEES-EQ
+NIF100BEES,ETF,Y,NIFTY 100,Broad market - large cap,NIF100BEES-EQ
+TOP10ADD,ETF,Y,NIFTY Top 10 Equal Weight,Broad market - large cap,TOP10ADD-EQ
+MONIFTY500,ETF,Y,NIFTY 500,Broad market - multi cap,MONIFTY500-EQ
+MID150BEES,ETF,Y,NIFTY Midcap 150,Broad market - mid cap,MID150BEES-EQ
+MOM100,ETF,Y,NIFTY Midcap 100,Broad market - mid cap,MOM100-EQ
+HDFCSML250,ETF,Y,NIFTY Smallcap 250,Broad market - small cap,HDFCSML250-EQ
+BANKBEES,ETF,Y,NIFTY Bank,Sector - Banking,BANKBEES-EQ
+PSUBNKBEES,ETF,Y,NIFTY PSU Bank,Sector - Banking,PSUBNKBEES-EQ
+PVTBANIETF,ETF,Y,NIFTY Private Bank,Sector - Banking,PVTBANIETF-EQ
+BFSI,ETF,Y,NIFTY Financial Services,Sector - Financials,BFSI-EQ
+FINIETF,ETF,Y,NIFTY Financial Services Ex-Bank,Sector - Financials,FINIETF-EQ
+ITBEES,ETF,Y,NIFTY IT,Sector - IT,ITBEES-EQ
+PHARMABEES,ETF,Y,NIFTY Pharma,Sector - Healthcare,PHARMABEES-EQ
+HEALTHIETF,ETF,Y,NIFTY Healthcare,Sector - Healthcare,HEALTHIETF-EQ
+FMCGIETF,ETF,Y,NIFTY FMCG,Sector - FMCG,FMCGIETF-EQ
+AUTOBEES,ETF,Y,NIFTY Auto,Sector - Auto,AUTOBEES-EQ
+METALIETF,ETF,Y,NIFTY Metal,Sector - Metals,METALIETF-EQ
+INFRAIETF,ETF,Y,NIFTY Infrastructure,Sector - Infrastructure,INFRAIETF-EQ
+OILIETF,ETF,Y,NIFTY Oil & Gas,Sector - Energy,OILIETF-EQ
+ENERGY,ETF,Y,NIFTY Energy,Sector - Energy,ENERGY-EQ
+CONSUMBEES,ETF,Y,NIFTY India Consumption,Sector - Consumption,CONSUMBEES-EQ
+MOREALTY,ETF,Y,NIFTY Realty,Sector - Realty,MOREALTY-EQ
+COMMOIETF,ETF,Y,NIFTY Commodities,Sector - Commodities,COMMOIETF-EQ
+CPSEETF,ETF,Y,CPSE,PSU / Thematic,CPSEETF-EQ
+ICICIB22,ETF,Y,BSE Bharat 22,PSU / Thematic,ICICIB22-EQ
+MODEFENCE,ETF,Y,NIFTY India Defence,Thematic,MODEFENCE-EQ
+GROWWRAIL,ETF,Y,NIFTY India Railways PSU,Thematic,GROWWRAIL-EQ
+TNIDETF,ETF,Y,NIFTY India Digital,Thematic,TNIDETF-EQ
+MOM30IETF,ETF,Y,NIFTY 200 Momentum 30,Strategy / factor,MOM30IETF-EQ
+MOMENTUM50,ETF,Y,NIFTY 500 Momentum 50,Strategy / factor,MOMENTUM50-EQ
+ALPHA,ETF,Y,NIFTY Alpha 50,Strategy / factor,ALPHA-EQ
+ALPHAETF,ETF,Y,NIFTY 200 Alpha 30,Strategy / factor,ALPHAETF-EQ
+ALPL30IETF,ETF,Y,NIFTY Alpha Low-Volatility 30,Strategy / factor,ALPL30IETF-EQ
+LOWVOLIETF,ETF,Y,NIFTY 100 Low Volatility 30,Strategy / factor,LOWVOLIETF-EQ
+SMALLCAP,ETF,Y,NIFTY Smallcap 250 Momentum Quality 100,Strategy / factor,SMALLCAP-EQ
+MIDSMALL,ETF,Y,NIFTY MidSmallcap 400 Momentum Quality 100,Strategy / factor,MIDSMALL-EQ
+MON100,ETF,Y,Nasdaq 100 (US),International,MON100-EQ
+MONQ50,ETF,Y,Nasdaq Q-50 (US),International,MONQ50-EQ
+MASPTOP50,ETF,Y,S&P 500 Top 50 (US),International,MASPTOP50-EQ
+MAFANG,ETF,Y,NYSE FANG+ (US),International,MAFANG-EQ
+HNGSNGBEES,ETF,Y,Hang Seng (HK),International,HNGSNGBEES-EQ
+MAHKTECH,ETF,Y,Hang Seng Tech (HK),International,MAHKTECH-EQ
+GOLDBEES,ETF,Y,Gold (domestic price),Commodity - gold,GOLDBEES-EQ
+SILVERBEES,ETF,Y,Silver (domestic price),Commodity - silver,SILVERBEES-EQ
+NV20IETF,ETF,N,NIFTY 50 Value 20,Strategy / factor,NV20IETF-EQ
+MIDCAP,ETF,N,NIFTY Midcap 50,Broad market - mid cap,MIDCAP-EQ
+MOVALUE,ETF,N,BSE Enhanced Value,Strategy / factor,MOVALUE-EQ
+BSE500IETF,ETF,N,BSE 500,Broad market - multi cap,BSE500IETF-EQ
+EQUAL50ADD,ETF,N,NIFTY 50 Equal Weight,Broad market - large cap,EQUAL50ADD-EQ
+EVINDIA,ETF,N,NIFTY EV & New Age Automotive,Thematic,EVINDIA-EQ
+MULTICAP,ETF,N,NIFTY 500 Multicap 50:25:25,Broad market - multi cap,MULTICAP-EQ
+MAKEINDIA,ETF,N,NIFTY India Manufacturing,Thematic,MAKEINDIA-EQ
+MIDSELIETF,ETF,N,BSE Midcap Select,Broad market - mid cap,MIDSELIETF-EQ
+VAL30IETF,ETF,N,NIFTY 200 Value 30,Strategy / factor,VAL30IETF-EQ
+DIVOPPBEES,ETF,N,NIFTY Dividend Opportunities 50,Strategy / factor,DIVOPPBEES-EQ
+SHARIABEES,ETF,N,NIFTY 50 Shariah,Thematic,SHARIABEES-EQ
+QUAL30IETF,ETF,N,NIFTY 200 Quality 30,Strategy / factor,QUAL30IETF-EQ
+CONSUMER,ETF,N,NIFTY India New Age Consumption,Thematic,CONSUMER-EQ
+EMULTIMQ,ETF,N,NIFTY 500 Multicap Momentum Quality 50,Strategy / factor,EMULTIMQ-EQ
+ESG,ETF,N,NIFTY 100 ESG Sector Leaders,Thematic,ESG-EQ
+HDFCBANK,Stock,Y,HDFC Bank,Financials - bank,HDFCBANK-EQ
+ICICIBANK,Stock,Y,ICICI Bank,Financials - bank,ICICIBANK-EQ
+SBIN,Stock,Y,State Bank of India,Financials - bank,SBIN-EQ
+BAJFINANCE,Stock,Y,Bajaj Finance,Financials - NBFC,BAJFINANCE-EQ
+TCS,Stock,Y,Tata Consultancy Services,IT,TCS-EQ
+INFY,Stock,Y,Infosys,IT,INFY-EQ
+HCLTECH,Stock,Y,HCL Technologies,IT,HCLTECH-EQ
+RELIANCE,Stock,Y,Reliance Industries,Oil & Gas,RELIANCE-EQ
+ONGC,Stock,Y,ONGC,Oil & Gas,ONGC-EQ
+NTPC,Stock,Y,NTPC,Power,NTPC-EQ
+POWERGRID,Stock,Y,Power Grid Corp,Power,POWERGRID-EQ
+HINDUNILVR,Stock,Y,Hindustan Unilever,FMCG,HINDUNILVR-EQ
+ITC,Stock,Y,ITC,FMCG,ITC-EQ
+NESTLEIND,Stock,Y,Nestle India,FMCG,NESTLEIND-EQ
+MARUTI,Stock,Y,Maruti Suzuki,Auto,MARUTI-EQ
+M&M,Stock,Y,Mahindra & Mahindra,Auto,M&M-EQ
+BAJAJ-AUTO,Stock,Y,Bajaj Auto,Auto,BAJAJ-AUTO-EQ
+SUNPHARMA,Stock,Y,Sun Pharma,Pharma,SUNPHARMA-EQ
+CIPLA,Stock,Y,Cipla,Pharma,CIPLA-EQ
+BHARTIARTL,Stock,Y,Bharti Airtel,Telecom,BHARTIARTL-EQ
+LT,Stock,Y,Larsen & Toubro,Construction,LT-EQ
+TATASTEEL,Stock,Y,Tata Steel,Metals,TATASTEEL-EQ
+HINDALCO,Stock,Y,Hindalco,Metals,HINDALCO-EQ
+ULTRACEMCO,Stock,Y,UltraTech Cement,Cement,ULTRACEMCO-EQ
+TITAN,Stock,Y,Titan,Consumer durables,TITAN-EQ
+ASIANPAINT,Stock,Y,Asian Paints,Paints,ASIANPAINT-EQ
+ADANIPORTS,Stock,Y,Adani Ports,Ports & logistics,ADANIPORTS-EQ
+BEL,Stock,Y,Bharat Electronics,Defence / capital goods,BEL-EQ
+APOLLOHOSP,Stock,Y,Apollo Hospitals,Healthcare services,APOLLOHOSP-EQ
+COALINDIA,Stock,Y,Coal India,Mining / energy,COALINDIA-EQ
