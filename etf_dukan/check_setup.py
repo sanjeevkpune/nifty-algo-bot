@@ -185,11 +185,12 @@ def angel_profile(br):
     r = br.smart.getProfile(tok)
     d = (r or {}).get("data") or {}
     if d:
-        ex = d.get("exchanges") or []
-        prods = d.get("products") or []
-        ok = "NSE" in ex and (not prods or "DELIVERY" in prods)
+        ex = [str(x) for x in (d.get("exchanges") or [])]
+        # AngelOne lists segments such as nse_cm (NSE cash / equity, where ETFs trade), nse_fo, bse_cm;
+        # older accounts may show plain "NSE". The profile does not list products, so DELIVERY is not checked.
+        ok = any(x.lower() in ("nse", "nse_cm") for x in ex)
         rec("PASS" if ok else "WARN", "AngelOne profile",
-            f"exchanges {','.join(ex) or '?'}" + ("" if ok else " (NSE / DELIVERY not listed)"))
+            f"exchanges {','.join(ex) or '?'}" + ("" if ok else " (NSE cash segment nse_cm not enabled)"))
     else:
         rec("WARN", "AngelOne profile", f"getProfile gave no data: {str(r)[:120]}")
 
