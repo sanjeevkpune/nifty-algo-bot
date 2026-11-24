@@ -50,7 +50,7 @@ EKD_HOME=${BOT_DIR}
 EKD_SERVICE_ACCOUNT_FILE=${TARGET_DIR}/service_account.json
 EKD_GSHEET_ID=${SHEET}
 EKD_SHEET_MODE=tracker
-EKD_SIGNAL_POLICY=sheet
+EKD_SIGNAL_POLICY=bot
 EKD_BROKER_CASH_FLOOR=500000
 ENVEOF
 if [ -n "${EKD_KEY}" ]; then echo "EKD_API_KEY=${EKD_KEY}" >> /etc/trade-config/etf_dukan.env; fi

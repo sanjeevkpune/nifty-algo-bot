@@ -10,9 +10,9 @@ The tracker (Signals!A7:J10) shows today's order plan from GOOGLEFINANCE prices 
 EKD_SIGNAL_POLICY
     agree  trade only the actions where the sheet and the bot name the same action and symbol;
            every disagreement is skipped and sent on Telegram.
-    sheet  (default, user's choice 24 Nov 2026) trade what the sheet says; the bot still sizes the order from the live AngelOne price and enforces
+    sheet  trade what the sheet says; the bot still sizes the order from the live AngelOne price and enforces
            its safety checks (holding exists, quantity, cash, max positions, daily limits, broker shortfall).
-    bot    trade the bot's own plan; disagreements are only reported.
+    bot    (default, user's choice 24 Nov 2026) trade the bot's own plan; disagreements are only reported.
     off    don't read the sheet.
 """
 from __future__ import annotations
