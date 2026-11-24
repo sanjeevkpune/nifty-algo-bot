@@ -1,0 +1,3 @@
+# One NSE trading holiday per line, YYYY-MM-DD (from the NSE holiday circular).
+# Optional: the bot also checks that NIFTYBEES has traded today before doing anything,
+# so a holiday missing here is still caught.

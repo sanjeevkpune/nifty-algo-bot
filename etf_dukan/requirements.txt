@@ -1,0 +1,9 @@
+smartapi-python>=1.4.8
+pyotp
+requests
+gspread>=5.12
+logzero
+websocket-client
+pycryptodome
+# optional: extra NSE holiday check
+# pandas_market_calendars

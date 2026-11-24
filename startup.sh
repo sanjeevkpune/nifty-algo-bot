@@ -186,4 +186,7 @@ rm -f /tmp/crontab.txt
 systemctl enable cron
 systemctl restart cron
 
+echo "8. ETF ki Dukan bot (paper mode unless the repo variable EKD_PAPER_MODE is 0)..."
+bash "${TARGET_DIR}/etf_dukan/setup_etf_dukan.sh" "${USER_NAME}" "${TARGET_DIR}" || echo "Warning: ETF ki Dukan setup failed; the other bots are unaffected."
+
 echo "Startup script completed successfully at $(date)"
