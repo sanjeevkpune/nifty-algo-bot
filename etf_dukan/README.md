@@ -207,3 +207,20 @@ python etf_dukan_bot.py flush-sheet         # retry queued sheet rows
    A start after 15:15 skips the day.
 7. **One run a day.** If the server is off at 2:45 pm, that day is skipped. Nothing is caught up the next day,
    the same as missing a day by hand.
+
+## Checking the setup
+
+`check_setup.py` checks everything end to end and prints a PASS / WARN / FAIL / SKIP table (also sent on Telegram).
+It is read-only: no orders, no changes to the state file or the tracker tabs. It writes one cell on a separate
+"Bot Setup Check" tab to prove the service account can write.
+
+* From GitHub: Actions → **ETF Bot Setup Check** → Run workflow (pick full, AngelOne only, or AngelOne + order test).
+* On the VM: `cd ~/trading-bot/etf_dukan && python3 check_setup.py` (add `--angel-only`, `--quick`, `--order-test`).
+
+AngelOne checks: login (PIN + TOTP), profile, scrip tokens, live prices, market-open probe, daily candles and RSI,
+funds against the ₹5L floor, holdings and positions, order book, and today's plan (computed, never placed).
+They are skipped from 9:30 am to 3:15 pm IST (a second login on the shared API key could log out the strangle bot)
+and while the bot's own 2:45 pm run is going. Run at 9:15-9:30 am or after 3:30 pm.
+
+`--order-test` is opt-in and places a REAL order even in paper mode: BUY 1 NIFTYBEES as a LIMIT 5% below the
+live price (it cannot fill), cancels it at once and confirms it shows cancelled. Market hours only.
