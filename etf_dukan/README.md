@@ -12,7 +12,7 @@ lock and state files, fill checks, `PAPER_MODE`, crash handling.
 |---|---|
 | `etf_dukan_bot.py` | The bot: login, data, plan, orders, reconciliation, sheet, CLI |
 | `strategy.py` | The rules as pure functions (no broker, no clock) |
-| `signals.py` | Reads the sheet's Signals tab and cross-checks it with the bot's plan |
+| `signals.py` | Reads the sheet's Signals tab, turns it into safe orders, and compares it with the bot's own plan |
 | `universe.csv` | The tracker's Watchlist: 47 ETFs + 30 stocks with Include = Y (16 more ETFs at N) |
 | `config.env.example` | Every setting with its default (the VM's `/etc/trade-config/etf_dukan.env` is written by the setup script) |
 | `nse_holidays.txt` | Optional holiday list |
@@ -37,24 +37,37 @@ lock and state files, fill checks, `PAPER_MODE`, crash handling.
 23-Nov-2026 on the same Yahoo closes and compares it with `backtest.py`. All 559 trades match (215 new, 114 averaging,
 195 sells, 35 Core 3x), with the same ending value (₹78.54L) and the same withdrawals (₹8.25L).
 
-## Live signals from your Google Sheet
+## Signals come from your Google Sheet
 
-The bot reads the order plan on your tracker's **Signals** tab (rows 7–10: Sell, ETF slot, stock slot,
-Core 3x) at 3:00 pm and 3:10 pm. It compares it with its own plan, which comes from AngelOne prices.
-The two can differ near a threshold, because GOOGLEFINANCE prices run up to ~20 minutes late, and the sheet's
-RSI comes from Google's closes, not AngelOne's.
-`EKD_SIGNAL_POLICY` decides what is traded:
+**The bot trades what your tracker's Signals tab says.** It reads rows 7–10 at 3:00 pm (Sell and Core 3x) and
+again at 3:10 pm (ETF slot and stock slot). Then it places those orders and writes the fills back into the sheet.
+
+**What the bot still does itself:**
+- **Sizing.** Every order is sized from the live AngelOne price: 50% of the bot's holding for a sell, and
+  ₹40k in whole shares for a buy.
+- **Refusing unsafe orders.** A signal is skipped, and you get a Telegram alert, if any of these is true:
+  - the bot doesn't hold that position;
+  - AngelOne shows fewer shares than the bot's records;
+  - the order would break the ₹15k reserve, the owed withdrawal or the ₹5L option-bot cash floor;
+  - 20 positions are already open;
+  - today's sell or averaging buy is already done;
+  - it's past the cutoff.
+- **Sheet not ready, no trades.** If the sheet can't be read, or shows `#N/A` or "Loading…", **no orders are
+  sent** that step, and you get a Telegram alert.
+- **Second opinion (alert only).** The Python rule engine (`strategy.py`, replay-matched to the backtest)
+  works out its own plan from AngelOne prices. Any difference from the sheet comes to you on Telegram, e.g.
+  `STOCK slot: bot says NEW TATASTEEL x245, sheet says NEW COALINDIA x104`. It never changes what's traded.
+  Differences are normal near a threshold, because GOOGLEFINANCE prices run up to ~20 minutes late.
+
+`EKD_SIGNAL_POLICY` switches this behaviour:
 
 | Policy | What is traded |
 |---|---|
-| `agree` | Only the actions where the sheet and the bot name the same action and symbol. Each disagreement is skipped and sent on Telegram, e.g. `STOCK slot: bot says NEW TATASTEEL x245, sheet says NEW COALINDIA x104`. |
-| `sheet` | The sheet's signals. The bot still sizes the order from the live AngelOne price and refuses anything unsafe: no such holding, broker shortfall, max positions, cash, or daily limits already used. |
-| `bot` (default, your choice) | The bot's own AngelOne-based plan. Every disagreement with the sheet is sent on Telegram, and every executed trade is written into the sheet. |
-| `off` | The sheet isn't read. |
+| `sheet` (default, your choice) | The sheet's signals, with the safety checks above |
+| `agree` | Only the actions where the sheet and the bot's own rules match |
+| `bot` | The bot's own plan; the sheet is only compared |
+| `off` | The sheet isn't read; the bot's own plan is traded |
 
-- **Sheet unreadable.** With the default `bot` policy, the bot still trades its own plan and warns you on
-  Telegram. Rows that couldn't be written are retried on the next run. (Under `agree` or `sheet`, an
-  unreadable sheet means no orders, unless `EKD_SIGNAL_IF_SHEET_DOWN=bot`.)
 - **Order of writes.** The 3:00 pm sell is written to Holdings, Sold and Core before the 3:10 pm buy signals are
   read, with a 30-second wait for the sheet to recalculate.
 - **Don't type the bot's trades into the sheet.** The sheet's signals depend on its Holdings, Sold and Core rows,
@@ -67,8 +80,8 @@ RSI comes from Google's closes, not AngelOne's.
 |---|---|
 | 14:45 | Lock for the day, NSE trading-day check (weekend, `nse_holidays.txt`, and "has NIFTYBEES traded today?"), login, recovery of any order left in flight by a crash, reconciliation with AngelOne, ~400 days of daily closes (cached per day) |
 | 14:50 | **Dry-run plan on Telegram**: cash, free cash, top 8 ETFs and top 2 stocks by RSI, the planned sell(s) and buys with quantity and reason, the withdrawal due, any blocked symbols |
-| 15:00 | Fresh prices, cross-check with the sheet's Signals tab, then the target sell and Core 3x exits |
-| 15:10 | Sell written to the sheet, fresh prices and RSI, cross-check with the sheet, then the ETF slot, the stock slot, or the 1 averaging buy |
+| 15:00 | Read the sheet's Sell and Core 3x signals, size them from the AngelOne price, place the orders (bot's own rules: alert only) |
+| 15:10 | Sell written to the sheet, wait 30 s, read the ETF-slot and stock-slot signals, size and place them |
 | after | Telegram day summary, Google Sheet rows, reconciliation again |
 
 ### Order handling

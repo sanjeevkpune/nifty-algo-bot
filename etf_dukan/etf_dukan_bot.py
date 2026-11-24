@@ -159,8 +159,8 @@ HISTORY_DAYS = env_int("EKD_HISTORY_DAYS", 400)                  # calendar days
 SHEET_MODE = env("EKD_SHEET_MODE", "tracker").lower()   # off | log | tracker (log tab + writes into tracker tabs)
 LOG_TAB = env("EKD_LOG_TAB", "Bot Log")
 # --- live signals from the sheet's Signals tab (see signals.py) ---
-SIGNAL_POLICY = env("EKD_SIGNAL_POLICY", "bot").lower()        # bot (user choice) | agree | sheet | off
-SIGNAL_IF_SHEET_DOWN = env("EKD_SIGNAL_IF_SHEET_DOWN", "skip").lower()   # skip (no orders) | bot (trade the bot's plan)
+SIGNAL_POLICY = env("EKD_SIGNAL_POLICY", "sheet").lower()      # sheet (user choice) | bot | agree | off
+SIGNAL_IF_SHEET_DOWN = env("EKD_SIGNAL_IF_SHEET_DOWN", "skip").lower()   # skip (no orders, default) | bot (fall back to the bot's plan)
 SIGNAL_RECALC_SECS = env_int("EKD_SIGNAL_RECALC_SECS", 30)     # wait after writing the sells, before reading buy signals
 
 
@@ -896,16 +896,20 @@ class Bot:
             return [], [f"🚨 Sheet signals unreadable ({e}). No {('sell' if phase == 'S' else 'buy')} orders sent "
                         f"(EKD_SIGNAL_IF_SHEET_DOWN=skip)."]
         if phase == "S":
+            sheet_plan = f"Sheet says: target {SG._fmt(sig.get('sell'))}; Core 3x {SG._fmt(sig.get('core'))}"
+        else:
+            sheet_plan = f"Sheet says: ETF slot {SG._fmt(sig.get('etf'))}; stock slot {SG._fmt(sig.get('stock'))}"
+        if phase == "S":
             out, lines = SG.cross_check_sells(actions, sig, SIGNAL_POLICY, self.state, ltp, RULES, self.today, self.blocked)
         else:
             out, lines = SG.cross_check_buys(actions, sig, SIGNAL_POLICY, self.state, self.universe, ltp, rsi or {}, RULES,
                                              self.today, RATES, self.blocked, cash_cap)
         if lines:
-            what = {"agree": "only matching actions are traded", "sheet": "trading the sheet's signals",
+            what = {"agree": "only matching actions are traded", "sheet": "trading the sheet's signals; the bot's own check only alerts",
                     "bot": "trading the bot's plan"}.get(SIGNAL_POLICY, SIGNAL_POLICY)
-            lines = [f"🔀 Sheet vs bot ({'sell' if phase == 'S' else 'buy'} check, {what}):"] + [f"  {l}" for l in lines]
+            lines = [f"🔀 {sheet_plan}", f"Sheet vs bot ({'sell' if phase == 'S' else 'buy'} check, {what}):"] + [f"  {l}" for l in lines]
         else:
-            lines = [f"✅ Sheet signals match the bot ({'sell' if phase == 'S' else 'buy'} check)."]
+            lines = [f"✅ {sheet_plan} (the bot's own check agrees)."]
         return out, lines
 
     def broker_cash_cap(self) -> Optional[float]:
