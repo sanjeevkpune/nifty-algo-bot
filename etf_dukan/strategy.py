@@ -1,19 +1,19 @@
 """
-strategy.py  --  ETF ki Dukan "best setup" rules as pure functions.
+strategy.py  --  ETF ki Dukan final rules (Nov 2026: max 30, keep 20%) as pure functions.
 
 No broker, no network, no clock. The live bot (etf_dukan_bot.py) and the 5-year replay test
 (tests/replay_test.py) both call these same functions, so what the bot does is what was backtested.
 
 Rules (tracker Settings tab, best setup):
   * 3:00 pm  at most 1 target sell a day: the highest % gainer at/above target on AVERAGE COST
-             (ETF +4%, stock +6%). Sell 50% (floor; a 1-share position is sold whole).
-             The other 50% becomes a Core lot at the position's average cost.
+             (ETF +5%, stock +8%). Sell 80% (floor; a 1-share position is sold whole).
+             The other 20% becomes a Core lot at the position's average cost.
   * 3:00 pm  a Core lot whose price >= 3x its cost is sold whole (extra to the 1 sell a day).
   * 3:10 pm  ETF slot and stock slot, Rs 40k each, whole shares.
              Slot = the lowest-RSI UNHELD name among the 8 lowest-RSI ETFs / 2 lowest-RSI stocks.
-             Max 20 open positions (Core lots don't count).
+             Max 30 open positions (Core lots don't count).
              At most 1 averaging buy a day, only in a shop whose slot had no new buy: the holding that is
-             most negative vs its LAST buy price, if at/below -3% (ETF) / -6% (stock). Rs 40k.
+             most negative vs its LAST buy price, if at/below -4% (ETF) / -8% (stock). Rs 40k.
   * Cash     buys never use the owed monthly withdrawal or the Rs 15k kept back.
 """
 from __future__ import annotations
@@ -33,13 +33,13 @@ ETF, STOCK = "ETF", "Stock"
 class Rules:
     buy_amount: float = 40_000.0      # every new buy and every averaging buy
     avg_amount: float = 40_000.0
-    etf_target: float = 0.04
-    etf_avg: float = -0.03
-    stock_target: float = 0.06
-    stock_avg: float = -0.06
-    sell_fraction: float = 0.5        # sold at target; the rest becomes a Core lot
+    etf_target: float = 0.05
+    etf_avg: float = -0.04
+    stock_target: float = 0.08
+    stock_avg: float = -0.08
+    sell_fraction: float = 0.8        # sold at target; the rest becomes a Core lot
     core_multiple: float = 3.0        # Core lot sold whole at 3x its cost
-    max_positions: int = 20
+    max_positions: int = 30
     etf_shortlist: int = 8
     stock_shortlist: int = 2
     rsi_period: int = 14

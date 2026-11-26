@@ -2,7 +2,7 @@
 signals.py  --  cross-check the bot's own plan with the Google Sheet tracker's Signals tab.
 
 The tracker (Signals!A7:J10) shows today's order plan from GOOGLEFINANCE prices and the rows on Holdings / Sold / Core:
-    row 7  Sell            C = symbol, I = qty (50%)
+    row 7  Sell            C = symbol, I = qty (80%)
     row 8  Buy: ETF slot   C = symbol, F = NEW BUY / AVERAGE, I = qty
     row 9  Buy: stock slot C = symbol, F = NEW BUY / AVERAGE, I = qty
     row 10 Core sell (3x)  C = symbol (the sheet shows one 3x lot at a time), I = qty
