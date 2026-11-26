@@ -74,3 +74,9 @@ CRON_LINE="45 14 * * 1-5 cd ${BOT_DIR} && /usr/bin/flock -n /tmp/etf_dukan.lock 
 ( crontab -u "${USER_NAME}" -l 2>/dev/null | grep -v "# EKD-ETF-DUKAN" ; echo "${CRON_LINE}" ) | crontab -u "${USER_NAME}" -
 
 echo "ETF ki Dukan bot ready (mode ${MODE_NAME}, sheet ${SHEET})."
+
+# Strategy Desk dashboard (separate service, port 8080). Its failure never affects the bots.
+if [ -f "${TARGET_DIR}/dashboard/setup_dashboard.sh" ]; then
+    bash "${TARGET_DIR}/dashboard/setup_dashboard.sh" "${USER_NAME}" "${TARGET_DIR}" \
+        || echo "Warning: dashboard setup failed; the bots are unaffected."
+fi
