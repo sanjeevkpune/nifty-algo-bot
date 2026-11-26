@@ -5,7 +5,7 @@ etf_dukan_bot.py  --  ETF ki Dukan (best setup) delivery bot for AngelOne SmartA
 What it does on each NSE trading day (one cron start at 2:45 pm IST):
   14:50  login, market-open check, reconcile the bot's records with AngelOne holdings + positions,
          daily closes for the 77-name universe, RSI(14) with the live price, Telegram DRY-RUN PLAN.
-  15:00  target sell (max 1/day, 50% of the position, other 50% -> Core lot) + Core 3x exits.
+  15:00  target sell (max 1/day, 80% of the position, other 20% -> Core lot) + Core 3x exits.
   15:10  ETF slot + stock slot (new buys, Rs 40k, whole shares), else 1 averaging buy.
   after  Telegram summary, Google Sheet rows, reconcile again.
 
@@ -167,15 +167,15 @@ SIGNAL_RECALC_SECS = env_int("EKD_SIGNAL_RECALC_SECS", 30)     # wait after writ
 def rules_from_env() -> S.Rules:
     r = S.Rules(
         buy_amount=env_float("EKD_BUY_AMOUNT", 40_000), avg_amount=env_float("EKD_AVG_AMOUNT", 40_000),
-        etf_target=env_float("EKD_ETF_TARGET", 0.04), etf_avg=env_float("EKD_ETF_AVG", -0.03),
-        stock_target=env_float("EKD_STOCK_TARGET", 0.06), stock_avg=env_float("EKD_STOCK_AVG", -0.06),
-        sell_fraction=env_float("EKD_SELL_FRACTION", 0.5), core_multiple=env_float("EKD_CORE_MULTIPLE", 3.0),
-        max_positions=env_int("EKD_MAX_POSITIONS", 20), etf_shortlist=env_int("EKD_ETF_SHORTLIST", 8),
+        etf_target=env_float("EKD_ETF_TARGET", 0.05), etf_avg=env_float("EKD_ETF_AVG", -0.04),
+        stock_target=env_float("EKD_STOCK_TARGET", 0.08), stock_avg=env_float("EKD_STOCK_AVG", -0.08),
+        sell_fraction=env_float("EKD_SELL_FRACTION", 0.8), core_multiple=env_float("EKD_CORE_MULTIPLE", 3.0),
+        max_positions=env_int("EKD_MAX_POSITIONS", 30), etf_shortlist=env_int("EKD_ETF_SHORTLIST", 8),
         stock_shortlist=env_int("EKD_STOCK_SHORTLIST", 2), rsi_period=env_int("EKD_RSI_PERIOD", 14),
         max_sells_per_day=env_int("EKD_MAX_SELLS_PER_DAY", 1), max_avg_per_day=env_int("EKD_MAX_AVG_PER_DAY", 1),
         withdrawal=env_float("EKD_WITHDRAWAL", 15_000), withdraw_after_months=env_int("EKD_WITHDRAW_AFTER_MONTHS", 6),
         keep_back=env_float("EKD_KEEP_BACK", 15_000))
-    # EKD_SYMBOL_LEVELS=GOLDBEES:0.04:-0.03,SILVERBEES:0.04:-0.03
+    # EKD_SYMBOL_LEVELS=GOLDBEES:0.05:-0.04,SILVERBEES:0.05:-0.04 (not needed: gold/silver use the ETF levels)
     for item in [x for x in env("EKD_SYMBOL_LEVELS", "").split(",") if x.strip()]:
         sym, tgt, avg = item.split(":")
         r.symbol_levels[sym.strip().upper()] = (float(tgt), float(avg))

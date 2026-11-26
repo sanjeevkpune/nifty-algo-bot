@@ -21,21 +21,23 @@ lock and state files, fill checks, `PAPER_MODE`, crash handling.
 ## The rules it follows (tracker Settings tab)
 
 - **3:00 pm sell.** At most one target sell a day: the open position with the highest % gain on average cost
-  that is at or above target (ETF +4%, stock +6%). It sells 50% (rounded down; a 1-share position is sold whole).
-  The other 50% becomes a Core lot at the position's average cost.
+  that is at or above target (ETF +5%, stock +8%; GOLDBEES and SILVERBEES use the ETF levels). It sells 80% (rounded down;
+  a 1-share position is sold whole). The other 20% becomes a Core lot at the position's average cost.
 - **Core lots.** Sold whole when the price reaches 3x the lot's cost. This doesn't count as the day's sell.
 - **3:10 pm buys.** There is one ETF slot and one stock slot, ₹40k each, in whole shares. Each slot buys the
   lowest-RSI name it doesn't already hold among the 8 lowest-RSI ETFs (or the 2 lowest-RSI stocks).
-  There are at most 20 open positions, and Core lots don't count.
+  There are at most 30 open positions, and Core lots don't count.
 - **Averaging.** At most 1 averaging buy a day (₹40k), and only in a shop whose slot made no new buy. It buys
-  the holding that is most negative vs its last buy price, if it's at or below -3% (ETF) or -6% (stock).
+  the holding that is most negative vs its last buy price, if it's at or below -4% (ETF) or -8% (stock).
 - **RSI(14).** Wilder RSI on AngelOne daily closes, with today's live price as the last close.
 - **Cash.** Buys never use the owed monthly withdrawal or the ₹15k kept back. You take the ₹15k out yourself and
   record it with `withdraw 15000`.
 
 **Proof it matches the backtest.** `tests/replay_test.py` runs `strategy.py` day by day over 24-Nov-2021 to
-23-Nov-2026 on the same Yahoo closes and compares it with `backtest.py`. All 559 trades match (215 new, 114 averaging,
-195 sells, 35 Core 3x), with the same ending value (₹78.54L) and the same withdrawals (₹8.25L).
+23-Nov-2026 on the same Yahoo closes and compares it with `backtest.py`. All 985 trades match (383 new, 196 averaging,
+353 sells, 53 Core 3x), with the same ending value (₹72.64L) and the same withdrawals (₹8.25L).
+The rules changed on 26-Nov-2026 from keep 50% / max 20 / ETF +4%/-3% / stock +6%/-6% to keep 20% / max 30 /
+ETF +5%/-4% / stock +8%/-8%.
 
 ## Live signals from your Google Sheet
 
@@ -80,7 +82,7 @@ Each order goes through these steps:
 3. For whatever is left, it places a MARKET order. It skips this step if the price has moved more than 1% from
    the plan (`EKD_MAX_CHASE_PCT`).
 
-Fills are recorded at AngelOne's average price. If a sell fills only partly, the planned 50% Core lot is still kept,
+Fills are recorded at AngelOne's average price. If a sell fills only partly, the planned 20% Core lot is still kept,
 and the unsold part stays an open position.
 
 ## Safety
