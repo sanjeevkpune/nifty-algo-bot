@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Strategy Desk</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--fg:#17202b;--muted:#5d6b7a;--line:#dde2e8;--accent:#2f5d8a;--ok:#1d7a46;--bad:#b3261e;--tip:#fff;
+--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0f141a;--panel:#161d25;--fg:#e6ebf0;--muted:#93a1b0;--line:#26313d;--accent:#7fb0e0;--ok:#4cc38a;--bad:#ff7b72;--tip:#1d2630;color-scheme:dark}}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}
+.wrap{max-width:1200px;margin:0 auto;padding:20px max(16px,env(safe-area-inset-left)) 40px max(16px,env(safe-area-inset-right));display:flex;flex-direction:column;gap:18px}
+h1{font-size:26px;font-weight:600;margin:0}h2{font-size:18px;margin:0;font-weight:600}h3{font-size:14px;margin:0;font-weight:600}
+p{margin:0;max-width:75ch}.muted{color:var(--muted);font-size:12px}
+.tabs{display:flex;flex-wrap:wrap;gap:4px;border-bottom:1px solid var(--line);padding-bottom:8px}
+.tab{font:inherit;background:none;border:1px solid transparent;border-radius:6px;padding:6px 12px;color:var(--muted);cursor:pointer}
+.tab:hover{color:var(--fg);border-color:var(--line)}.tab.on{color:var(--fg);background:var(--panel);border-color:var(--line)}
+.tab:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+section{display:flex;flex-direction:column;gap:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.big{font-size:24px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.label{color:var(--muted);font-size:12px}
+.pos{color:var(--ok)}.neg{color:var(--bad)}
+.pill{display:inline-block;font-size:12px;border:1px solid var(--line);border-radius:999px;padding:0 8px;color:var(--muted);vertical-align:middle;font-weight:400}
+.pill.Live{color:var(--bad);border-color:var(--bad)}.pill.Paper{color:var(--ok);border-color:var(--ok)}
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:600}td.n,th.n{text-align:right}
+.chart{position:relative;min-height:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px}
+.chart svg{display:block;width:100%}.chart text{fill:var(--muted);font-size:11px}
+.tip{position:absolute;pointer-events:none;background:var(--tip);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.err{color:var(--bad);font-size:12px}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Strategy Desk</h1>
+    <p>Across the four bots the running P&amp;L is <b id="total">…</b>. <span class="muted">Updated <span id="updated">…</span> · refreshes every minute.</span></p>
+    <p class="muted">The option bots write to the sheet at the end of each day; the ETF bot writes at about 3:10 pm.</p>
+    <p class="err" id="errors" hidden></p>
+  </header>
+  <nav class="tabs" id="tabs">
+    <button class="tab on" data-t="overview">Overview</button>
+    <button class="tab" data-t="etf">ETF ki Dukan</button>
+    <button class="tab" data-t="v4">Lemonn v4 straddle</button>
+    <button class="tab" data-t="v3">Lemonn v3 dual session</button>
+    <button class="tab" data-t="adaptive">Adaptive strangle</button>
+    <button class="tab" data-t="backtests">Backtests</button>
+  </nav>
+
+  <section id="overview">
+    <h2>Running P&amp;L by strategy</h2>
+    <div class="grid" id="ov-cards"></div>
+    <div class="tw"><table id="ov-table"></table></div>
+    <p class="muted">ETF P&amp;L is realised plus unrealised from the tracker's Capital tab. v3 and v4 are before charges; the adaptive strangle is net of charges.</p>
+  </section>
+
+  <section id="etf" hidden>
+    <h2>ETF ki Dukan <span class="pill" id="etf-mode"></span></h2>
+    <div class="grid" id="etf-cards"></div>
+    <h3>Net worth after each bot run</h3><div class="chart" id="etf-nav"></div>
+    <h3>Open lots</h3><div class="tw"><table id="etf-open"></table></div>
+    <h3>Bot log, newest first</h3><div class="tw"><table id="etf-log"></table></div>
+    <h3>Sells</h3><div class="tw"><table id="etf-sold"></table></div>
+  </section>
+
+  <section id="v4" hidden>
+    <h2>Lemonn v4 sideways straddle <span class="pill" id="v4-mode"></span></h2>
+    <div class="grid" id="v4-cards"></div>
+    <h3>Daily P&amp;L and running total</h3><div class="chart" id="v4-chart"></div>
+    <h3>Daily log, newest first</h3><div class="tw"><table id="v4-log"></table></div>
+  </section>
+
+  <section id="v3" hidden>
+    <h2>Lemonn v3 dual session <span class="pill" id="v3-mode"></span></h2>
+    <div class="grid" id="v3-cards"></div>
+    <h3>Daily P&amp;L and running total</h3><div class="chart" id="v3-chart"></div>
+    <h3>Legs, newest first</h3><div class="tw"><table id="v3-legs"></table></div>
+    <h3>Earlier session log</h3><div class="tw"><table id="v3-sess"></table></div>
+  </section>
+
+  <section id="adaptive" hidden>
+    <h2>Adaptive strangle V4.2 <span class="pill" id="ad-mode"></span></h2>
+    <div class="grid" id="ad-cards"></div>
+    <h3>Daily net P&amp;L and running total</h3><div class="chart" id="ad-chart"></div>
+    <h3>Session log, newest first</h3><div class="tw"><table id="ad-log"></table></div>
+  </section>
+
+  <section id="backtests" hidden>
+    <h2>Tradetron backtests</h2>
+    <p class="muted">Copied from each finished run's Tradetron report into the "Tradetron Backtests" tab of your V2 sheet. COVERAGE_PARTIAL means Tradetron lacked data for part of the window. Lemonn v3 dual session and Adaptive V4.2 have no finished run yet.</p>
+    <div class="tw"><table id="bt-table"></table></div>
+    <h3>Straddle Seller v4: monthly P&amp;L in the backtest</h3><div class="chart" id="bt-v4"></div>
+    <h2>ETF ki Dukan backtest (new setup, Python engine)</h2>
+    <div class="grid" id="etfbt-cards"></div>
+    <h3>Return by year</h3><div class="chart" id="etfbt-chart"></div>
+  </section>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const INR = new Intl.NumberFormat('en-IN', {maximumFractionDigits: 0});
+const INR2 = new Intl.NumberFormat('en-IN', {maximumFractionDigits: 2});
+const isN = (v) => typeof v === 'number' && isFinite(v);
+function fmt(v, f) {
+  if (v === null || v === undefined || v === '') return '';
+  if (!isN(v)) return String(v);
+  if (f === 'rs') return (v < 0 ? '−₹' : '₹') + INR.format(Math.abs(v));
+  if (f === 'r') return INR.format(v);
+  if (f === 'p') return INR2.format(v);
+  if (f === 'pct') return INR2.format(v) + '%';
+  return INR.format(v);
+}
+function short(v) { const a = Math.abs(v), s = v < 0 ? '−' : '';
+  if (a >= 1e7) return s + '₹' + (a / 1e7).toFixed(2) + 'Cr'; if (a >= 1e5) return s + '₹' + (a / 1e5).toFixed(1) + 'L';
+  if (a >= 1e3) return s + '₹' + (a / 1e3).toFixed(0) + 'k'; return s + '₹' + INR.format(a); }
+function sign(el, v) { el.classList.toggle('pos', isN(v) && v > 0); el.classList.toggle('neg', isN(v) && v < 0); }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+
+function cards(id, items) {
+  $(id).replaceChildren(...items.map(([label, v, f, signed]) => {
+    const c = el('div', 'card'); c.append(el('span', 'label', label));
+    const b = el('span', 'big', v === null || v === undefined ? '—' : fmt(v, f)); if (signed) sign(b, v); c.append(b); return c;
+  }));
+}
+function table(id, rows, cols, empty) {
+  const t = $(id); const thead = el('thead'); const tr = el('tr');
+  cols.forEach(([k, label, f]) => tr.append(el('th', f ? 'n' : '', label))); thead.append(tr);
+  const tb = el('tbody');
+  if (!rows || !rows.length) { const r = el('tr'); const td = el('td', 'muted', empty || 'No rows yet.'); td.colSpan = cols.length; r.append(td); tb.append(r); }
+  else rows.forEach((row) => { const r = el('tr'); cols.forEach(([k, , f]) => {
+    let v = row[k]; const td = el('td', f ? 'n' : '');
+    if (f === 'link') { td.className = ''; if (typeof v === 'string' && /^https:\/\//.test(v)) { const a = el('a', '', 'Report'); a.href = v; a.target = '_blank'; a.rel = 'noopener'; td.append(a); } }
+    else { td.textContent = fmt(v, f); if (/pnl|p_l|profit/.test(k)) sign(td, v); }
+    r.append(td); }); tb.append(r); });
+  t.replaceChildren(thead, tb);
+}
+const SVGNS = 'http://www.w3.org/2000/svg';
+function sv(tag, attrs, text) { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text !== undefined) e.textContent = text; return e; }
+function chart(id, rows, o) {
+  const box = $(id); box.replaceChildren();
+  if (!rows || !rows.length) { box.append(el('p', 'muted', o.empty || 'Nothing to chart yet.')); return; }
+  const W = Math.max(300, box.clientWidth - 16), H = 220, m = {t: 10, r: 10, b: 24, l: 56};
+  const ys = rows.map((r) => r[o.y]).concat(o.line ? rows.map((r) => r[o.line]) : []);
+  let lo = Math.min(0, ...ys), hi = Math.max(0, ...ys); if (lo === hi) { hi += 1; }
+  const pad = (hi - lo) * 0.08; lo = lo < 0 ? lo - pad : lo; hi += pad;
+  const y = (v) => m.t + (hi - v) / (hi - lo) * (H - m.t - m.b);
+  const step = (W - m.l - m.r) / rows.length, bw = Math.min(40, Math.max(2, step * 0.7));
+  const cx = (i) => m.l + step * i + step / 2;
+  const fy = o.unit === '%' ? (v) => v.toFixed(0) + '%' : short;
+  const svg = sv('svg', {viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': o.label || 'chart'});
+  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4;
+    svg.append(sv('line', {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: 'var(--line)'}));
+    svg.append(sv('text', {x: m.l - 6, y: y(v) + 4, 'text-anchor': 'end'}, fy(v))); }
+  svg.append(sv('line', {x1: m.l, x2: W - m.r, y1: y(0), y2: y(0), stroke: 'var(--muted)'}));
+  const every = Math.max(1, Math.ceil(rows.length / Math.floor((W - m.l) / 64)));
+  rows.forEach((r, i) => { if (i % every === 0) svg.append(sv('text', {x: cx(i), y: H - 6, 'text-anchor': 'middle'}, String(r[o.x]).replace(/^20(\d\d)-/, '$1-'))); });
+  if (o.kind === 'line') {
+    svg.append(sv('path', {d: rows.map((r, i) => (i ? 'L' : 'M') + cx(i) + ' ' + y(r[o.y])).join(''), fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2}));
+    rows.forEach((r, i) => svg.append(sv('circle', {cx: cx(i), cy: y(r[o.y]), r: 3.5, fill: 'var(--accent)'})));
+  } else {
+    rows.forEach((r, i) => { const v = r[o.y]; svg.append(sv('rect', {x: cx(i) - bw / 2, width: bw, y: Math.min(y(v), y(0)), height: Math.max(1, Math.abs(y(v) - y(0))), fill: v < 0 ? 'var(--bad)' : 'var(--ok)', opacity: 0.85})); });
+    if (o.line) { svg.append(sv('path', {d: rows.map((r, i) => (i ? 'L' : 'M') + cx(i) + ' ' + y(r[o.line])).join(''), fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2}));
+      rows.forEach((r, i) => svg.append(sv('circle', {cx: cx(i), cy: y(r[o.line]), r: 3, fill: 'var(--accent)'}))); }
+  }
+  const tip = el('div', 'tip'); tip.hidden = true;
+  const f = o.unit === '%' ? (v) => fmt(v, 'pct') : (v) => fmt(v, 'rs');
+  rows.forEach((r, i) => { const hit = sv('rect', {x: m.l + step * i, width: step, y: m.t, height: H - m.t - m.b, fill: 'transparent'});
+    hit.addEventListener('pointermove', (ev) => { tip.textContent = r[o.x] + ' · ' + f(r[o.y]) + (o.line ? ' · running ' + f(r[o.line]) : '');
+      tip.hidden = false; const b = box.getBoundingClientRect(); tip.style.left = Math.min(ev.clientX - b.left + 12, box.clientWidth - tip.offsetWidth) + 'px'; tip.style.top = Math.max(0, ev.clientY - b.top - 34) + 'px'; });
+    hit.addEventListener('pointerleave', () => { tip.hidden = true; }); svg.append(hit); });
+  box.append(svg, tip);
+}
+function pill(id, mode) { const p = $(id); p.textContent = mode || '—'; p.className = 'pill ' + (mode || ''); }
+
+let DATA = null;
+function render() {
+  const d = DATA; if (!d) return;
+  const t = $('total'); t.textContent = fmt(d.total_pnl, 'rs'); sign(t, d.total_pnl);
+  $('updated').textContent = d.updated;
+  const errs = Object.entries(d.errors || {}); $('errors').hidden = !errs.length;
+  $('errors').textContent = errs.length ? 'Could not read: ' + errs.map(([k, v]) => k + ' (' + v + ')').join('; ') : '';
+  const S = Object.fromEntries(d.strategies.map((s) => [s.id, s]));
+  $('ov-cards').replaceChildren(...d.strategies.map((s) => { const c = el('div', 'card');
+    c.append(el('span', 'label', s.name + ' · ' + s.broker + ' · ' + s.basis)); const b = el('span', 'big', fmt(s.pnl, 'rs')); sign(b, s.pnl); c.append(b);
+    c.append(el('span', 'muted', s.mode + ' · last row ' + (s.last || '—'))); return c; }));
+  table('ov-table', d.strategies, [['name', 'Strategy'], ['mode', 'Mode'], ['trade_days', 'Days traded', 'n'], ['wins', 'Winning days', 'n'], ['pnl', 'Running P&L (₹)', 'r'], ['last', 'Last row']]);
+
+  const c = d.etf.capital || {}; pill('etf-mode', S.etf.mode);
+  cards('etf-cards', [['Net worth', c.net_worth, 'rs'], ['Realised net profit', c.realised_net_profit ?? 0, 'rs', 1], ['Unrealised P/L', c.unrealised_pl ?? 0, 'rs', 1],
+    ['Free cash', c.free_cash, 'rs'], ['Open positions / max', c.open_positions], ['Total withdrawn', c.total_withdrawn ?? 0, 'rs']]);
+  chart('etf-nav', d.etf.nav, {kind: 'line', x: 'date', y: 'net_worth', label: 'ETF net worth by day', empty: 'No bot runs logged yet.'});
+  table('etf-open', d.etf.open, [['buy_date', 'Buy date'], ['nse_symbol', 'Symbol'], ['type', 'Type'], ['buy_type_new_avg', 'Buy'], ['qty', 'Qty', 'n'], ['buy_price', 'Buy price', 'p'], ['cmp', 'CMP', 'p'], ['current_value', 'Value', 'r'], ['lot_p_l', 'Lot P/L %', 'p'], ['position_p_l', 'Position P/L %', 'p']], 'No open lots.');
+  table('etf-log', d.etf.botlog, [['date', 'Date'], ['time', 'Time'], ['mode', 'Mode'], ['event', 'Event'], ['symbol', 'Symbol'], ['qty', 'Qty', 'n'], ['price', 'Price', 'p'], ['value', 'Value', 'r'], ['net_p_l', 'Net P&L', 'r'], ['note', 'Note']], 'The bot has not logged anything yet.');
+  table('etf-sold', d.etf.sold, [['sell_date', 'Sell date'], ['nse_symbol', 'Symbol'], ['actual_qty_sold', 'Qty sold', 'n'], ['sell_price', 'Sell price', 'p'], ['net_profit', 'Net profit', 'r'], ['profit_on_cost', 'Profit % on cost', 'p'], ['holding_days', 'Days held', 'n']], 'No sells yet.');
+
+  pill('v4-mode', S.v4.mode);
+  cards('v4-cards', [['Running P&L, before charges', S.v4.pnl, 'rs', 1], ['Days traded / logged', S.v4.traded + ' / ' + S.v4.days_logged], ['Latest decision', S.v4.last_decision]]);
+  chart('v4-chart', d.v4.days, {x: 'date', y: 'pnl', line: 'cum', label: 'v4 daily P&L', empty: 'No days logged yet.'});
+  table('v4-log', d.v4.log, [['date', 'Date'], ['decision', 'Decision'], ['gap', 'Gap %', 'p'], ['vix', 'VIX', 'p'], ['score', 'Score', 'n'], ['strike', 'Strike', 'n'], ['combined_entry', 'Entry', 'p'], ['exit_reason', 'Exit reason'], ['day_p_l_before_charges', 'Day P&L', 'r'], ['lots', 'Lots', 'n']], 'No days logged yet.');
+
+  pill('v3-mode', S.v3.mode);
+  cards('v3-cards', [['Running P&L, before charges', S.v3.pnl, 'rs', 1], ['Days traded', S.v3.trade_days], ['Winning days', S.v3.wins]]);
+  chart('v3-chart', d.v3.days, {x: 'date', y: 'pnl', line: 'cum', label: 'v3 daily P&L', empty: 'No traded days yet.'});
+  table('v3-legs', d.v3.legs, [['date', 'Date'], ['index', 'Index'], ['session', 'Session'], ['leg', 'Leg'], ['side', 'Side'], ['symbol', 'Symbol'], ['qty', 'Qty', 'n'], ['entry', 'Entry', 'p'], ['exit', 'Exit', 'p'], ['reason', 'Reason'], ['leg_pnl', 'Leg P&L', 'r']], 'No legs logged yet.');
+  table('v3-sess', d.v3.sessions, [['date', 'Date'], ['index', 'Index'], ['session', 'Session'], ['ce_symbol', 'CE'], ['ce_reason', 'CE exit'], ['pe_symbol', 'PE'], ['pe_reason', 'PE exit'], ['session_pnl', 'Session P&L', 'r']], 'Nothing here.');
+
+  pill('ad-mode', S.adaptive.mode);
+  cards('ad-cards', [['Running P&L, net of charges', S.adaptive.pnl, 'rs', 1], ['Days traded / skipped', S.adaptive.trade_days + ' / ' + S.adaptive.skipped], ['Position now', S.adaptive.open_now]]);
+  chart('ad-chart', d.adaptive.days, {x: 'date', y: 'pnl', line: 'cum', label: 'Adaptive daily P&L', empty: 'No traded days yet.'});
+  table('ad-log', d.adaptive.log, [['date', 'Date'], ['timestamp', 'Time'], ['strategy_version', 'Version'], ['session_status', 'Status'], ['nifty_spot_950', 'Spot 9:50', 'p'], ['final_ce_symbol', 'CE'], ['final_pe_symbol', 'PE'], ['active_qty', 'Qty', 'n'], ['exit_reason', 'Exit / skip reason'], ['net_pnl', 'Net P&L', 'r']], 'No sessions logged yet.');
+
+  const bt = d.backtests;
+  table('bt-table', bt.tradetron, [['strategy', 'Strategy'], ['window', 'Window'], ['capital', 'Capital', 'r'], ['net_p_l', 'Net P&L', 'r'], ['cagr', 'CAGR %', 'p'], ['win_rate', 'Win rate %', 'p'], ['max_dd', 'Max DD (₹)', 'r'], ['sharpe', 'Sharpe', 'p'], ['trades', 'Trades', 'n'], ['high_caveats', 'High caveats'], ['report', 'Report', 'link'], ['updated', 'Copied on']], 'The "Tradetron Backtests" tab is empty.');
+  chart('bt-v4', bt.v4_monthly, {x: 'month', y: 'p_l', label: 'v4 backtest monthly P&L', empty: 'No monthly rows.'});
+  const e = bt.etf_summary || {};
+  cards('etfbt-cards', [['Fund + withdrawn (from ₹40L)', e['Fund + withdrawn (from 40L)'], 'rs'], ['XIRR per year', e['XIRR %'], 'pct'], ['Max drawdown', e['Max drawdown %'], 'pct'], ['NIFTYBEES XIRR, same withdrawals', e['NIFTYBEES XIRR %'], 'pct']]);
+  chart('etfbt-chart', bt.etf_yearly, {x: 'year', y: 'return', unit: '%', label: 'ETF backtest return by year'});
+}
+async function load() {
+  try { const r = await fetch('/api/data', {cache: 'no-store'}); const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status); DATA = j; render(); }
+  catch (err) { $('errors').hidden = false; $('errors').textContent = 'Could not load data: ' + err.message; }
+}
+function show(id) {
+  document.querySelectorAll('section').forEach((s) => { s.hidden = s.id !== id; });
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('on', t.dataset.t === id));
+  try { history.replaceState(null, '', '#' + id); } catch (e) {}
+  render();
+}
+document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => show(t.dataset.t)));
+if (location.hash && $(location.hash.slice(1))) show(location.hash.slice(1));
+let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(render, 150); });
+load(); setInterval(load, 60000);
+</script>
+</body>
+</html>

@@ -24,6 +24,7 @@ Edit the schedule there, not on the VM.
 .github/workflows/
   vm-scheduler.yml          Start 08:30 / stop 16:00 IST; pushes startup.sh + secrets to VM metadata
   etf-dukan-check.yml       Manual: runs etf_dukan/check_setup.py on the VM
+  dashboard-network.yml     Manual, once: opens port 8080 for the dashboard
 startup.sh                  VM boot script: packages, clone/pull main, /etc/trade-config/config.env, crontab
 requirements.txt            Python packages for the root bots
 cleanup_logs.sh             Daily: old log folders, run locks, ETF caches
@@ -38,6 +39,7 @@ test_lemonn_dhan_connectivity.py Pre-flight checks for the Dhan v3 bot (--order-
 test_lemonn_v4_connectivity.py   Read-only checks for the Dhan v4 bot
 
 etf_dukan/                  ETF ki Dukan bot, its own README, setup script and setup check
+dashboard/                  Strategy Desk: password-protected dashboard on port 8080 (see dashboard/README.md)
 ```
 
 The bot scripts stay in the repository root on purpose: the crontab, the relative run-lock files

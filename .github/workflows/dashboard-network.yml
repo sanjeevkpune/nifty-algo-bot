@@ -1,0 +1,67 @@
+name: Dashboard Network Setup
+
+# Run once (Actions -> Dashboard Network Setup -> Run workflow) to open port 8080 for the Strategy Desk
+# dashboard. It adds a firewall rule for VMs tagged "strategy-dashboard", tags the trading VM, and prints
+# the VM's fixed address (the static IP "algo-vm-ip" it was created with). Safe to run again.
+# "remove" takes the rule and the tag away again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'What to do'
+        required: true
+        default: 'open'
+        type: choice
+        options:
+          - open
+          - remove
+      source_ranges:
+        description: 'Who may connect (CIDR list). 0.0.0.0/0 = anywhere; put your home IP/32 to lock it down.'
+        required: true
+        default: '0.0.0.0/0'
+
+env:
+  PROJECT_ID: "streamlit-db-503313"
+  VM_NAME: "angel-one-auto-trading-bot-v2"
+  ZONE: "us-central1-c"
+  RULE_NAME: "allow-strategy-dashboard-8080"
+  TAG: "strategy-dashboard"
+
+jobs:
+  network:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Open port 8080
+        if: github.event.inputs.action == 'open'
+        env:
+          SOURCE_RANGES: ${{ github.event.inputs.source_ranges }}
+        run: |
+          set -e
+          if gcloud compute firewall-rules describe "$RULE_NAME" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            gcloud compute firewall-rules update "$RULE_NAME" --project="$PROJECT_ID" --source-ranges="$SOURCE_RANGES"
+          else
+            gcloud compute firewall-rules create "$RULE_NAME" --project="$PROJECT_ID" \
+              --direction=INGRESS --action=ALLOW --rules=tcp:8080 \
+              --target-tags="$TAG" --source-ranges="$SOURCE_RANGES" \
+              --description="Strategy Desk dashboard (password protected)"
+          fi
+          gcloud compute instances add-tags "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --tags="$TAG"
+          IP=$(gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" \
+                --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+          echo "### Strategy Desk: http://${IP}:8080 (user admin; password was sent to Telegram)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dashboard address: http://${IP}:8080"
+
+      - name: Remove the rule and tag
+        if: github.event.inputs.action == 'remove'
+        run: |
+          gcloud compute instances remove-tags "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --tags="$TAG" || true
+          gcloud compute firewall-rules delete "$RULE_NAME" --project="$PROJECT_ID" --quiet || true
