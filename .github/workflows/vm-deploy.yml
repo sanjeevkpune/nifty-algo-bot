@@ -1,0 +1,85 @@
+name: Deploy to VM (manual)
+
+# The VM is started and stopped by the GCP instance schedule (Compute Engine > Instance schedules),
+# not by GitHub any more. The old timed start (08:30) / stop (16:00) jobs were removed.
+#
+# Run this by hand only when something the VM cannot pull by itself has changed:
+#   * a GitHub Secret or Variable (Angel/Dhan logins, Telegram, EKD_PAPER_MODE, EKD_START_DATE, ...)
+#   * startup.sh itself (the VM boots with the copy saved in its metadata)
+# Plain code changes merged to main need nothing: every boot runs `git reset --hard origin/main`.
+#
+# What it does: copies startup.sh and the secrets into the VM metadata. If the VM is running and you
+# picked "update + re-run now", it also re-runs the startup script (pull code, rewrite config, crontab).
+# Re-running is refused from 09:00 to 15:35 IST (bots are trading) unless you tick "force".
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: 'What to do'
+        required: true
+        default: 'update metadata only'
+        type: choice
+        options:
+          - update metadata only
+          - update + re-run now
+      force:
+        description: 'Allow re-run during market hours (09:00-15:35 IST)'
+        type: boolean
+        default: false
+
+env:
+  PROJECT_ID: "streamlit-db-503313"
+  VM_NAME: "angel-one-auto-trading-bot-v2"
+  ZONE: "us-central1-c"
+  VM_USER: "kumar_sanjeev_pune"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Update startup-script and secrets in the VM metadata
+        env:
+          GCP_SA_RAW: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if ! gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            echo "::error::VM $VM_NAME not found in $ZONE. Create it in the GCP console (attach it to the instance schedule), then run this again."
+            exit 1
+          fi
+          GCP_SA_B64=$(echo -n "$GCP_SA_RAW" | base64 -w 0)
+          gcloud compute instances add-metadata "$VM_NAME" \
+              --zone="$ZONE" \
+              --project="$PROJECT_ID" \
+              --metadata-from-file=startup-script=startup.sh \
+              --metadata=api-key="${{ secrets.API_KEY }}",client-code="${{ secrets.CLIENT_CODE }}",pin="${{ secrets.PIN }}",totp-secret="${{ secrets.TOTP_SECRET }}",dhan-client-id="${{ secrets.DHAN_CLIENT_ID }}",dhan-pin="${{ secrets.DHAN_PIN }}",dhan-totp-secret="${{ secrets.DHAN_TOTP_SECRET }}",telegram-token="${{ secrets.TELEGRAM_BOT_TOKEN }}",telegram-chat="${{ secrets.TELEGRAM_CHAT_ID }}",gsheet-v2="${{ secrets.GSHEET_ID_V2 }}",gcp-sa-b64="${GCP_SA_B64}",ekd-paper-mode="${{ vars.EKD_PAPER_MODE }}",ekd-start-date="${{ vars.EKD_START_DATE }}",ekd-capital="${{ vars.EKD_CAPITAL }}",ekd-gsheet-id="${{ vars.EKD_GSHEET_ID }}",ekd-api-key="${{ secrets.EKD_API_KEY }}"
+          echo "Metadata updated. The next boot (from the instance schedule) uses it."
+
+      - name: Re-run the startup script on the running VM
+        if: github.event.inputs.action_type == 'update + re-run now'
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          STATUS=$(gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --format='get(status)')
+          if [ "$STATUS" != "RUNNING" ]; then
+            echo "VM is $STATUS. Nothing to re-run: the next scheduled start picks up the new metadata."
+            exit 0
+          fi
+          HHMM=$(TZ=Asia/Kolkata date +%H%M)
+          DOW=$(TZ=Asia/Kolkata date +%u)
+          if [ "$FORCE" != "true" ] && [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0900 ] && [ "$HHMM" -le 1535 ]; then
+            echo "::error::It is $HHMM IST on a weekday: bots may be trading. Re-run after 15:35 IST, or tick 'force'."
+            exit 1
+          fi
+          gcloud compute ssh "${VM_USER}@${VM_NAME}" --zone="$ZONE" --project="$PROJECT_ID" --quiet \
+              --command="sudo google_metadata_script_runner startup && crontab -l"

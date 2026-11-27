@@ -143,6 +143,14 @@ def tg(message: str):
     tag = ("[PAPER] " if PAPER_MODE else "[LIVE] ") + BOT_TAG + "\n"
     print(f"{now_ist():%H:%M:%S} {tag}{message}", flush=True)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:   # notify.py: routine messages silent, repeats within 10 min dropped, one retry
+            import notify
+            notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, timeout=5, retry=False)
+            return
+        except ImportError:
+            pass
+        except Exception:
+            return
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -928,15 +936,18 @@ class LemonnV4Bot:
     def run(self):
         if self.today.weekday() >= 5:
             return print("Weekend - nothing to trade.")
-        try:
-            import pandas_market_calendars as mcal
-            if mcal.get_calendar("NSE").schedule(start_date=str(self.today), end_date=str(self.today)).empty:
-                return tg("📅 NSE holiday. NIFTY v4 sleeping.")
-        except Exception:
-            pass
         self.load_state()
         if self.phase == "done":
             return print("Today's NIFTY v4 session is already complete.")
+        try:
+            import pandas_market_calendars as mcal
+            if mcal.get_calendar("NSE").schedule(start_date=str(self.today), end_date=str(self.today)).empty:
+                # the watchdog re-runs this every 10 min: mark the day done so the holiday note is sent once
+                self.phase, self.info["decision"] = "done", "SKIP: NSE holiday"
+                self.save_state()
+                return tg("📅 NSE holiday. NIFTY v4 sleeping.")
+        except Exception:
+            pass
         self.login()
         self.load_master()
         tg(f"🚀 LEMONN NIFTY v4 (sideways straddle) | {NUM_LOTS} lots x {self.lot_size} | expiry {self.expiry} "

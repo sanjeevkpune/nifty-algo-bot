@@ -118,6 +118,7 @@ OHLC_RETRY_SECS = env_int("OHLC_RETRY_SECS", 120)
 POLL_SECS = env_float("POLL_SECS", 1.5)
 DATA_FAIL_ALERT_SECS = env_int("DATA_FAIL_ALERT_SECS", 15)
 DATA_FAIL_EXIT_SECS = env_int("DATA_FAIL_EXIT_SECS", 60)
+STATUS_EVERY_MIN = env_int("STATUS_EVERY_MIN", 90)          # Telegram P&L update while positions are open (0 = off)
 
 # --- Safety -----------------------------------------------------------
 MIN_REQUIRED_MARGIN = env_float("MIN_REQUIRED_MARGIN", 0.0)
@@ -147,6 +148,15 @@ class OrderError(Exception):
 def tg(message: str):
     tag = ("[PAPER] " if PAPER_MODE else "[LIVE] ") + "🟠 ANGEL ONE · Adaptive Strangle\n"
     print(f"{tag}{message}")
+    try:   # notify.py: routine messages silent, repeats within 10 min dropped, one retry
+        import notify
+        notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, timeout=5, retry=False)
+        return
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -793,14 +803,15 @@ class Bot:
             self.handle_existing_lock()
             return
 
-        def abort_and_log(reason, spot=0.0, gap=0.0, orb=0.0):
+        def abort_and_log(reason, spot=0.0, gap=0.0, orb=0.0, routine=False):
             try:
                 with open(self.lock_path, "w") as lf:
                     json.dump({"status": "skipped", "reason": reason}, lf)
             except Exception:
                 pass
             today_str = str(today)
-            tg(f"⚠️ STRATEGY SKIPPED ({today_str})\nReason: {reason}")
+            # routine = the gap / opening-range filter said no trade today: a silent message, not an alert
+            tg(f"{'⏭️ NO TRADE TODAY' if routine else '⚠️ STRATEGY SKIPPED'} ({today_str})\nReason: {reason}")
             self.log_sheet([today_str, now_ist().strftime("%H:%M:%S"), self.version_tag(), "SKIPPED",
                             round(spot, 2), round(gap, 2), round(orb, 2), "N/A", "N/A", 0.0,
                             "N/A", "N/A", 0, "No", reason, 0.0, 0.0, 0.0])
@@ -844,7 +855,7 @@ class Bot:
 
         ok, spot, gap_pct, orb, msg = self.check_filters()
         if not ok:
-            abort_and_log(msg, spot, gap_pct, orb)
+            abort_and_log(msg, spot, gap_pct, orb, routine=spot > 0)   # feed down is an alert
             return
 
         atm = int(round(spot / 50.0) * 50)
@@ -909,7 +920,7 @@ class Bot:
 
         exit_reason, force_market = "N/A", False
         last_ok, feed_alerted = time.time(), False
-        last_slot = now_ist().hour * 2 + now_ist().minute // 30
+        last_status = now_ist()        # first P&L update STATUS_EVERY_MIN after entry (09:50 -> 11:20, 12:50, 14:20)
 
         while True:
             now = now_ist()
@@ -943,10 +954,10 @@ class Bot:
                            for l in active_legs)
             total_pnl = self.realized + open_pnl
 
-            slot = now.hour * 2 + now.minute // 30
-            if slot != last_slot and now.minute % 30 == 0:
-                last_slot = slot
-                tg(f"⏱️ {now:%I:%M %p}: P&L ₹{total_pnl:,.0f} | Spot {spot_now:.2f}")
+            if STATUS_EVERY_MIN > 0 and (now - last_status).total_seconds() >= STATUS_EVERY_MIN * 60:
+                last_status = now
+                legs_txt = " | ".join(f"{l.opt_type} {l.strike} ₹{q[l.token]:.2f}" for l in active_legs)
+                tg(f"⏱️ {now:%I:%M %p}: P&L ₹{total_pnl:+,.0f} (hard SL -₹{max_loss:,.0f}) | Spot {spot_now:.2f}\n{legs_txt}")
 
             if total_pnl <= -max_loss:
                 exit_reason = f"Hard SL ({int(MAX_PREMIUM_LOSS_PCT * 100)}% premium loss)"

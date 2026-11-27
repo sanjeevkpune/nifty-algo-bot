@@ -3,7 +3,7 @@ name: ETF Bot Setup Check
 # Runs etf_dukan/check_setup.py on the VM over SSH and shows the PASS / FAIL table in the log.
 # Read-only unless you pick an order test (one real 1-unit LIMIT buy far below the price, cancelled at once).
 # AngelOne checks are skipped from 9:30 am to 3:15 pm IST so the strangle bot's session is not disturbed.
-# Best times: 9:15-9:30 am IST (order test works then) or after 3:30 pm IST (VM stops at 4 pm).
+# Best times: 9:15-9:30 am IST (order test works then) or after 3:30 pm IST (the GCP schedule stops the VM after 3:45 pm).
 
 on:
   workflow_dispatch:
@@ -47,7 +47,7 @@ jobs:
         run: |
           STATUS=$(gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --format='get(status)')
           if [ "$STATUS" != "RUNNING" ]; then
-            echo "::error::The VM is $STATUS. Start it with the 'Automated VM Start and Stop Scheduler' workflow (start_or_sync), then run this again."
+            echo "::error::The VM is $STATUS. It is started by the GCP instance schedule; start it in the GCP console (Compute Engine > VM instances > Start) and run this again."
             exit 1
           fi
           ARGS=""
@@ -58,6 +58,6 @@ jobs:
           [ "$QUICK" = "true" ] && ARGS="$ARGS --quick"
           echo "Running: python3 check_setup.py $ARGS"
           gcloud compute ssh "${VM_USER}@${VM_NAME}" --zone="$ZONE" --project="$PROJECT_ID" --quiet \
-            --command="cd ~/trading-bot/etf_dukan 2>/dev/null || { echo 'etf_dukan folder missing: run VM Scheduler start_or_sync first'; exit 1; }; \
-                       [ -f check_setup.py ] || { echo 'check_setup.py missing on the VM: run VM Scheduler start_or_sync so it pulls main'; exit 1; }; \
+            --command="cd ~/trading-bot/etf_dukan 2>/dev/null || { echo 'etf_dukan folder missing: the VM has not pulled the repo yet; reboot it or run the Deploy to VM workflow (update + re-run now)'; exit 1; }; \
+                       [ -f check_setup.py ] || { echo 'check_setup.py missing on the VM: run the Deploy to VM workflow (update + re-run now) so it pulls main'; exit 1; }; \
                        python3 check_setup.py $ARGS"
