@@ -12,6 +12,8 @@ Rules (tracker Settings tab, best setup):
   * 3:10 pm  ETF slot and stock slot, Rs 40k each, whole shares.
              Slot = the lowest-RSI UNHELD name among the 8 lowest-RSI ETFs / 2 lowest-RSI stocks.
              Max 30 open positions (Core lots don't count).
+             A counter sold today (target sell or Core 3x sell) is NOT bought back as a new buy the same day;
+             rebuy_gap_days > 0 extends that wait (calendar days), -1 turns the block off (old behaviour).
              At most 1 averaging buy a day, only in a shop whose slot had no new buy: the holding that is
              most negative vs its LAST buy price, if at/below -4% (ETF) / -8% (stock). Rs 40k.
   * Cash     buys never use the owed monthly withdrawal or the Rs 15k kept back.
@@ -48,6 +50,7 @@ class Rules:
     withdrawal: float = 15_000.0
     withdraw_after_months: int = 6
     keep_back: float = 15_000.0
+    rebuy_gap_days: int = 7           # no new buy of a counter sold within this many calendar days (0 = same day only, -1 = off)
     keep_back_months_before: int = 1  # backtest kept the Rs 15k back from 1 month before withdrawals start
     # per-symbol overrides: {"GOLDBEES": (target, avg_level)}
     symbol_levels: Dict[str, Tuple[float, float]] = field(default_factory=dict)
@@ -181,6 +184,15 @@ def cash_for_buys(state: dict, rules: Rules, today: dt.date) -> float:
     return state["cash"] - withdrawal_owed(state, rules, today) - keep_back(state, rules, today)
 
 
+def recently_sold(state: dict, today: dt.date, gap_days: int) -> set:
+    """Symbols with a target sell or Core sell on or after today - gap_days (gap_days < 0: none)."""
+    if gap_days < 0:
+        return set()
+    since = (today - dt.timedelta(days=gap_days)).isoformat()
+    return {j["sym"] for j in state["journal"]
+            if j["kind"] in ("SELL", "CORE_SELL") and since <= j["date"] <= today.isoformat()}
+
+
 def todays(state: dict, today: dt.date, kinds) -> List[dict]:
     d = today.isoformat()
     return [j for j in state["journal"] if j["date"] == d and j["kind"] in kinds]
@@ -251,6 +263,7 @@ def plan_buys(state: dict, universe: Dict[str, dict], rsi: Dict[str, float], ltp
     out: List[dict] = []
     n_open = len(pos)
     slot_filled = dict(new_done)
+    cooling = recently_sold(state, today, rules.rebuy_gap_days)
 
     def cost_of(sym, kind, amount):
         px = ltp[sym]
@@ -262,13 +275,18 @@ def plan_buys(state: dict, universe: Dict[str, dict], rsi: Dict[str, float], ltp
         if new_done[kind]:
             continue
         sl = shortlist(universe, rsi, ltp, kind, k)
-        cand = next((s for s in sl if s not in pos and s not in blocked), None)
+        cand = next((s for s in sl if s not in pos and s not in blocked and s not in cooling), None)
+        skipped = [s for s in sl if s not in pos and s in cooling]
+        if skipped and (cand is None or sl.index(skipped[0]) < sl.index(cand)):
+            when = "today" if rules.rebuy_gap_days == 0 else f"in the last {rules.rebuy_gap_days} day(s)"
+            notes.append(f"{kind} slot: {', '.join(skipped)} skipped, sold {when} (no buy-back).")
         if n_open >= rules.max_positions:
             if cand:
                 notes.append(f"{kind} slot: {cand} skipped, {n_open} positions open (max {rules.max_positions}).")
             continue
         if not cand:
-            notes.append(f"{kind} slot: every name on the shortlist ({', '.join(sl) or 'none'}) is already held.")
+            notes.append(f"{kind} slot: every name on the shortlist ({', '.join(sl) or 'none'}) is already held"
+                         + (" or was just sold." if skipped else "."))
             continue
         q, val, ch = cost_of(cand, kind, rules.buy_amount)
         if q < 1:

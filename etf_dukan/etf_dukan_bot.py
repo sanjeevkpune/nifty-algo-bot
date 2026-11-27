@@ -174,7 +174,7 @@ def rules_from_env() -> S.Rules:
         stock_shortlist=env_int("EKD_STOCK_SHORTLIST", 2), rsi_period=env_int("EKD_RSI_PERIOD", 14),
         max_sells_per_day=env_int("EKD_MAX_SELLS_PER_DAY", 1), max_avg_per_day=env_int("EKD_MAX_AVG_PER_DAY", 1),
         withdrawal=env_float("EKD_WITHDRAWAL", 15_000), withdraw_after_months=env_int("EKD_WITHDRAW_AFTER_MONTHS", 6),
-        keep_back=env_float("EKD_KEEP_BACK", 15_000))
+        keep_back=env_float("EKD_KEEP_BACK", 15_000), rebuy_gap_days=env_int("EKD_REBUY_GAP_DAYS", 7))
     # EKD_SYMBOL_LEVELS=GOLDBEES:0.05:-0.04,SILVERBEES:0.05:-0.04 (not needed: gold/silver use the ETF levels)
     for item in [x for x in env("EKD_SYMBOL_LEVELS", "").split(",") if x.strip()]:
         sym, tgt, avg = item.split(":")
@@ -296,6 +296,7 @@ class Broker:
         self.u = universe
         self.smart = None
         self.tokens: Dict[str, dict] = {}     # sym -> {"token", "tick", "tradingsymbol"}
+        self.last_candle_error = ""
 
     # --- session ---
     def login(self):
@@ -414,10 +415,16 @@ class Broker:
             time.sleep(1.5)
         return True, "quote unavailable; assuming open"
 
-    def daily_closes(self, sym: str, today: dt.date) -> List[Tuple[str, float]]:
+    CANDLE_TRIES = 5
+
+    def daily_closes(self, sym: str, today: dt.date) -> Optional[List[Tuple[str, float]]]:
+        """Daily closes before today, oldest first. None = the API never answered properly
+        (rate limit / server error), so the caller retries later instead of treating it as
+        "no history". An empty list means AngelOne really returned no candles."""
         t = self.tokens[sym]
         frm = today - dt.timedelta(days=HISTORY_DAYS)
-        for attempt in range(3):
+        self.last_candle_error = ""
+        for attempt in range(self.CANDLE_TRIES):
             try:
                 res = self.smart.getCandleData({"exchange": "NSE", "symboltoken": t["token"], "interval": "ONE_DAY",
                                                 "fromdate": f"{frm} 09:15", "todate": f"{today} 15:30"})
@@ -428,12 +435,17 @@ class Broker:
                         d = str(c[0])[:10]
                         if d < today.isoformat():          # today's bar is replaced by the live price
                             out.append((d, float(c[4])))
+                    out.sort()
                     return out
-                print(f"candles {sym} empty (try {attempt + 1}): {res}")
+                if res and res.get("status") and res.get("data") is not None:
+                    return []                              # a proper answer with no candles
+                self.last_candle_error = str((res or {}).get("message") or (res or {}).get("errorcode") or res)[:80]
+                print(f"candles {sym} not ok (try {attempt + 1}): {res}")
             except Exception as e:
+                self.last_candle_error = str(e)[:80]
                 print(f"candles {sym} error (try {attempt + 1}): {e}")
-            time.sleep(1.5 * (attempt + 1))
-        return []
+            time.sleep(min(2.0 * 2 ** attempt, 20.0))      # 2, 4, 8, 16 s: lets a rate limit clear
+        return None
 
     # --- account ---
     def available_cash(self) -> Optional[float]:
@@ -833,21 +845,60 @@ class Bot:
             save_state(st)
 
     # --- data ---
-    def load_history(self):
+    def _needs_history(self, s: str) -> bool:
+        return (self.universe[s]["include"] or s in self.state["positions"]
+                or any(l["sym"] == s for l in self.state["core"]))
+
+    def load_history(self, alert: bool = True):
+        """Fetch daily closes for every counter that still lacks enough of them.
+        Only good results are cached, so a counter that failed (rate limit, API hiccup)
+        is fetched again on the next pass or the next call, not left out for the day."""
         cache = os.path.join(CACHE_DIR, f"closes_{self.today}.json")
-        if os.path.exists(cache):
+        if os.path.exists(cache) and not self.closes:
             with open(cache) as f:
                 self.closes = {k: [tuple(x) for x in v] for k, v in json.load(f).items()}
-        need = [s for s in self.universe if s in self.broker.tokens and s not in self.closes
-                and (self.universe[s]["include"] or s in self.state["positions"] or any(l["sym"] == s for l in self.state["core"]))]
-        for s in need:
-            self.closes[s] = self.broker.daily_closes(s, self.today)
-            time.sleep(0.4)                           # candle API: ~3 requests/sec
+        enough = RULES.rsi_period + 1
+        errors: Dict[str, str] = {}
+        for pass_no in range(3):
+            need = [s for s in self.universe if s in self.broker.tokens and self._needs_history(s)
+                    and len(self.closes.get(s, [])) < enough]
+            if not need:
+                break
+            if pass_no:
+                print(f"history pass {pass_no + 1}: retrying {len(need)} counters")
+                time.sleep(15 * pass_no)                  # let the per-minute limit reset
+            fails_in_row = 0
+            for s in need:
+                if fails_in_row >= 5:                     # API looks down: stop hammering, retry next pass
+                    errors.setdefault(s, "skipped, API not answering")
+                    continue
+                got = self.broker.daily_closes(s, self.today)
+                if got is None:
+                    errors[s] = self.broker.last_candle_error or "no answer"
+                    fails_in_row += 1
+                else:
+                    fails_in_row = 0
+                    errors.pop(s, None)
+                    if len(got) >= len(self.closes.get(s, [])):
+                        self.closes[s] = got
+                time.sleep(0.5)                           # candle API limit is 3/sec and 180/min
+        good = {k: v for k, v in self.closes.items() if len(v) >= enough}
         with open(cache, "w") as f:
-            json.dump(self.closes, f)
-        thin = [s for s in self.universe if self.universe[s]["include"] and len(self.closes.get(s, [])) < RULES.rsi_period + 1]
-        if thin:
-            tg(f"ℹ️ Not enough daily history for RSI (left out today): {', '.join(thin)}")
+            json.dump(good, f)
+        thin = [s for s in self.universe if self.universe[s]["include"] and len(self.closes.get(s, [])) < enough]
+        if thin and alert:
+            failed = [s for s in thin if s in errors]
+            short = [s for s in thin if s not in errors]
+            parts = []
+            if failed:
+                parts.append(f"AngelOne did not return candles after retries: {', '.join(failed)}"
+                             f" (last error: {errors[failed[-1]]})")
+            if short:
+                parts.append("fewer than " + str(enough) + " daily closes (new listing or no trades): "
+                             + ", ".join(f"{s} ({len(self.closes.get(s, []))})" for s in short))
+            tg("ℹ️ Left out of today's RSI ranking. " + "; ".join(parts)
+               + ". They will not be picked for a new buy today.")
+        return thin
 
     def snapshot(self) -> Tuple[Dict[str, float], Dict[str, float]]:
         held = set(self.state["positions"]) | {l["sym"] for l in self.state["core"]}
@@ -1166,9 +1217,10 @@ class Bot:
             if not open_ok:
                 raise SkipDay(f"market closed today ({open_msg})")
             recon = self.reconcile()
-            self.load_history()
+            self.load_history(alert=False)
             # ---- 2:50 pm dry-run plan
             wait_until(at_ist(self.today, PLAN_TIME), self)
+            self.load_history()                       # re-fetch anything that failed earlier
             ltp, rsi = self.snapshot()
             sells = S.plan_sells(self.state, ltp, RULES, self.today, self.blocked)
             buys, notes = self.planned_buys_after_sells(ltp, rsi, sells)

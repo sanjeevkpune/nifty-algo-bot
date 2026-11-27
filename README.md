@@ -58,10 +58,11 @@ setup_vm_extras.sh          Run on boot by etf_dukan/setup_etf_dukan.sh: 15:45 s
 notify.py                   Shared Telegram sender (silent routine messages, no repeats)
 daily_summary.py            15:45 Telegram summary of every bot
 
-adaptive_strangle_v2.py     AngelOne adaptive strangle (file name kept: cron uses it; code is V4.2)
+adaptive_strangle_v2.py     AngelOne adaptive strangle (file name kept: cron uses it; code is V4.4)
 dhan_improved_with_filters.py  Dhan Lemonn dual-session v3 (file name kept: cron uses it)
 lemonn_nifty_sideways_v4_dhan.py  Dhan Lemonn v4 sideways straddle
 
+test_adaptive_exit.py            Offline tests of the AngelOne strangle's exit (fake broker): python3 test_adaptive_exit.py
 test_reliability.py              Read-only diagnostics for the AngelOne strangle bot
 test_lemonn_dhan_connectivity.py Pre-flight checks for the Dhan v3 bot (--order-test places and cancels test orders)
 test_lemonn_v4_connectivity.py   Read-only checks for the Dhan v4 bot

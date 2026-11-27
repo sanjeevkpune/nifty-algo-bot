@@ -12,6 +12,7 @@ import sys
 import os
 import time
 import json
+import math
 import datetime
 import traceback
 import signal
@@ -80,7 +81,7 @@ if missing_env:
     print(f"CRITICAL: missing environment variables: {', '.join(missing_env)}")
     sys.exit(1)
 
-STRATEGY_VERSION = "V4.3_ZERO_TOUCH"
+STRATEGY_VERSION = "V4.4_ZERO_TOUCH"
 
 # --- Mode -------------------------------------------------------------
 PAPER_MODE = env_bool("PAPER_MODE", True)          
@@ -135,6 +136,20 @@ STAMP_BUY_PCT = 0.00003
 EXIT_BLIND_IF_POSITIONS_UNAVAILABLE = env_bool("EXIT_BLIND_IF_POSITIONS_UNAVAILABLE", False)
 POSITION_READ_TRIES = env_int("POSITION_READ_TRIES", 4)
 FLAT_VERIFY_ROUNDS = env_int("FLAT_VERIFY_ROUNDS", 3)
+
+# --- Live exit execution (V4.4) ------------------------------------------
+# Exits no longer rely on a single MARKET order. Each attempt: make sure no earlier order on the
+# symbol is still live (cancel + wait for the broker to confirm), read the broker's net qty, send a
+# LIMIT priced through the best bid/ask (fills at once at the market price if there is any
+# liquidity), wait EXIT_WAIT_SECS, cancel and re-price wider if it did not fill.
+EXIT_WAIT_SECS = env_int("EXIT_WAIT_SECS", 6)
+EXIT_MAX_ATTEMPTS = env_int("EXIT_MAX_ATTEMPTS", 8)
+EXIT_LIMIT_BUFFERS_PCT = [float(x) for x in
+                          os.environ.get("EXIT_LIMIT_BUFFERS_PCT", "3,6,10,15,25,40,60,100").split(",") if x.strip()]
+EXIT_MIN_BUFFER_PTS = env_float("EXIT_MIN_BUFFER_PTS", 1.0)
+CANCEL_CONFIRM_SECS = env_int("CANCEL_CONFIRM_SECS", 8)
+MAX_ORDER_QTY = env_int("MAX_ORDER_QTY", 1755)     # one order stays under NSE's Nifty freeze qty (1800)
+TICK = 0.05
 
 NIFTY_SPOT_TOKEN = "99926000"
 TERMINAL_STATES = {"complete", "rejected", "cancelled", "canceled"}
@@ -481,6 +496,8 @@ class Bot:
             tg(f"❌ ORDER REJECTED: {side} {symbol} - {(info2 or {}).get('text', '')}")
             raise OrderError(f"{symbol} market order rejected")
         if st2 != "complete":
+            # Never leave an unconfirmed order live: it could fill later, behind the bot's back.
+            self._cancel_confirm(order_ids={str(oid2)}, reason=f"(unconfirmed {side} {symbol})")
             raise OrderError(f"{symbol} market order not confirmed (status={st2 or 'unknown'})")
             
         avg2 = float(info2.get("averageprice") or 0)
@@ -534,6 +551,43 @@ class Bot:
             print(f"orderBook error: {e}")
             return None
 
+    def _cancel_confirm(self, order_ids=None, symbols=None, reason="") -> bool:
+        """Cancel pending orders (all on the bot's symbols, or only the given ids / symbols) and WAIT
+        until the order book shows none of them pending. Returns False if that could not be confirmed,
+        in which case the caller must not send a new order (it could double up with the old one)."""
+        if PAPER_MODE:
+            return True
+
+        def targets(pend):
+            return [o for o in pend
+                    if (order_ids is None or str(o.get("orderid")) in order_ids)
+                    and (symbols is None or o.get("tradingsymbol") in symbols)]
+
+        deadline = time.time() + CANCEL_CONFIRM_SECS
+        sent = {}
+        while True:
+            pend = self.open_orders()
+            if pend is not None:
+                todo = targets(pend)
+                if not todo:
+                    if sent:
+                        print(f"Cancel confirmed for {len(sent)} order(s) {reason}")
+                    return True
+                for o in todo:
+                    oid = str(o.get("orderid"))
+                    if time.time() - sent.get(oid, 0) < 3:     # re-send a cancel at most every 3 s
+                        continue
+                    sent[oid] = time.time()
+                    try:
+                        res = self.smart.cancelOrder(oid, o.get("variety") or "NORMAL")
+                        print(f"Cancel sent {oid} {o.get('tradingsymbol')} ({self._status(o)}) {reason}: {res}")
+                    except Exception as e:
+                        print(f"Cancel failed for {oid}: {e}")
+            if time.time() >= deadline:
+                print(f"Could not confirm cancel {reason} (order book {'unreadable' if pend is None else 'still pending'})")
+                return False
+            time.sleep(ORDER_POLL_SECS)
+
     def cancel_pending_orders(self, reason="") -> int:
         if PAPER_MODE:
             return 0
@@ -541,17 +595,103 @@ class Bot:
         if pend is None:
             tg("⚠️ Could not read order book to cancel pending orders. Check Angel One for open orders.")
             return 0
-        cancelled = 0
-        for o in pend:
+        if not pend:
+            return 0
+        if self._cancel_confirm(reason=reason):
+            tg(f"🧹 Cancelled {len(pend)} pending order(s) {reason}".strip())
+        else:
+            tg(f"⚠️ Cancel of {len(pend)} pending order(s) {reason} NOT confirmed by the broker.".strip())
+        return len(pend)
+
+    def _quote(self, token) -> Dict[str, float]:
+        """LTP, best bid / ask and circuit limits for one NFO token (empty dict if unavailable)."""
+        try:
+            res = self.smart.getMarketData("FULL", {"NFO": [str(token)]})
+            rows = ((res or {}).get("data") or {}).get("fetched") or []
+            if rows:
+                r = rows[0]
+                depth = r.get("depth") or {}
+                buy = [float(d.get("price") or 0) for d in (depth.get("buy") or []) if float(d.get("price") or 0) > 0]
+                sell = [float(d.get("price") or 0) for d in (depth.get("sell") or []) if float(d.get("price") or 0) > 0]
+                return {"ltp": float(r.get("ltp") or 0), "bid": max(buy) if buy else 0.0,
+                        "ask": min(sell) if sell else 0.0,
+                        "upper": float(r.get("upperCircuit") or 0), "lower": float(r.get("lowerCircuit") or 0)}
+        except Exception as e:
+            print(f"FULL quote error for {token}: {e}")
+        ltp = self.get_ltp_retry("NFO", token, tries=2)
+        return {"ltp": ltp} if ltp else {}
+
+    @staticmethod
+    def _exit_limit_price(side, q, attempt) -> float:
+        """Aggressive limit: through the best ask (BUY) / bid (SELL), wider on every attempt,
+        kept inside the exchange's circuit limits and on the 0.05 tick."""
+        buf = EXIT_LIMIT_BUFFERS_PCT[min(attempt, len(EXIT_LIMIT_BUFFERS_PCT) - 1)] / 100.0
+        ltp, bid, ask = q.get("ltp") or 0, q.get("bid") or 0, q.get("ask") or 0
+        if side == "BUY":
+            ref = max(ltp, ask)
+            px = max(ref * (1 + buf), ref + EXIT_MIN_BUFFER_PTS)
+            if q.get("upper"):
+                px = min(px, q["upper"])
+            return round(math.ceil(round(px / TICK, 6)) * TICK, 2)
+        ref = min(x for x in (ltp, bid) if x > 0) if (ltp > 0 or bid > 0) else 0
+        px = min(ref * (1 - buf), ref - EXIT_MIN_BUFFER_PTS)
+        if q.get("lower"):
+            px = max(px, q["lower"])
+        return max(TICK, round(math.floor(round(px / TICK, 6)) * TICK, 2))
+
+    def flatten_symbol(self, sym, token):
+        """Bring the broker's net position in `sym` to zero.
+        Returns (ok, fills, last_problem); fills = [(side, qty, avg_px), ...] of what actually traded.
+        The broker's position is re-read before every order, so partial fills are never doubled."""
+        fills, problem, use_market = [], "", False
+        for attempt in range(EXIT_MAX_ATTEMPTS):
+            if not self._cancel_confirm(symbols={sym}, reason=f"before exit attempt {attempt + 1} on {sym}"):
+                problem = "an earlier order could not be cancelled"
+                continue
+            net = self.get_net_positions()
+            if net is None:
+                problem = "broker positions unreadable"
+                continue
+            n = net.get(sym, 0)
+            if n == 0:
+                return True, fills, ""
+            side = "BUY" if n < 0 else "SELL"
+            qty = min(abs(n), MAX_ORDER_QTY)
+            q = {} if use_market else self._quote(token)
+            if q.get("ltp") or q.get("ask") or q.get("bid"):
+                otype, px = "LIMIT", self._exit_limit_price(side, q, attempt)
+            else:
+                otype, px = "MARKET", 0.0
+            use_market = False
+            print(f"Exit attempt {attempt + 1}: {side} {qty} {sym} {otype} {px or ''} (broker net {n}, quote {q})")
             try:
-                self.smart.cancelOrder(o.get("orderid"), o.get("variety") or "NORMAL")
-                cancelled += 1
-                print(f"Cancelled pending order {o.get('orderid')} {o.get('tradingsymbol')} ({self._status(o)}) {reason}")
-            except Exception as e:
-                print(f"Cancel failed for {o.get('orderid')}: {e}")
-        if cancelled:
-            tg(f"🧹 Cancelled {cancelled} pending order(s) {reason}".strip())
-        return cancelled
+                oid = self._place(sym, token, side, qty, otype, px)
+            except OrderError as e:
+                problem = str(e)
+                time.sleep(1)
+                continue
+            info = self._wait_terminal(oid, EXIT_WAIT_SECS)
+            st = self._status(info)
+            if st != "complete" and st not in TERMINAL_STATES:
+                self._cancel_confirm(order_ids={str(oid)}, reason=f"(exit attempt {attempt + 1} not filled, re-pricing)")
+                info = self._order_info(oid) or info
+                st = self._status(info)
+            filled = int(float((info or {}).get("filledshares") or 0))
+            if st == "complete" and not filled:
+                filled = qty
+            if filled:
+                avg = float((info or {}).get("averageprice") or 0) or px or (q.get("ltp") or 0)
+                fills.append((side, filled, avg))
+            if st == "rejected":
+                problem = f"{otype} order rejected: {(info or {}).get('text', '')}"
+                tg(f"❌ Exit order rejected: {side} {qty} {sym} {otype} {px or ''} - {(info or {}).get('text', '')}. Retrying.")
+                use_market = otype == "LIMIT"     # a limit rejected (e.g. price band) -> try one MARKET next
+            elif st != "complete":
+                problem = f"{otype} order not filled in {EXIT_WAIT_SECS}s (status {st or 'unknown'})"
+        net = self.get_net_positions()
+        if net is not None and net.get(sym, 0) == 0 and self._cancel_confirm(symbols={sym}, reason="(final check)"):
+            return True, fills, ""
+        return False, fills, problem or "not flat after all attempts"
 
     def close_leg(self, leg: Leg, ref_ltp, force_market=False):
         expected = -leg.qty if leg.side == "SELL" else leg.qty
@@ -587,13 +727,29 @@ class Bot:
                     tg(f"⚠️ {leg.symbol}: broker net qty {actual} differs from bot record {expected}. Closing the broker quantity ({abs(actual)}).")
                     qty_to_close, status = abs(actual), "partial"
 
-        px = self.execute(leg.symbol, leg.token, close_side, qty_to_close, ref_ltp, force_market)
-        self.ledger.record(close_side, px, qty_to_close)
+        if PAPER_MODE:
+            px = self.execute(leg.symbol, leg.token, close_side, qty_to_close, ref_ltp, force_market)
+            self.ledger.record(close_side, px, qty_to_close)
+        else:
+            ok, fills, problem = self.flatten_symbol(leg.symbol, leg.token)
+            for f_side, f_qty, f_px in fills:
+                self.ledger.record(f_side, f_px, f_qty)
+            if not ok:
+                raise OrderError(f"{leg.symbol} exit not completed: {problem}")
+            px = self._avg_fill(fills, close_side) or ref_ltp or leg.entry_px
+        return self._book_close(leg, px, qty_to_close), status
+
+    @staticmethod
+    def _avg_fill(fills, side) -> float:
+        q = sum(f[1] for f in fills if f[0] == side)
+        return round(sum(f[1] * f[2] for f in fills if f[0] == side) / q, 2) if q else 0.0
+
+    def _book_close(self, leg: Leg, px, qty) -> float:
         leg.exit_px, leg.active = px, False
-        pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * qty_to_close
+        pnl = ((leg.entry_px - px) if leg.side == "SELL" else (px - leg.entry_px)) * qty
         self.realized += pnl
         self.save_state()
-        return pnl, status
+        return pnl
 
     def verify_flat(self) -> bool:
         if PAPER_MODE:
@@ -613,6 +769,8 @@ class Bot:
             if leftover:
                 tg(f"⚠️ Round {rnd}: still open after exit: {leftover}. Closing again.")
                 self.emergency_square_off(f"post-exit leftovers {leftover}")
+            elif pend:
+                print(f"verify_flat round {rnd}: {len(pend)} order(s) still pending after cancel")
         net = self.get_net_positions()
         pend = self.open_orders()
         leftover = None if net is None else {s: q for s, q in net.items() if q != 0}
@@ -655,13 +813,18 @@ class Bot:
         for _, sym, tok, net in todo:
             side = "BUY" if net < 0 else "SELL"
             try:
-                oid = self._place(sym, tok, side, abs(net), "MARKET", 0)
-                info = self._wait_terminal(oid, MARKET_WAIT_SECS)
-                if self._status(info) != "complete":
-                    failed.append(sym)
+                ok, fills, problem = self.flatten_symbol(sym, tok)
             except Exception as e:
-                print(f"Emergency close failed for {sym}: {e}")
-                failed.append(sym)
+                ok, fills, problem = False, [], f"error: {e}"
+            for f_side, f_qty, f_px in fills:
+                self.ledger.record(f_side, f_px, f_qty)
+            if ok:   # book the P&L of the bot's legs in this symbol (otherwise the day's P&L misses it)
+                px = self._avg_fill(fills, side)
+                for leg in [l for l in self.legs if l.active and l.symbol == sym]:
+                    self._book_close(leg, px or self.last_q.get(leg.token) or leg.entry_px, leg.qty)
+            else:
+                print(f"Emergency close failed for {sym}: {problem}")
+                failed.append(f"{sym} ({problem})")
         if failed:
             tg(f"🚨 STILL OPEN after emergency exit: {', '.join(failed)}. CLOSE MANUALLY NOW.")
         else:
