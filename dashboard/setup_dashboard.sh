@@ -7,7 +7,8 @@
 #   1. Creates /etc/trade-config/dashboard.env once, with a random password (never in the repo).
 #   2. Installs and (re)starts the systemd service "strategy-dashboard" (python3 dashboard/server.py, port 8080).
 #   3. Sends the address (and, the first time, the password) to your Telegram chat.
-# Port 8080 is opened by the "Dashboard Network Setup" GitHub workflow (run once).
+# Port 8080 is opened by the manual GCP firewall rule "allow-strategy-dashboard-8080" (TCP 8080, VMs with
+# network tag "strategy-dashboard"), made by hand in the console.
 set -u
 
 USER_NAME="${1:-kumar_sanjeev_pune}"
