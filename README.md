@@ -49,7 +49,6 @@ caps the system journal at 200 MB and empties the apt cache on every boot.
 .github/workflows/
   vm-deploy.yml             Manual: push startup.sh + secrets to VM metadata (optionally re-run it now)
   etf-dukan-check.yml       Manual: runs etf_dukan/check_setup.py on the VM
-  dashboard-network.yml     Manual, once: opens port 8080 for the dashboard
 startup.sh                  VM boot script: packages, clone/pull main, /etc/trade-config/config.env, crontab
 requirements.txt            Python packages for the root bots
 cleanup_logs.sh             Daily 09:00: old log folders, run locks, old state files, ETF caches, disk alert

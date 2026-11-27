@@ -22,12 +22,14 @@ existing `service_account.json`, and the login lives in `/etc/trade-config/dashb
 * `etf_dukan/setup_etf_dukan.sh` (already run by `startup.sh` on every boot or sync) calls
   `dashboard/setup_dashboard.sh`, which installs the `strategy-dashboard` systemd service.
   The first time, it makes a random password and sends the address and password to Telegram.
-* **Once:** run the GitHub workflow **Dashboard Network Setup** (`open`) to open port 8080 in the
-  Google Cloud firewall. Set `source_ranges` to `<your IP>/32` to allow only your own connection.
+* Port 8080 is opened by a Google Cloud firewall rule made by hand in the console (VPC network ->
+  Firewall): `allow-strategy-dashboard-8080`, ingress, allow TCP 8080, target tag `strategy-dashboard`.
+  The VM carries the network tag `strategy-dashboard` (VM -> Edit -> Network tags). Set the rule's
+  source range to `<your IP>/32` to allow only your own connection.
 * Address: `http://<VM static IP>:8080`, user `admin`. It is up only while the VM runs (the GCP instance schedule, about 08:15 to 16:00 IST).
 
 The page refreshes every minute; the server caches sheet reads for 60 seconds.
-Plain HTTP: the password crosses the network unencrypted, so prefer a locked-down `source_ranges`.
+Plain HTTP: the password crosses the network unencrypted, so prefer a firewall rule locked to your own IP.
 
 ## On the VM
 
