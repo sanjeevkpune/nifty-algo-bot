@@ -27,6 +27,8 @@ lock and state files, fill checks, `PAPER_MODE`, crash handling.
 - **3:10 pm buys.** There is one ETF slot and one stock slot, ₹40k each, in whole shares. Each slot buys the
   lowest-RSI name it doesn't already hold among the 8 lowest-RSI ETFs (or the 2 lowest-RSI stocks).
   There are at most 30 open positions, and Core lots don't count.
+  A counter sold today (target sell or Core 3x sell) is never bought back the same day; the slot moves to the
+  next unheld name on the shortlist. `EKD_REBUY_GAP_DAYS` (default 0) can make that wait longer; -1 turns it off.
 - **Averaging.** At most 1 averaging buy a day (₹40k), and only in a shop whose slot made no new buy. It buys
   the holding that is most negative vs its last buy price, if it's at or below -4% (ETF) or -8% (stock).
 - **RSI(14).** Wilder RSI on AngelOne daily closes, with today's live price as the last close.
