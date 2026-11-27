@@ -10,7 +10,7 @@ name: Deploy to VM (manual)
 #
 # What it does: copies startup.sh and the secrets into the VM metadata. If the VM is running and you
 # picked "update + re-run now", it also re-runs the startup script (pull code, rewrite config, crontab).
-# Re-running is refused from 09:00 to 15:35 IST (bots are trading) unless you tick "force".
+# Re-running is refused from 09:00 to 15:45 IST (bots are trading) unless you tick "force".
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ on:
           - update metadata only
           - update + re-run now
       force:
-        description: 'Allow re-run during market hours (09:00-15:35 IST)'
+        description: 'Allow re-run during market hours (09:00-15:45 IST)'
         type: boolean
         default: false
 
@@ -77,8 +77,8 @@ jobs:
           fi
           HHMM=$(TZ=Asia/Kolkata date +%H%M)
           DOW=$(TZ=Asia/Kolkata date +%u)
-          if [ "$FORCE" != "true" ] && [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0900 ] && [ "$HHMM" -le 1535 ]; then
-            echo "::error::It is $HHMM IST on a weekday: bots may be trading. Re-run after 15:35 IST, or tick 'force'."
+          if [ "$FORCE" != "true" ] && [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0900 ] && [ "$HHMM" -le 1545 ]; then
+            echo "::error::It is $HHMM IST on a weekday: bots may be trading. Re-run after 15:45 IST, or tick 'force'."
             exit 1
           fi
           gcloud compute ssh "${VM_USER}@${VM_NAME}" --zone="$ZONE" --project="$PROJECT_ID" --quiet \

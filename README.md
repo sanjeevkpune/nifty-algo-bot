@@ -13,7 +13,7 @@ They run on one Google Cloud VM that is started and stopped by a **GCP instance 
 |---|---|---|---|---|---|
 | 09:08 → 15:20 | NIFTY sideways ATM straddle (Lemonn v4) + watchdog every 10 min | `lemonn_nifty_sideways_v4_dhan.py` | Dhan | Paper until 31 Dec 2026, then live only with `DHAN_V4_LIVE=1` | `dhan_v4.log` |
 | 09:30 | NIFTY + SENSEX dual-session strangle (Lemonn v3) | `dhan_improved_with_filters.py` | Dhan | Paper until 31 Dec 2026, then `DHAN_PAPER_MODE` | `dhan_improved.log` |
-| 09:39 | Adaptive strangle | `adaptive_strangle_v2.py` | AngelOne | `PAPER_MODE` in config.env (startup.sh sets 0 = live) | `algo_trade_v2.log` |
+| 09:39 → 15:35 | Adaptive strangle (exit time `EXIT_TIME`, default 15:35) | `adaptive_strangle_v2.py` | AngelOne | `PAPER_MODE` in config.env (startup.sh sets 0 = live) | `algo_trade_v2.log` |
 | 14:45 | ETF ki Dukan | `etf_dukan/etf_dukan_bot.py run` | AngelOne | Paper unless repo variable `EKD_PAPER_MODE` is `0` | `etf_dukan/logs/cron.log` |
 | 15:45 | Daily summary of all bots to Telegram (reads the bots' files only) | `daily_summary.py` | none | n/a | `daily_summary.log` |
 | 09:00 daily, logrotate hourly | Disk housekeeping | `cleanup_logs.sh`, `bot_logrotate.conf` | none | n/a | `cleanup.log` |
@@ -58,10 +58,11 @@ setup_vm_extras.sh          Run on boot by etf_dukan/setup_etf_dukan.sh: 15:45 s
 notify.py                   Shared Telegram sender (silent routine messages, no repeats)
 daily_summary.py            15:45 Telegram summary of every bot
 
-adaptive_strangle_v2.py     AngelOne adaptive strangle (file name kept: cron uses it; code is V4.2)
+adaptive_strangle_v2.py     AngelOne adaptive strangle (file name kept: cron uses it; code is V4.4)
 dhan_improved_with_filters.py  Dhan Lemonn dual-session v3 (file name kept: cron uses it)
 lemonn_nifty_sideways_v4_dhan.py  Dhan Lemonn v4 sideways straddle
 
+test_adaptive_exit.py            Offline tests of the AngelOne strangle's exit (fake broker): python3 test_adaptive_exit.py
 test_reliability.py              Read-only diagnostics for the AngelOne strangle bot
 test_lemonn_dhan_connectivity.py Pre-flight checks for the Dhan v3 bot (--order-test places and cancels test orders)
 test_lemonn_v4_connectivity.py   Read-only checks for the Dhan v4 bot
@@ -82,7 +83,7 @@ all assume `~/trading-bot/<script>.py`. Moving a script means changing `startup.
    `service_account.json`, installs the crontab and runs `etf_dukan/setup_etf_dukan.sh` (which also runs
    `setup_vm_extras.sh` and the dashboard setup). Code changes need nothing else.
 3. Only when a **GitHub Secret/Variable** or **`startup.sh` itself** changed, run the **Deploy to VM** workflow by hand
-   (`update metadata only`, or `update + re-run now` to apply it to a running VM; refused 09:00-15:35 IST unless forced).
+   (`update metadata only`, or `update + re-run now` to apply it to a running VM; refused 09:00-15:45 IST unless forced).
 
 Merging during market hours is safe: the running VM only pulls on boot or a manual re-run.
 
