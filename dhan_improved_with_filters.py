@@ -205,6 +205,7 @@ class Leg:
     sl_limit_px: float = 0.0
     exit_px: float = 0.0
     exit_reason: str = ""
+    sheet_logged: bool = False   # row already written to the Lemonn_Dual_v3 tab
 
     def pnl(self, px: float) -> float:
         return (self.entry_px - px) * self.qty if self.side == "SELL" else (px - self.entry_px) * self.qty
@@ -223,6 +224,8 @@ class LemonnDualSessionBot:
         self.phase = "init"     # init -> morning_open -> morning_done -> afternoon_open -> done
         self.halted = False
         self._last_feed_call = 0.0
+        self._ws = None              # cached Lemonn_Dual_v3 worksheet
+        self._sheet_retry_at = 0.0   # after a failed write, wait before trying again
         self.state_path = os.path.join(STATE_DIR, f"lemonn_dual_{self.today:%Y%m%d}.json")
 
     # ----------------------------------------------------------
@@ -251,6 +254,12 @@ class LemonnDualSessionBot:
             self.halted = st.get("halted", False)
             self.realized_pnl = float(st.get("realized_pnl", 0.0))
             self.legs = [Leg(**d) for d in st.get("legs", [])]
+            # A finished day saved by the older code (no sheet_logged flag) was already
+            # written at day end - don't write it again.
+            if self.phase == "done":
+                for d, l in zip(st.get("legs", []), self.legs):
+                    if "sheet_logged" not in d:
+                        l.sheet_logged = True
             msg = (f"♻️ Resumed state: phase={self.phase}, active legs={sum(l.active for l in self.legs)}, "
                    f"realised ₹{self.realized_pnl:,.0f}")
             if self.phase in ("init", "done"):
@@ -668,6 +677,7 @@ class LemonnDualSessionBot:
             tg(f"↩️ {session} unwinding ({why}).")
             for l in [l for l in opened if l.side == "SELL"] + [l for l in opened if l.side == "BUY"]:
                 self.close_leg(l, ltp.get(l.token, 0.0), "UNWIND")
+            self.flush_sheet(force=True)
 
         # 1) Protection first (buying first lowers the margin needed for the sells)
         for opt, c in hedges:
@@ -726,6 +736,7 @@ class LemonnDualSessionBot:
     def monitor_until(self, exit_time: datetime.datetime):
         gap_through = {}
         while now_ist() < exit_time and not self.halted:
+            self.flush_sheet()   # legs closed in the last loop (after the survivor's stop was moved)
             active = [l for l in self.legs if l.active]
             if not any(l.side == "SELL" for l in active):
                 break
@@ -786,6 +797,7 @@ class LemonnDualSessionBot:
             if rem:
                 ltp = self.ltp_batch(FNO_SEG, [l.token for l in rem])
                 self.close_all(ltp, "TIME_EXIT")
+        self.flush_sheet(force=True)
 
     # ----------------------------------------------------------
     # Reconciliation after restart
@@ -855,23 +867,45 @@ class LemonnDualSessionBot:
     # ----------------------------------------------------------
     # Logging
     # ----------------------------------------------------------
-    def log_sheet(self):
-        if not gspread or not GSHEET_ID_V2 or not os.path.exists(SERVICE_ACCOUNT_FILE):
-            return
-        try:
+    def _sheet(self):
+        if self._ws is None:
             sh = gspread.service_account(filename=SERVICE_ACCOUNT_FILE).open_by_key(GSHEET_ID_V2)
             try:
-                ws = sh.worksheet("Lemonn_Dual_v3")
+                self._ws = sh.worksheet("Lemonn_Dual_v3")
             except Exception:
-                ws = sh.add_worksheet(title="Lemonn_Dual_v3", rows="2000", cols="12")
-                ws.append_row(["Date", "Index", "Session", "Leg", "Side", "Symbol", "Qty", "Entry", "Exit",
-                               "Reason", "Leg_PnL", "Paper"])
-            for l in self.legs:
-                ws.append_row([str(self.today), INDEX, l.session, l.opt_type + (" hedge" if l.is_hedge else ""),
-                               l.side, l.symbol, l.qty, l.entry_px, l.exit_px, l.exit_reason,
-                               round(l.pnl(l.exit_px), 2) if not l.active else "", PAPER_MODE])
+                self._ws = sh.add_worksheet(title="Lemonn_Dual_v3", rows="2000", cols="12")
+                self._ws.append_row(["Date", "Index", "Session", "Leg", "Side", "Symbol", "Qty", "Entry", "Exit",
+                                     "Reason", "Leg_PnL", "Paper"])
+        return self._ws
+
+    def _row(self, l: Leg) -> list:
+        return [str(self.today), INDEX, l.session, l.opt_type + (" hedge" if l.is_hedge else ""),
+                l.side, l.symbol, l.qty, l.entry_px, l.exit_px, l.exit_reason,
+                round(l.pnl(l.exit_px), 2) if not l.active else "", PAPER_MODE]
+
+    def flush_sheet(self, force: bool = False, include_open: bool = False):
+        """Write each leg to the sheet as soon as it closes (one row per leg, same
+        columns as before). The sheet_logged flag is saved in the state file, so a
+        restart or the end-of-day pass never writes a leg twice. A failed write is
+        retried on a later loop (60 s back-off) and again at day end."""
+        if not gspread or not GSHEET_ID_V2 or not os.path.exists(SERVICE_ACCOUNT_FILE):
+            return
+        todo = [l for l in self.legs if not l.sheet_logged and (include_open or not l.active)]
+        if not todo or (not force and time.time() < self._sheet_retry_at):
+            return
+        try:
+            self._sheet().append_rows([self._row(l) for l in todo])
+            for l in todo:
+                l.sheet_logged = True
+            self.save_state()
         except Exception as e:
-            print(f"⚠️ Sheet logging failed: {e}")
+            self._ws = None
+            self._sheet_retry_at = time.time() + 60
+            print(f"⚠️ Sheet logging failed (will retry): {e}")
+
+    def log_sheet(self):
+        """Day end: write only what is still missing (normally nothing)."""
+        self.flush_sheet(force=True, include_open=True)
 
     # ----------------------------------------------------------
     # Main flow
@@ -891,6 +925,7 @@ class LemonnDualSessionBot:
 
         self.load_state()
         if self.phase == "done":
+            self.log_sheet()   # writes only legs a crash kept out of the sheet
             return print("Today's sessions are already complete.")
         self.login()
         self.load_master()
