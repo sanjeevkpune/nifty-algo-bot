@@ -11,9 +11,9 @@ They run on one Google Cloud VM that is started and stopped by a **GCP instance 
 
 | Time | Bot | File | Broker | Mode | Log |
 |---|---|---|---|---|---|
-| 09:08 → 15:35 | NIFTY sideways ATM straddle (Lemonn v4; exit `DHAN_V4_EXIT`, default 15:35) + watchdog every 10 min | `lemonn_nifty_sideways_v4_dhan.py` | Dhan | Paper until 31 Dec 2026, then live only with `DHAN_V4_LIVE=1` | `dhan_v4.log` |
-| 09:30 → 15:35 | NIFTY + SENSEX dual-session strangle (Lemonn v3; afternoon exit `DHAN_V3_PM_EXIT`, default 15:35) | `dhan_improved_with_filters.py` | Dhan | Paper until 31 Dec 2026, then `DHAN_PAPER_MODE` | `dhan_improved.log` |
-| 09:39 → 15:35 | Adaptive strangle (exit time `EXIT_TIME`, default 15:35) | `adaptive_strangle_v2.py` | AngelOne | `PAPER_MODE` in config.env (startup.sh sets 0 = live) | `algo_trade_v2.log` |
+| 09:08 → 15:20 | NIFTY sideways ATM straddle (Lemonn v4) + watchdog every 10 min | `lemonn_nifty_sideways_v4_dhan.py` | Dhan | Paper until 31 Dec 2026, then live only with `DHAN_V4_LIVE=1` | `dhan_v4.log` |
+| 09:30 | NIFTY + SENSEX dual-session strangle (Lemonn v3) | `dhan_improved_with_filters.py` | Dhan | Paper until 31 Dec 2026, then `DHAN_PAPER_MODE` | `dhan_improved.log` |
+| 09:39 | Adaptive strangle | `adaptive_strangle_v2.py` | AngelOne | `PAPER_MODE` in config.env (startup.sh sets 0 = live) | `algo_trade_v2.log` |
 | 14:45 | ETF ki Dukan | `etf_dukan/etf_dukan_bot.py run` | AngelOne | Paper unless repo variable `EKD_PAPER_MODE` is `0` | `etf_dukan/logs/cron.log` |
 | 15:45 | Daily summary of all bots to Telegram (reads the bots' files only) | `daily_summary.py` | none | n/a | `daily_summary.log` |
 | 09:00 daily, logrotate hourly | Disk housekeeping | `cleanup_logs.sh`, `bot_logrotate.conf` | none | n/a | `cleanup.log` |
@@ -83,7 +83,7 @@ all assume `~/trading-bot/<script>.py`. Moving a script means changing `startup.
    `service_account.json`, installs the crontab and runs `etf_dukan/setup_etf_dukan.sh` (which also runs
    `setup_vm_extras.sh` and the dashboard setup). Code changes need nothing else.
 3. Only when a **GitHub Secret/Variable** or **`startup.sh` itself** changed, run the **Deploy to VM** workflow by hand
-   (`update metadata only`, or `update + re-run now` to apply it to a running VM; refused 09:00-15:45 IST unless forced).
+   (`update metadata only`, or `update + re-run now` to apply it to a running VM; refused 09:00-15:35 IST unless forced).
 
 Merging during market hours is safe: the running VM only pulls on boot or a manual re-run.
 

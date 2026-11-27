@@ -50,7 +50,7 @@ class Rules:
     withdrawal: float = 15_000.0
     withdraw_after_months: int = 6
     keep_back: float = 15_000.0
-    rebuy_gap_days: int = 0           # no new buy of a counter sold within this many calendar days (0 = same day only, -1 = off)
+    rebuy_gap_days: int = 7           # no new buy of a counter sold within this many calendar days (0 = same day only, -1 = off)
     keep_back_months_before: int = 1  # backtest kept the Rs 15k back from 1 month before withdrawals start
     # per-symbol overrides: {"GOLDBEES": (target, avg_level)}
     symbol_levels: Dict[str, Tuple[float, float]] = field(default_factory=dict)

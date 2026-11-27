@@ -174,7 +174,7 @@ def rules_from_env() -> S.Rules:
         stock_shortlist=env_int("EKD_STOCK_SHORTLIST", 2), rsi_period=env_int("EKD_RSI_PERIOD", 14),
         max_sells_per_day=env_int("EKD_MAX_SELLS_PER_DAY", 1), max_avg_per_day=env_int("EKD_MAX_AVG_PER_DAY", 1),
         withdrawal=env_float("EKD_WITHDRAWAL", 15_000), withdraw_after_months=env_int("EKD_WITHDRAW_AFTER_MONTHS", 6),
-        keep_back=env_float("EKD_KEEP_BACK", 15_000), rebuy_gap_days=env_int("EKD_REBUY_GAP_DAYS", 0))
+        keep_back=env_float("EKD_KEEP_BACK", 15_000), rebuy_gap_days=env_int("EKD_REBUY_GAP_DAYS", 7))
     # EKD_SYMBOL_LEVELS=GOLDBEES:0.05:-0.04,SILVERBEES:0.05:-0.04 (not needed: gold/silver use the ETF levels)
     for item in [x for x in env("EKD_SYMBOL_LEVELS", "").split(",") if x.strip()]:
         sym, tgt, avg = item.split(":")

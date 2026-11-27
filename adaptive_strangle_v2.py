@@ -92,8 +92,7 @@ NUM_LOTS = env_int("NUM_LOTS", 4)
 FALLBACK_LOT_SIZE = env_int("FALLBACK_LOT_SIZE", 65)
 ENTRY_HOUR, ENTRY_MIN = 9, 50
 ENTRY_GRACE_MIN = env_int("ENTRY_GRACE_MIN", 5)
-# Time exit (config.env EXIT_TIME=HH:MM, IST). 15:35 since 27 Nov 2026 (market now closes 15:40).
-EXIT_HOUR, EXIT_MIN = (int(x) for x in (os.environ.get("EXIT_TIME") or "15:35").split(":"))
+EXIT_HOUR, EXIT_MIN = 15, 10
 
 DELTA_WIDTH_MULTIPLIER = env_float("DELTA_WIDTH_MULTIPLIER", 1.25)
 MAX_OPENING_RANGE_PTS = env_float("MAX_OPENING_RANGE_PTS", 140.0)
@@ -1092,7 +1091,7 @@ class Bot:
                 exit_reason, force_market = "Stop signal received - exiting all positions", True
                 break
             if now >= exit_time:
-                exit_reason = f"Time Exit ({EXIT_HOUR}:{EXIT_MIN:02d})"
+                exit_reason = "Time Exit (3:10 PM)"
                 break
 
             active_legs = self.active()

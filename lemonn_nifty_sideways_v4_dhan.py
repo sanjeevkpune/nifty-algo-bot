@@ -18,7 +18,7 @@ Mirrors Tradetron strategy "Nifty Sideways-Day ATM Straddle Seller v4"
           4. 5-minute ADX(14) of NIFTY below 20
   * Sell the ATM CE + PE (strike = spot rounded to 50).
   * Combined stop: exit both legs when CE + PE premium rises 40% above the
-    combined entry premium. Hard exit 15:35 (was 15:20 until 27 Nov 2026; config.env DHAN_V4_EXIT=HH:MM).
+    combined entry premium. Hard exit 15:20.
 
 Same safety framework as lemonn_dual_session_final_dhan_v3.py:
   fill-checked orders (limit -> stepped limit -> market), one-leg unwind,
@@ -114,10 +114,7 @@ VWAP_BAND = 0.0025             # future within 0.25% of VWAP
 ADX_PERIOD, ADX_MAX = 14, 20.0
 COMBINED_SL = 1.40             # exit when CE+PE >= 1.4 x entry
 REF_TIME, REF_LAST = (9, 20), (9, 30)
-ENTRY, ENTRY_LAST = (10, 0), (10, 5)
-# Hard time exit: 15:35 since 27 Nov 2026 (market now closes 15:40).
-EXIT = tuple(int(x) for x in (os.environ.get("DHAN_V4_EXIT") or "15:35").split(":"))
-EXIT_HHMM = f"{EXIT[0]}{EXIT[1]:02d}"
+ENTRY, ENTRY_LAST, EXIT = (10, 0), (10, 5), (15, 20)
 
 # --- Risk / execution extras (do not change the rules) ---
 DAILY_HARD_STOP = float(os.environ.get("DAILY_HARD_STOP", "-45000"))
@@ -616,7 +613,7 @@ class LemonnV4Bot:
         self.save_state()
         tg(f"🟢 SOLD NIFTY {k} straddle ({self.expiry}) x{qty}\n"
            f"CE ₹{opened[0].entry_px:.2f} + PE ₹{opened[1].entry_px:.2f} = ₹{e:.2f}\n"
-           f"Combined stop ₹{e * COMBINED_SL:.2f} (+40%), exit {EXIT[0]}:{EXIT[1]:02d}"
+           f"Combined stop ₹{e * COMBINED_SL:.2f} (+40%), exit 15:20"
            + (f"\nBackup exchange stops at {BACKUP_SL_MULT}x each leg" if any(l.sl_order_id for l in opened) else ""))
         return True
 
@@ -666,7 +663,7 @@ class LemonnV4Bot:
             time.sleep(1.5)
         if any(l.active for l in self.legs):
             ltp = self.ltp_batch(FNO_SEG, [l.token for l in self.legs if l.active])
-            self.close_all(ltp, f"TIME_EXIT_{EXIT_HHMM}")
+            self.close_all(ltp, "TIME_EXIT_1520")
 
     # ----------------------------------------------------------
     # Orders
