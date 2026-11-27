@@ -12,7 +12,7 @@ They run on one Google Cloud VM that is started and stopped by a **GCP instance 
 | Time | Bot | File | Broker | Mode | Log |
 |---|---|---|---|---|---|
 | 09:08 → 15:20 | NIFTY sideways ATM straddle (Lemonn v4) + watchdog every 10 min | `lemonn_nifty_sideways_v4_dhan.py` | Dhan | Paper until 31 Dec 2026, then live only with `DHAN_V4_LIVE=1` | `dhan_v4.log` |
-| 09:30 | NIFTY + SENSEX dual-session strangle (Lemonn v3) | `dhan_improved_with_filters.py` | Dhan | Paper until 31 Dec 2026, then `DHAN_PAPER_MODE` | `dhan_improved.log` |
+| 09:30 → 15:35 | NIFTY + SENSEX dual-session strangle (Lemonn v3; afternoon exit `DHAN_V3_PM_EXIT`, default 15:35) | `dhan_improved_with_filters.py` | Dhan | Paper until 31 Dec 2026, then `DHAN_PAPER_MODE` | `dhan_improved.log` |
 | 09:39 → 15:35 | Adaptive strangle (exit time `EXIT_TIME`, default 15:35) | `adaptive_strangle_v2.py` | AngelOne | `PAPER_MODE` in config.env (startup.sh sets 0 = live) | `algo_trade_v2.log` |
 | 14:45 | ETF ki Dukan | `etf_dukan/etf_dukan_bot.py run` | AngelOne | Paper unless repo variable `EKD_PAPER_MODE` is `0` | `etf_dukan/logs/cron.log` |
 | 15:45 | Daily summary of all bots to Telegram (reads the bots' files only) | `daily_summary.py` | none | n/a | `daily_summary.log` |

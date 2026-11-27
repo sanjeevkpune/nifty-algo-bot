@@ -17,7 +17,7 @@ Mirrors Tradetron strategy "Lemonn Dual Session NIFTY+SENSEX Final"
   * AFTERNOON 14:16-14:30 (NIFTY) / 13:35-13:45 (SENSEX): skipped if both
     morning legs were stopped or the morning realised P&L is <= -12,000.
     Synthetic-future ATM short straddle (spot + CE_atm - PE_atm), same stops.
-    Time exit 15:28.
+    Time exit 15:35 (was 15:28 until 27 Nov 2026; config.env DHAN_V3_PM_EXIT=HH:MM).
 
 What changed from your v2.1 file (the trading rules above are unchanged):
   1. Fill-or-flag order execution. v2.1 returned the reference price even when
@@ -132,7 +132,9 @@ P = PROFILES[INDEX]
 STRIKE_STEP = P["step"]
 MAX_ORB_PTS = P["orb"]
 M_ENTRY, M_ENTRY_LAST, M_EXIT = (9, 50), (10, 0), P["m_exit"]
-A_ENTRY, A_ENTRY_LAST, A_EXIT = P["a_entry"], P["a_last"], (15, 28)
+A_ENTRY, A_ENTRY_LAST = P["a_entry"], P["a_last"]
+# Afternoon time exit: 15:35 since 27 Nov 2026 (market now closes 15:40). Morning exits unchanged.
+A_EXIT = tuple(int(x) for x in (os.environ.get("DHAN_V3_PM_EXIT") or "15:35").split(":"))
 
 # --- Risk / execution extras (do not change the rules) ---
 HEDGE_ENABLED = env_bool("HEDGE_ENABLED", "0")
