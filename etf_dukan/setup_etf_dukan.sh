@@ -3,7 +3,7 @@
 # Called by startup.sh (as root) after the repo is cloned and the main crontab is written:
 #     bash /home/<user>/trading-bot/etf_dukan/setup_etf_dukan.sh <user> <trading-bot dir>
 #
-# Settings come from GCP instance metadata, written by .github/workflows/vm-scheduler.yml from repo
+# Settings come from GCP instance metadata, written by .github/workflows/vm-deploy.yml from repo
 # Variables (not secret) and Secrets. Every one has a safe default, so nothing has to be set by hand:
 #   ekd-paper-mode   vars.EKD_PAPER_MODE    default 1 (paper). Only the exact value 0 turns on live orders.
 #   ekd-start-date   vars.EKD_START_DATE    default auto (the first day this script creates the records)
@@ -74,6 +74,12 @@ CRON_LINE="45 14 * * 1-5 cd ${BOT_DIR} && /usr/bin/flock -n /tmp/etf_dukan.lock 
 ( crontab -u "${USER_NAME}" -l 2>/dev/null | grep -v "# EKD-ETF-DUKAN" ; echo "${CRON_LINE}" ) | crontab -u "${USER_NAME}" -
 
 echo "ETF ki Dukan bot ready (mode ${MODE_NAME}, sheet ${SHEET})."
+
+# VM-wide extras: 3:45 pm daily summary cron line, journald size limit. Its failure never affects the bots.
+if [ -f "${TARGET_DIR}/setup_vm_extras.sh" ]; then
+    bash "${TARGET_DIR}/setup_vm_extras.sh" "${USER_NAME}" "${TARGET_DIR}" \
+        || echo "Warning: VM extras setup failed; the bots are unaffected."
+fi
 
 # Strategy Desk dashboard (separate service, port 8080). Its failure never affects the bots.
 if [ -f "${TARGET_DIR}/dashboard/setup_dashboard.sh" ]; then

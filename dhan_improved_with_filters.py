@@ -161,6 +161,14 @@ def tg(message: str):
     tag = ("[PAPER] " if PAPER_MODE else "[LIVE] ") + BOT_TAG + "\n"
     print(f"{now_ist():%H:%M:%S} {tag}{message}", flush=True)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:   # notify.py: routine messages silent, repeats within 10 min dropped, one retry
+            import notify
+            notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, timeout=5, retry=False)
+            return
+        except ImportError:
+            pass
+        except Exception:
+            return
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -412,7 +420,7 @@ class LemonnDualSessionBot:
             if gap > MAX_GAP_PCT:
                 tg(f"🛑 Gap filter: {INDEX} opened {gap:.2f}% from previous close (> {MAX_GAP_PCT}%). No trades today.")
                 return True
-            tg(f"✅ Gap filter passed: {gap:.2f}%")
+            print(f"✅ Gap filter passed: {gap:.2f}%")   # log only: the deploy / skip message follows
             return False
         tg("⚠️ Gap check could not read OHLC - proceeding (same as v2.1).")
         return False
@@ -423,7 +431,7 @@ class LemonnDualSessionBot:
         hi = float(ohlc.get("high", 0) or 0)
         lo = float(ohlc.get("low", 0) or 0) or float("inf")
         if now_ist() < orb_end:
-            tg(f"🔍 Watching {INDEX} 09:15-09:50 range (limit {MAX_ORB_PTS:.0f} pts)...")
+            print(f"🔍 Watching {INDEX} 09:15-09:50 range (limit {MAX_ORB_PTS:.0f} pts)...")
         while now_ist() < orb_end:
             s = self.get_spot()
             if s > 0:
@@ -436,7 +444,7 @@ class LemonnDualSessionBot:
             if hi - lo > MAX_ORB_PTS:
                 tg(f"🛑 ORB filter: range {hi - lo:.1f} pts > {MAX_ORB_PTS:.0f}. Skipping morning session.")
                 return True
-            tg(f"✅ Opening range OK: {hi - lo:.1f} pts")
+            print(f"✅ Opening range OK: {hi - lo:.1f} pts")
         return False
 
     # ----------------------------------------------------------
@@ -873,7 +881,7 @@ class LemonnDualSessionBot:
 
     def run(self):
         if self.today.weekday() >= 5:
-            return tg("Weekend - nothing to trade.")
+            return print("Weekend - nothing to trade.")
         try:
             import pandas_market_calendars as mcal
             if mcal.get_calendar(P["calendar"]).schedule(start_date=str(self.today), end_date=str(self.today)).empty:

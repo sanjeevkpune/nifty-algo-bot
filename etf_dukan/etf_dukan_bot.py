@@ -207,6 +207,17 @@ def tg(message: str):
     print(f"{tag}{message}", flush=True)
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
+    try:   # ../notify.py: routine messages silent, repeats within 10 min dropped, one retry
+        if os.path.dirname(HERE) not in sys.path:
+            sys.path.append(os.path.dirname(HERE))
+        import notify
+        notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        return
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return
     try:
         import requests
         for i in range(0, len(message), 3800):     # Telegram limit is 4096 characters

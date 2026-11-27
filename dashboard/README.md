@@ -24,7 +24,7 @@ existing `service_account.json`, and the login lives in `/etc/trade-config/dashb
   The first time, it makes a random password and sends the address and password to Telegram.
 * **Once:** run the GitHub workflow **Dashboard Network Setup** (`open`) to open port 8080 in the
   Google Cloud firewall. Set `source_ranges` to `<your IP>/32` to allow only your own connection.
-* Address: `http://<VM static IP>:8080`, user `admin`. It is up only while the VM runs (08:30 to 16:00 IST).
+* Address: `http://<VM static IP>:8080`, user `admin`. It is up only while the VM runs (the GCP instance schedule, about 08:15 to 16:00 IST).
 
 The page refreshes every minute; the server caches sheet reads for 60 seconds.
 Plain HTTP: the password crosses the network unencrypted, so prefer a locked-down `source_ranges`.
