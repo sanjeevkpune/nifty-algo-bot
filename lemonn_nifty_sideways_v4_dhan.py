@@ -10,7 +10,8 @@ Mirrors Tradetron strategy "Nifty Sideways-Day ATM Straddle Seller v4"
   * Entry 10:00-10:05, only if ALL of these hold:
       - opening gap vs previous close <= 0.5%
       - 09:15-09:59 NIFTY range <= 140 points
-      - 0 to 3 calendar days to the weekly expiry
+      - 0 to 3 NSE trading days to the weekly expiry (weekends and NSE
+        holidays are not counted; with a Tuesday expiry Thu/Fri/Mon/Tue trade)
       - at least 2 of these 4 "sideways" signs:
           1. India VIX <= previous close + 3%
           2. NIFTY current-month future within 0.25% of its VWAP
@@ -107,7 +108,7 @@ INDEX = "NIFTY"
 STRIKE_STEP = 50
 MAX_GAP_PCT = 0.50
 MAX_ORB_PTS = 140.0
-MAX_DTE = 3                    # calendar days to the weekly expiry
+MAX_DTE = 3                    # NSE trading days to the weekly expiry (see trading_days_to_expiry)
 MIN_SCORE = 2                  # of the 4 sideways signs
 VIX_MAX_RISE = 1.03            # VIX <= previous close + 3%
 VWAP_BAND = 0.0025             # future within 0.25% of VWAP
@@ -115,6 +116,35 @@ ADX_PERIOD, ADX_MAX = 14, 20.0
 COMBINED_SL = 1.40             # exit when CE+PE >= 1.4 x entry
 REF_TIME, REF_LAST = (9, 20), (9, 30)
 ENTRY, ENTRY_LAST, EXIT = (10, 0), (10, 5), (15, 20)
+
+HOLIDAY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "etf_dukan", "nse_holidays.txt")
+
+
+def trading_days_to_expiry(today: datetime.date, expiry: datetime.date) -> int:
+    """NSE trading days after today up to and including expiry (expiry day itself = 0).
+    Weekends and NSE holidays are skipped, e.g. Fri -> Tue expiry = 2 (Mon, Tue).
+    Holidays come from pandas_market_calendars (XNSE) when installed, plus
+    etf_dukan/nse_holidays.txt; if neither is available only weekends are skipped."""
+    if expiry <= today:
+        return 0
+    days = [today + datetime.timedelta(days=i) for i in range(1, (expiry - today).days + 1)]
+    days = [d for d in days if d.weekday() < 5]
+    hol = set()
+    try:
+        with open(HOLIDAY_FILE) as f:
+            hol = {l.split("#")[0].strip() for l in f} - {""}
+    except OSError:
+        pass
+    try:
+        import pandas_market_calendars as mcal
+        open_days = {d.date().isoformat() for d in mcal.get_calendar("XNSE").valid_days(
+            start_date=str(days[0]), end_date=str(days[-1]))} if days else set()
+        days = [d for d in days if d.isoformat() in open_days]
+    except Exception:
+        pass
+    # the expiry day is always a trading day (NSE moves expiry before a holiday)
+    return sum(1 for d in days if d.isoformat() not in hol or d == expiry)
+
 
 # --- Risk / execution extras (do not change the rules) ---
 DAILY_HARD_STOP = float(os.environ.get("DAILY_HARD_STOP", "-45000"))
@@ -512,7 +542,7 @@ class LemonnV4Bot:
             o = self.spot_ohlc()
             I["orb_pts"] = round(float(o.get("high", 0) or 0) - float(o.get("low", 0) or 0), 2)
             I["orb_note"] = "day OHLC fallback"
-        I["dte"] = (self.expiry - d).days
+        I["dte"] = trading_days_to_expiry(d, self.expiry)
 
         # 1. India VIX vs previous close
         vq = self.ohlc_of(SPOT_EXCH, VIX_TOKEN)
@@ -554,7 +584,7 @@ class LemonnV4Bot:
         tg("🧭 NIFTY v4 10:00 check\n"
            f"{mk(checks['gap'])} Gap {I.get('gap_pct')}% (max {MAX_GAP_PCT}%)\n"
            f"{mk(checks['orb'])} 09:15-09:59 range {I['orb_pts']} pts (max {MAX_ORB_PTS:.0f})\n"
-           f"{mk(checks['dte'])} {I['dte']} day(s) to expiry {self.expiry} (max {MAX_DTE})\n"
+           f"{mk(checks['dte'])} {I['dte']} trading day(s) to expiry {self.expiry} (max {MAX_DTE})\n"
            f"{mk(checks['score'])} Sideways score {I['score']}/4 (need {MIN_SCORE}):\n"
            f"   {mk(s1)} VIX {I.get('vix')} vs prev {I.get('vix_prev')}\n"
            f"   {mk(s2)} Future vs VWAP {I.get('fut_vwap_pct')}%\n"
@@ -951,7 +981,7 @@ class LemonnV4Bot:
         self.login()
         self.load_master()
         tg(f"🚀 LEMONN NIFTY v4 (sideways straddle) | {NUM_LOTS} lots x {self.lot_size} | expiry {self.expiry} "
-           f"({(self.expiry - self.today).days}d) | {'PAPER' if PAPER_MODE else 'LIVE'}")
+           f"({trading_days_to_expiry(self.today, self.expiry)} trading days) | {'PAPER' if PAPER_MODE else 'LIVE'}")
         self.reconcile_positions()
 
         if self.phase == "init":
@@ -959,10 +989,11 @@ class LemonnV4Bot:
             if not self.check_gap():
                 self.info["decision"] = "SKIP: gap"
                 return self.finish(f"gap {self.info.get('gap_pct')}% > {MAX_GAP_PCT}%, no trade")
-            if (self.expiry - self.today).days > MAX_DTE:
-                self.info["dte"] = (self.expiry - self.today).days
+            dte = trading_days_to_expiry(self.today, self.expiry)
+            if dte > MAX_DTE:
+                self.info["dte"] = dte
                 self.info["decision"] = "SKIP: dte"
-                return self.finish(f"{self.info['dte']} days to expiry (> {MAX_DTE}), no trade")
+                return self.finish(f"{dte} trading days to expiry (> {MAX_DTE}), no trade")
             if now_ist() <= at_ist(self.today, *REF_LAST) and not self.info.get("straddle_920"):
                 wait_until(at_ist(self.today, *REF_TIME))
                 self.capture_ref_straddle()
