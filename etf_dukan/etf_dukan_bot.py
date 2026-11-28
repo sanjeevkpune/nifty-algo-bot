@@ -142,7 +142,7 @@ UNIVERSE_META_FILE = os.path.join(HOME, "state", "universe_meta.json")
 UNIVERSE_TAB = env("EKD_UNIVERSE_TAB", "Universe")
 UNIVERSE_HISTORY_TAB = env("EKD_UNIVERSE_HISTORY_TAB", "Universe History")
 UNIVERSE_SYNC_WATCHLIST = env_bool("EKD_UNIVERSE_SYNC_WATCHLIST", True)   # also update the tracker's Watchlist rows
-UNIVERSE_FROM_SHEET = env_bool("EKD_UNIVERSE_FROM_SHEET", True)   # each run starts by taking your Watchlist edits
+SHEET_SYNC_STAMP = os.path.join(HERE, "universe_synced.txt")   # written by the "Sync list from sheet" workflow
 UNIVERSE_LATEST = env("EKD_UNIVERSE_LATEST", "15:50")        # don't start a refresh after this (VM stops ~16:00)
 UNIVERSE_FALLBACK_DAYS = env_int("EKD_UNIVERSE_FALLBACK_DAYS", 10)   # NSE lists unreachable this many tries: re-rank current names
 NIFTY50_URLS = [u for u in env("EKD_NIFTY50_URLS",
@@ -753,7 +753,8 @@ class SheetLogger:
             ws = sh.add_worksheet(title=UNIVERSE_TAB, rows=max(300, need_rows), cols=len(UR.SHEET_HEADERS))
         ws.clear()
         head = [["ETF ki Dukan universe: refreshed by the bot every 6 months (1 Apr and 1 Oct). This tab is the refresh "
-                 "report; to change the list, edit Type / Include / Symbol on the Watchlist tab (read at each 2:45 pm run)."],
+                 "report; to change the list, edit Type / Include / Symbol on the Watchlist tab, then run the GitHub "
+                 "workflow 'ETF Bot: Sync list from sheet'."],
                 ["Last refresh", summary["date"], "Next refresh", next_due.isoformat(), "Source", source],
                 [params_text],
                 [f"{summary['etfs']} ETFs + {summary['stocks']} stocks with Include = Y. New: {', '.join(summary['added']) or 'none'}. "
@@ -807,9 +808,6 @@ class SheetLogger:
             ws.batch_update(upd, value_input_option="USER_ENTERED")
         return notes
 
-    def read_watchlist(self) -> List[list]:
-        return self._ws("Watchlist").get("A5:H200")
-
     def log_universe_change(self, changes: List[str]):
         try:
             hs = self._book().worksheet(UNIVERSE_HISTORY_TAB)
@@ -817,7 +815,7 @@ class SheetLogger:
             hs = self._book().add_worksheet(title=UNIVERSE_HISTORY_TAB, rows=200, cols=7)
             hs.append_row(["Date", "ETFs", "Stocks", "Added", "Dropped", "Dropped but held (sell/average only)", "Source"])
         hs.append_row([now_ist().date().isoformat(), "", "", "; ".join(changes)[:45000], "", "",
-                       "your edit on the Watchlist"], value_input_option="RAW")
+                       "your sheet edits (Sync list from sheet workflow)"], value_input_option="RAW")
 
     def read_universe(self) -> Tuple[Dict[str, dict], Optional[str]]:
         ws = self._book().worksheet(UNIVERSE_TAB)
@@ -1410,7 +1408,7 @@ class Bot:
             tg(f"🚨 No state file {STATE_FILE}. Run `etf_dukan_bot.py init --capital 4000000 --start YYYY-MM-DD` first.")
             return
         backup_state()
-        self.sync_universe_from_sheet()               # your Watchlist edits (Type / Include / Symbol) -> the bot's list
+        self.apply_sheet_sync()                       # your list from the "Sync list from sheet" workflow, if new
         self.broker.login()
         self.broker.load_tokens()
         try:
@@ -1477,35 +1475,46 @@ class Bot:
             self.sheet.backup_state(self.state)
             self.broker.logout()
 
-    # --- your own edits on the sheet's Watchlist -> the bot's list ---
-    def sync_universe_from_sheet(self) -> bool:
-        """Start of each run: the Watchlist (Type / Include / Symbol columns) is the editable list. Changes are
-        validated, saved to state/universe_active.csv and reported on Telegram. If the sheet can't be read, or
-        looks wrong, the last good list is used. Returns True if the list changed."""
-        if not UNIVERSE_FROM_SHEET or SHEET_MODE == "off" or not GSHEET_ID:
+    # --- your own edits, synced from the sheet by the "ETF Bot: Sync list from sheet" workflow ---
+    def apply_sheet_sync(self) -> bool:
+        """The workflow commits universe.csv + universe_synced.txt; the VM gets them on boot (or the workflow
+        copies them onto a running VM). The first run after that makes universe.csv the bot's list.
+        Held counters missing from it stay with Include = N. Returns True if a new sync was applied."""
+        if not os.path.exists(SHEET_SYNC_STAMP):
             return False
+        with open(SHEET_SYNC_STAMP) as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+        stamp = lines[0] if lines else ""
         meta = load_universe_meta()
-        if meta.get("sheet_pending"):                  # a refresh isn't on the sheet yet: write it, don't read old rows
-            self._write_universe_sheet(meta)
-            if load_universe_meta().get("sheet_pending"):
-                return False
-        try:
-            vals = self.sheet.read_watchlist()
-        except Exception as e:
-            print(f"Watchlist not readable ({e}); using the saved list")
+        if not stamp or meta.get("sheet_sync_applied") == stamp:
             return False
-        new, changes, problems = UR.universe_from_watchlist(vals, self.universe, self.held_symbols())
-        if problems:
-            tg("⚠️ Watchlist list check:\n  " + "\n  ".join(problems[:20]))
-        if new is None or not changes:
+        if meta.get("last_refresh") and stamp[:10] < str(meta["last_refresh"])[:10]:
+            meta["sheet_sync_applied"] = stamp          # older than the last 6-monthly refresh: superseded by it
+            save_universe_meta(meta)
+            return False
+        try:
+            new = load_universe(UNIVERSE_FILE)
+        except Exception as e:
+            tg(f"⚠️ Synced list in universe.csv is unreadable ({e}); keeping the current list.")
+            return False
+        kept = []
+        for s in sorted(self.held_symbols()):
+            if s not in new and s in self.universe:
+                new[s] = dict(self.universe[s], include=False)
+                kept.append(s)
+        if sum(1 for u in new.values() if u["include"]) < 10:
+            tg("⚠️ Synced list has fewer than 10 names with Include = Y; keeping the current list.")
             return False
         save_active_universe(new)
         self.universe = new
         self.broker.u = new
-        tg("📝 Your Watchlist edits are now the bot's list (used from this run):\n  " + "\n  ".join(changes[:40])
-           + ("\nNames with Include = N get no new buys; held ones still sell / average as normal." if any("→ N" in c or "removed" in c for c in changes) else ""))
+        meta["sheet_sync_applied"] = stamp
+        save_universe_meta(meta)
+        changes = lines[1:]
+        tg(f"📝 Your sheet list (synced {stamp}) is now the bot's list:\n  " + "\n  ".join(changes[:40])
+           + (f"\nHeld but not on the sheet, kept with Include = N (sell / average only): {', '.join(kept)}" if kept else ""))
         try:
-            self.sheet.log_universe_change(changes)
+            self.sheet.log_universe_change([f"synced {stamp}"] + changes)
         except Exception as e:
             print(f"Universe History not updated: {e}")
         return True
@@ -1653,7 +1662,7 @@ class Bot:
         self.state = load_state()
         if not self.state:
             raise SystemExit(f"No state file {STATE_FILE}; run init first.")
-        self.sync_universe_from_sheet()
+        self.apply_sheet_sync()
         self.broker.login()
         self.broker.load_tokens()
         try:

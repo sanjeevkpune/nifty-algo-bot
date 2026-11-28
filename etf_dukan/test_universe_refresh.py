@@ -257,23 +257,57 @@ same, ch3, _ = UR.universe_from_watchlist(
      for s, u in u0.items()], u0, set())
 check(ch3 == [], "unchanged Watchlist = no change")
 
-sheet.read_watchlist = lambda: wl
+# workflow side: sheet_sync.py with a fake gspread, writing into a temp copy of universe.csv
+import shutil, types  # noqa: E401,E402
+import sheet_sync as SS  # noqa: E402
+tmp = tempfile.mkdtemp()
+csvp, stampp = os.path.join(tmp, "universe.csv"), os.path.join(tmp, "universe_synced.txt")
+shutil.copy(B.UNIVERSE_FILE, csvp)
+
+
+class FakeWS:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def get(self, rng):
+        return self.rows
+
+
+def fake_gspread(rows):
+    m = types.ModuleType("gspread")
+    m.service_account = lambda filename: types.SimpleNamespace(
+        open_by_key=lambda k: types.SimpleNamespace(worksheet=lambda t: FakeWS(rows)))
+    sys.modules["gspread"] = m
+
+
+same_rows = [[0, "ETF" if u["type"] == S.ETF else "Stock", "Y" if u["include"] else "N", s, "", "", u["name"], u["sector"]]
+             for s, u in base.items()]
+fake_gspread(same_rows)
+sys.argv = ["x", "--sheet", "id", "--sa", "sa.json", "--csv", csvp, "--stamp", stampp, "--no-scrip-check"]
+check(SS.main() == 0 and not os.path.exists(stampp) and open(csvp).read() == open(B.UNIVERSE_FILE).read(),
+      "sync workflow: unchanged sheet = universe.csv untouched, no stamp")
+fake_gspread(wl)
+check(SS.main() == 0 and os.path.exists(stampp) and "ZOMATO" in SS.load_csv(csvp), "sync workflow writes the edited list + stamp")
+fake_gspread([[1, "ETF", "Y", "NIFTYBEES"]])
+before = open(csvp).read()
+check(SS.main() == 2 and open(csvp).read() == before, "sync workflow rejects an almost empty sheet")
+
+# bot side: the next run applies the synced list once
+B.UNIVERSE_FILE, B.SHEET_SYNC_STAMP = csvp, stampp
 sheet.log_universe_change = lambda c: sheet.history.append({"edit": c})
-B.save_universe_meta(dict(B.load_universe_meta(), sheet_pending=False))
+B.save_universe_meta(dict(B.load_universe_meta(), last_refresh="2026-11-27"))
 bot3 = B.Bot()
 bot3.state = bot.state
 msgs.clear()
-check(bot3.sync_universe_from_sheet() and B.load_universe()["ZOMATO"]["include"]
-      and any("Watchlist edits" in m for m in msgs) and "edit" in sheet.history[-1], "bot adopts the edits, saves, reports")
-sheet.read_watchlist = lambda: (_ for _ in ()).throw(RuntimeError("sheet down"))
-check(bot3.sync_universe_from_sheet() is False and "ZOMATO" in B.load_universe(), "sheet down: last good list kept")
-m = B.load_universe_meta()
-m["sheet_pending"] = True
-B.save_universe_meta(m)
-sheet.read_watchlist = lambda: [[1, "ETF", "Y", "ONLYONE"]] * 20
-bot3._write_universe_sheet = lambda meta: False
-check(bot3.sync_universe_from_sheet() is False and "ZOMATO" in B.load_universe(),
-      "refresh not yet on the sheet: old Watchlist rows are not read back")
+check(bot3.apply_sheet_sync() and B.load_universe()["ZOMATO"]["include"]
+      and B.load_universe()["NESTLEIND"]["include"] is False
+      and any("sheet list" in m for m in msgs) and "edit" in sheet.history[-1],
+      "bot applies the synced list at its next run, keeps held NESTLEIND as N, reports it")
+check(bot3.apply_sheet_sync() is False, "the same sync is applied only once")
+with open(stampp, "w") as f:
+    f.write("2026-01-01 10:00:00 IST\nold change\n")
+check(bot3.apply_sheet_sync() is False and "ZOMATO" in B.load_universe(),
+      "a sync older than the last 6-monthly refresh is not applied (e.g. on a rebuilt server)")
 
 print("\nALL UNIVERSE TESTS PASS" if OK else "\nSOME UNIVERSE TESTS FAILED")
 sys.exit(0 if OK else 1)

@@ -15,6 +15,7 @@ lock and state files, fill checks, `PAPER_MODE`, crash handling.
 | `signals.py` | Reads the sheet's Signals tab and cross-checks it with the bot's plan |
 | `universe.csv` | The starting list: 47 ETFs + 30 stocks with Include = Y (16 more ETFs at N). After the first 6-monthly refresh the bot uses `state/universe_active.csv` instead |
 | `universe_refresh.py` | The 6-monthly ETF + stock list refresh rules (pure functions) |
+| `sheet_sync.py` | Used by the "ETF Bot: Sync list from sheet" workflow: Watchlist tab -> `universe.csv` |
 | `config.env.example` | Every setting with its default (the VM's `/etc/trade-config/etf_dukan.env` is written by the setup script) |
 | `nse_holidays.txt` | Optional holiday list |
 | `setup_etf_dukan.sh` | VM setup, called from `startup.sh` on every boot (idempotent) |
@@ -207,8 +208,8 @@ python etf_dukan_bot.py refresh-universe --dry-run   # preview the 6-monthly ETF
 4. **Pledged holdings.** Selling holdings that are pledged for the option bot's margin is assumed to work directly
    at AngelOne. If AngelOne asks for an unpledge first, the sell is rejected and you get an alert.
 5. **Signals and universe.** The live signals come from the sheet's Signals tab, cross-checked as described
-   above. The universe is the Watchlist tab (read at each run) and is refreshed by the bot every 6 months
-   (see "ETF and stock list refresh" below).
+   above. The universe is refreshed by the bot every 6 months, and your own Watchlist edits reach it when you
+   run the "Sync list from sheet" workflow (see "ETF and stock list refresh" below).
 6. **Times.** Sell orders stop at 15:09 and buy orders at 15:24, so no order is sent close to the 15:30 close.
    A start after 15:15 skips the day.
 7. **One run a day.** If the server is off at 2:45 pm, that day is skipped. Nothing is caught up the next day,
@@ -241,26 +242,22 @@ extra job or workflow.
   re-ranks the current names by liquidity instead. If AngelOne candles fail, nothing changes and it retries.
 - **Rebuilt server.** The list is read back from the sheet.
 
-### Your own edits in the sheet
+### Your own edits in the sheet (sync when you want)
 
-The tracker's **Watchlist** tab is the list you edit. At the start of every run (2:45 pm, and `plan`) the bot reads
-its **Type** (B), **Include** (C) and **NSE symbol** (D) columns and makes that its list, so an edit made before
-2:45 pm counts the same day. To add a name, type it in an empty row (Type, Y, symbol; name/sector optional).
-To stop new buys in a name, set Include to N. Changes are checked and reported on Telegram and in `Universe History`:
+The tracker's **Watchlist** tab is the list you edit: **Type** (B), **Include** (C), **NSE symbol** (D), plus name /
+sector if you like. To add a name, fill an empty row; to stop new buys in a name, set Include to N.
+Nothing changes in the bot until you sync:
 
-- Type must be ETF or Stock, Include Y or N, symbol a plain NSE symbol; a bad row is skipped and reported.
-  A symbol AngelOne doesn't know is reported and left out of trading.
-- A held counter you delete from the Watchlist stays in the bot's list with Include = N (it keeps selling / averaging).
-- If fewer than 10 names have Include = Y (say the tab was cleared by mistake), or the sheet can't be read,
-  the bot keeps its last good list and tells you.
-- The 6-monthly refresh rewrites the Include flags from liquidity. Re-apply a manual choice after it, or put names
-  you never want in `EKD_UNIV_EXCLUDE`.
+1. GitHub > **Actions** > **ETF Bot: Sync list from sheet** > **Run workflow** (tick *dry run* to only see the changes).
+2. It reads the Watchlist, checks every row (ETF/Stock, Y/N, a symbol AngelOne knows) and commits the list to
+   `etf_dukan/universe.csv` (+ `universe_synced.txt` with the time and the changes). The job summary shows what changed.
+   Fewer than 10 names with Include = Y (e.g. a cleared tab) is rejected and nothing changes.
+3. If the VM is running, the workflow copies just those two files onto it; if it's off, the next boot pulls them.
+4. The bot's next run (2:45 pm) makes it its list and tells you on Telegram. A held counter you removed stays with
+   Include = N (it still sells / averages). A sync older than the last 6-monthly refresh is not re-applied.
 
-This runs inside the bot, not as a GitHub workflow: the server is only on during market days, and the bot reads the
-sheet just before it trades, so it always trades on your latest list. `EKD_UNIVERSE_FROM_SHEET=0` turns it off.
-- **By hand:** `python3 etf_dukan_bot.py refresh-universe --dry-run` (preview on Telegram, nothing changes),
-  `--force` (refresh now). Settings: `EKD_UNIVERSE_*` and `EKD_UNIV_*` in `config.env.example`
-  (`EKD_UNIVERSE_AUTO=0` turns it off, `EKD_UNIV_EXCLUDE=SYM1,SYM2` never picks those names).
+The 6-monthly refresh rewrites the Include flags from liquidity. Re-apply a manual choice after it, or put names you
+never want in `EKD_UNIV_EXCLUDE`.
 
 ## Checking the setup
 
