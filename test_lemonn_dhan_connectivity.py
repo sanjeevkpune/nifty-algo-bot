@@ -75,7 +75,7 @@ def check_environment(m):
     for k in ("DHAN_CLIENT_ID", "DHAN_PIN", "DHAN_TOTP_SECRET"):
         rec("PASS" if os.environ.get(k) else "FAIL", area, f"{k} set",
             "" if os.environ.get(k) else "add it to /etc/trade-config/config.env")
-    rec("INFO", area, "Paper mode", f"PAPER_MODE={m.PAPER_MODE} (forced on until {m.PAPER_MODE_END_DATE})")
+    rec("INFO", area, "Paper mode", f"PAPER_MODE={m.PAPER_MODE} (DHAN_PAPER_MODE, set by the Bot settings workflow)")
     rec("INFO", area, "Settings", f"lots={m.NUM_LOTS}, hedge={'ON' if m.HEDGE_ENABLED else 'OFF'}, "
         f"exchange SL={'ON' if m.USE_EXCHANGE_SL else 'OFF'}, hard stop ₹{m.DAILY_HARD_STOP:,.0f}")
 

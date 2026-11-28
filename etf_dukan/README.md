@@ -154,7 +154,7 @@ All are optional, and the defaults are safe:
 
 | Name | Kind | Default | Meaning |
 |---|---|---|---|
-| `EKD_PAPER_MODE` | Variable | `1` | Paper trading. Only the exact value `0` sends real orders. |
+| `EKD_PAPER_MODE` | Variable | `1` | Paper trading. Only the exact value `0` sends real orders. Once the **Bot settings** workflow has set the ETF bot's mode or buy amount, the workflow's value wins over this variable. |
 | `EKD_START_DATE` | Variable | `auto` | Start date of the records (`YYYY-MM-DD`). `auto` = the first day the VM sets the bot up. Withdrawals start 6 months later. |
 | `EKD_CAPITAL` | Variable | `4000000` | Starting capital in the records |
 | `EKD_GSHEET_ID` | Variable | the ETF ki Dukan tracker | Google Sheet for signals and trade logging |
@@ -170,7 +170,8 @@ when the records are first created.
 - **Before going live:**
   - Turn on DDPI at AngelOne, so the API can sell delivery holdings.
   - Clear the paper rows from Holdings, Sold, Core and Bot Log, and set Capital A20 to the start date.
-  - Set the repo Variables `EKD_START_DATE` and `EKD_PAPER_MODE=0`.
+  - Set the repo Variable `EKD_START_DATE` (then run **Deploy to VM**), and switch the bot live with the
+    **Bot settings (paper/live, lots)** workflow (strategy ETF ki Dukan, mode live, confirm LIVE).
 
   Live records are created on the next boot with that date. The paper records stay in `state/paper_state.json`.
 

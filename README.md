@@ -11,12 +11,20 @@ They run on one Google Cloud VM that is started and stopped by a **GCP instance 
 
 | Time | Bot | File | Broker | Mode | Log |
 |---|---|---|---|---|---|
-| 09:08 → 15:20 | NIFTY sideways ATM straddle (Lemonn v4) + watchdog every 10 min | `lemonn_nifty_sideways_v4_dhan.py` | Dhan | Paper until 31 Dec 2026, then live only with `DHAN_V4_LIVE=1` | `dhan_v4.log` |
-| 09:30 | NIFTY + SENSEX dual-session strangle (Lemonn v3) | `dhan_improved_with_filters.py` | Dhan | Paper until 31 Dec 2026, then `DHAN_PAPER_MODE` | `dhan_improved.log` |
+| 09:08 → 15:20 | NIFTY sideways ATM straddle (Lemonn v4) + watchdog every 10 min | `lemonn_nifty_sideways_v4_dhan.py` | Dhan | Paper unless `DHAN_V4_LIVE=1` | `dhan_v4.log` |
+| 09:30 | NIFTY + SENSEX dual-session strangle (Lemonn v3) | `dhan_improved_with_filters.py` | Dhan | Paper unless `DHAN_PAPER_MODE=0` | `dhan_improved.log` |
 | 09:39 | Adaptive strangle | `adaptive_strangle_v2.py` | AngelOne | `PAPER_MODE` in config.env (startup.sh sets 0 = live) | `algo_trade_v2.log` |
-| 14:45 | ETF ki Dukan | `etf_dukan/etf_dukan_bot.py run` | AngelOne | Paper unless repo variable `EKD_PAPER_MODE` is `0` | `etf_dukan/logs/cron.log` |
+| 14:45 | ETF ki Dukan | `etf_dukan/etf_dukan_bot.py run` | AngelOne | Paper unless `EKD_PAPER_MODE=0` | `etf_dukan/logs/cron.log` |
 | 15:45 | Daily summary of all bots to Telegram (reads the bots' files only) | `daily_summary.py` | none | n/a | `daily_summary.log` |
 | 09:00 daily, logrotate hourly | Disk housekeeping | `cleanup_logs.sh`, `bot_logrotate.conf` | none | n/a | `cleanup.log` |
+
+Paper/live and size for every bot above are set with the **Bot settings (paper/live, lots)** workflow
+(Actions → Bot settings → Run workflow): pick a strategy (or all), paper / live / keep, lots (option bots,
+1-20) or the ETF buy amount (₹ per buy). Going live, or adding lots to a live bot, needs `LIVE` typed in the
+confirm box. Every run posts the result to Telegram; run it with everything on "keep" to see the current settings.
+The values are kept in the VM metadata key `bot-settings` (numbers only) and override the defaults in
+`startup.sh` / the `EKD_PAPER_MODE` variable. If the VM is running outside 09:00-15:35 IST they are applied at once,
+otherwise from the next boot. A bot that is already running keeps its settings until its next start.
 
 The crontab is written by `startup.sh` (plus `etf_dukan/setup_etf_dukan.sh` for the ETF line and `setup_vm_extras.sh`
 for the 15:45 summary) on every boot. Edit the schedule there, not on the VM.
@@ -47,6 +55,7 @@ caps the system journal at 200 MB and empties the apt cache on every boot.
 
 ```
 .github/workflows/
+  bot-settings.yml          Manual: paper/live and lots per bot (or all), LIVE confirm, Telegram report
   vm-deploy.yml             Manual: push startup.sh + secrets to VM metadata (optionally re-run it now)
   etf-dukan-check.yml       Manual: runs etf_dukan/check_setup.py on the VM
 startup.sh                  VM boot script: packages, clone/pull main, /etc/trade-config/config.env, crontab

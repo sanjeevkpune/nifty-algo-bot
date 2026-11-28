@@ -262,9 +262,9 @@ def main():
     s = Summary(day)
     s.adaptive()
     s.dhan("🔷 Lemonn v3 Dual-Session", f"lemonn_dual_{day:%Y%m%d}.json",
-           paper=True if day <= dt.date(2026, 12, 31) else env_on("DHAN_PAPER_MODE"))
+           paper=os.environ.get("DHAN_PAPER_MODE", "1").strip() != "0")
     s.dhan("🔶 Lemonn v4 Sideways", f"lemonn_v4_{day:%Y%m%d}.json",
-           paper=not (day > dt.date(2026, 12, 31) and env_on("DHAN_V4_LIVE")))
+           paper=not env_on("DHAN_V4_LIVE"))
     s.etf()
     s.vm()
 
