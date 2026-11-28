@@ -178,7 +178,7 @@ B.Broker.scrip_master_nse = lambda self: {f"{s}-EQ": {"token": TOK[s], "symbol":
 B.Broker.login = lambda self: setattr(self, "smart", FakeSmart())
 B.Broker.logout = lambda self: None
 msgs = []
-B.tg = lambda m: msgs.append(m)
+B.tg = lambda m, loud=None: msgs.append(m)
 B.time.sleep = lambda x: None
 
 bot = B.Bot()

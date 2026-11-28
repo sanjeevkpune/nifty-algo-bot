@@ -233,7 +233,7 @@ def _ensure_dirs():
         os.makedirs(d, exist_ok=True)
 
 
-def tg(message: str):
+def tg(message: str, loud=None):
     tag = ("[PAPER] " if PAPER_MODE else "[LIVE] ") + ("[DRY RUN] " if DRY_RUN else "") + "🟢 ANGEL ONE · ETF ki Dukan\n"
     print(f"{tag}{message}", flush=True)
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -242,7 +242,7 @@ def tg(message: str):
         if os.path.dirname(HERE) not in sys.path:
             sys.path.append(os.path.dirname(HERE))
         import notify
-        notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, loud=loud)
         return
     except ImportError:
         pass
@@ -1512,7 +1512,8 @@ class Bot:
         save_universe_meta(meta)
         changes = lines[1:]
         tg(f"📝 Your sheet list (synced {stamp}) is now the bot's list:\n  " + "\n  ".join(changes[:40])
-           + (f"\nHeld but not on the sheet, kept with Include = N (sell / average only): {', '.join(kept)}" if kept else ""))
+           + (f"\nHeld but not on the sheet, kept with Include = N (sell / average only): {', '.join(kept)}" if kept else ""),
+           loud=True)
         try:
             self.sheet.log_universe_change([f"synced {stamp}"] + changes)
         except Exception as e:
@@ -1654,7 +1655,7 @@ class Bot:
         meta.update(last_refresh=today, source=source, etfs=summary["etfs"], stocks=summary["stocks"],
                     list_fail_dates=[], sheet_pending=True)
         save_universe_meta(meta)
-        tg(txt)
+        tg(txt, loud=bool(summary["added"] or summary["removed"] or summary["held_dropped"]))   # list changed: ring
         self._write_universe_sheet(meta)
         return True
 

@@ -256,6 +256,10 @@ Nothing changes in the bot until you sync:
 4. The bot's next run (2:45 pm) makes it its list and tells you on Telegram. A held counter you removed stays with
    Include = N (it still sells / averages). A sync older than the last 6-monthly refresh is not re-applied.
 
+**Telegram.** Every run of the workflow sends a message (what changed, dry run / applied / refused / failed, with a
+link to the run), using the `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` repo secrets the VM already uses. The bot
+also rings when it switches to a synced list, and when a 6-monthly refresh adds or drops names.
+
 The 6-monthly refresh rewrites the Include flags from liquidity. Re-apply a manual choice after it, or put names you
 never want in `EKD_UNIV_EXCLUDE`.
 
