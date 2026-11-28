@@ -8,6 +8,8 @@ What it does on each NSE trading day (one cron start at 2:45 pm IST):
   15:00  target sell (max 1/day, 80% of the position, other 20% -> Core lot) + Core 3x exits.
   15:10  ETF slot + stock slot (new buys, Rs 40k, whole shares), else 1 averaging buy.
   after  Telegram summary, Google Sheet rows, reconcile again.
+  1 Apr / 1 Oct (first run on or after): refresh the ETF + stock list by 6-month liquidity
+         (universe_refresh.py), write it to the sheet's Universe + Watchlist tabs; used from the next day.
 
 Rules live in strategy.py (pure functions, replay-tested against the 5-year backtest).
 
@@ -35,6 +37,7 @@ Usage
   python3 etf_dukan_bot.py withdraw 15000 [--date YYYY-MM-DD]
   python3 etf_dukan_bot.py deposit 100000
   python3 etf_dukan_bot.py split SYMBOL RATIO   # e.g. a 1:10 split -> RATIO 10
+  python3 etf_dukan_bot.py refresh-universe [--dry-run] [--force]   # the 6-monthly list refresh, by hand
 """
 from __future__ import annotations
 
@@ -57,6 +60,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import strategy as S  # noqa: E402
 import signals as SG  # noqa: E402
+import universe_refresh as UR  # noqa: E402
 
 
 # ==========================================
@@ -128,7 +132,34 @@ STATE_FILE = os.path.join(HOME, "state", f"{MODE}_state.json")
 LOCK_DIR = os.path.join(HOME, "locks")
 LOG_DIR = os.path.join(HOME, "logs")
 CACHE_DIR = os.path.join(HOME, "cache")
-UNIVERSE_FILE = env("EKD_UNIVERSE_FILE", os.path.join(HERE, "universe.csv"))
+UNIVERSE_FILE = env("EKD_UNIVERSE_FILE", os.path.join(HERE, "universe.csv"))   # the starting list (from the repo)
+
+# --- 6-monthly universe refresh (universe_refresh.py has the rules) ---
+UNIVERSE_AUTO = env_bool("EKD_UNIVERSE_AUTO", True)          # 0 = never refresh; the bot keeps universe.csv
+UNIVERSE_MONTHS = tuple(int(m) for m in env("EKD_UNIVERSE_MONTHS", "4,10").split(",") if m.strip())
+ACTIVE_UNIVERSE_FILE = os.path.join(HOME, "state", "universe_active.csv")   # the refreshed list (git-ignored)
+UNIVERSE_META_FILE = os.path.join(HOME, "state", "universe_meta.json")
+UNIVERSE_TAB = env("EKD_UNIVERSE_TAB", "Universe")
+UNIVERSE_HISTORY_TAB = env("EKD_UNIVERSE_HISTORY_TAB", "Universe History")
+UNIVERSE_SYNC_WATCHLIST = env_bool("EKD_UNIVERSE_SYNC_WATCHLIST", True)   # also update the tracker's Watchlist rows
+SHEET_SYNC_STAMP = os.path.join(HERE, "universe_synced.txt")   # written by the "Sync list from sheet" workflow
+UNIVERSE_LATEST = env("EKD_UNIVERSE_LATEST", "15:50")        # don't start a refresh after this (VM stops ~16:00)
+UNIVERSE_FALLBACK_DAYS = env_int("EKD_UNIVERSE_FALLBACK_DAYS", 10)   # NSE lists unreachable this many tries: re-rank current names
+NIFTY50_URLS = [u for u in env("EKD_NIFTY50_URLS",
+                               "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv,"
+                               "https://archives.nseindia.com/content/indices/ind_nifty50list.csv,"
+                               "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv").split(",") if u.strip()]
+ETF_LIST_URLS = [u for u in env("EKD_ETF_LIST_URLS",
+                                "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv,"
+                                "https://archives.nseindia.com/content/equities/eq_etfseclist.csv").split(",") if u.strip()]
+
+
+def universe_params() -> "UR.Params":
+    return UR.Params(etf_min_cr=env_float("EKD_UNIV_ETF_MIN_CR", 1.0), min_days=env_int("EKD_UNIV_MIN_DAYS", 60),
+                     max_etfs=env_int("EKD_UNIV_MAX_ETFS", 50), max_stocks=env_int("EKD_UNIV_MAX_STOCKS", 30),
+                     max_financials=env_int("EKD_UNIV_MAX_FINANCIALS", 4), max_per_sector=env_int("EKD_UNIV_MAX_PER_SECTOR", 3),
+                     incumbent_edge=env_float("EKD_UNIV_INCUMBENT_EDGE", 1.25),
+                     exclude=[x.strip() for x in env("EKD_UNIV_EXCLUDE", "").split(",") if x.strip()])
 
 # --- timing (IST) ---
 PLAN_TIME = env("EKD_PLAN_TIME", "14:50")
@@ -202,7 +233,7 @@ def _ensure_dirs():
         os.makedirs(d, exist_ok=True)
 
 
-def tg(message: str):
+def tg(message: str, loud=None):
     tag = ("[PAPER] " if PAPER_MODE else "[LIVE] ") + ("[DRY RUN] " if DRY_RUN else "") + "🟢 ANGEL ONE · ETF ki Dukan\n"
     print(f"{tag}{message}", flush=True)
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -211,7 +242,7 @@ def tg(message: str):
         if os.path.dirname(HERE) not in sys.path:
             sys.path.append(os.path.dirname(HERE))
         import notify
-        notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        notify.send(tag, message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, loud=loud)
         return
     except ImportError:
         pass
@@ -241,7 +272,10 @@ def inr(x: float) -> str:
     return f"₹{x:,.0f}"
 
 
-def load_universe(path=UNIVERSE_FILE) -> Dict[str, dict]:
+def load_universe(path=None) -> Dict[str, dict]:
+    """The refreshed list (state/universe_active.csv) once a refresh has run, else the repo's universe.csv."""
+    if path is None:
+        path = ACTIVE_UNIVERSE_FILE if os.path.exists(ACTIVE_UNIVERSE_FILE) else UNIVERSE_FILE
     out = {}
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
@@ -448,6 +482,31 @@ class Broker:
         return None
 
     # --- account ---
+    def scrip_master_nse(self) -> Dict[str, dict]:
+        """Every NSE cash-market row of the scrip master, by trading symbol (e.g. NIFTYBEES-EQ). Used by the refresh."""
+        raw = json.loads(urllib.request.urlopen(self.SCRIP_URL, timeout=120).read())
+        return {r["symbol"]: r for r in raw if r.get("exch_seg") == "NSE" and str(r.get("symbol", "")).endswith("-EQ")}
+
+    def daily_bars(self, token: str, today: dt.date, days: int = 190) -> Optional[List[Tuple[str, float, float]]]:
+        """(date, close, volume) for completed days before today, oldest first. None = API never answered."""
+        frm = today - dt.timedelta(days=days)
+        self.last_candle_error = ""
+        for attempt in range(self.CANDLE_TRIES):
+            try:
+                res = self.smart.getCandleData({"exchange": "NSE", "symboltoken": str(token), "interval": "ONE_DAY",
+                                                "fromdate": f"{frm} 09:15", "todate": f"{today} 15:30"})
+                rows = (res or {}).get("data")
+                if rows:
+                    return sorted((str(c[0])[:10], float(c[4]), float(c[5] if len(c) > 5 else 0)) for c in rows
+                                  if str(c[0])[:10] < today.isoformat())
+                if res and res.get("status") and rows is not None:
+                    return []
+                self.last_candle_error = str((res or {}).get("message") or res)[:80]
+            except Exception as e:
+                self.last_candle_error = str(e)[:80]
+            time.sleep(min(2.0 * 2 ** attempt, 20.0))
+        return None
+
     def available_cash(self) -> Optional[float]:
         try:
             res = self.smart.rmsLimit()
@@ -681,6 +740,89 @@ class SheetLogger:
             rows = ws.get("A7:J10")
         return SG.parse_signals(rows)
 
+    # --- 6-monthly universe refresh: Universe tab, Universe History tab, Watchlist rows ---
+    def write_universe(self, rows: List[dict], summary: dict, params_text: str, next_due: dt.date, source: str):
+        sh = self._book()
+        table = UR.sheet_table(rows)
+        need_rows = len(table) + 20
+        try:
+            ws = sh.worksheet(UNIVERSE_TAB)
+            if ws.row_count < need_rows:
+                ws.add_rows(need_rows - ws.row_count)
+        except Exception:
+            ws = sh.add_worksheet(title=UNIVERSE_TAB, rows=max(300, need_rows), cols=len(UR.SHEET_HEADERS))
+        ws.clear()
+        head = [["ETF ki Dukan universe: refreshed by the bot every 6 months (1 Apr and 1 Oct). This tab is the refresh "
+                 "report; to change the list, edit Type / Include / Symbol on the Watchlist tab, then run the GitHub "
+                 "workflow 'ETF Bot: Sync list from sheet'."],
+                ["Last refresh", summary["date"], "Next refresh", next_due.isoformat(), "Source", source],
+                [params_text],
+                [f"{summary['etfs']} ETFs + {summary['stocks']} stocks with Include = Y. New: {', '.join(summary['added']) or 'none'}. "
+                 f"Dropped: {', '.join(summary['removed'] + summary['held_dropped']) or 'none'}."],
+                [],
+                UR.SHEET_HEADERS]
+        ws.update(range_name="A1", values=head + table, value_input_option="RAW")
+        try:
+            hs = sh.worksheet(UNIVERSE_HISTORY_TAB)
+        except Exception:
+            hs = sh.add_worksheet(title=UNIVERSE_HISTORY_TAB, rows=200, cols=7)
+            hs.append_row(["Date", "ETFs", "Stocks", "Added", "Dropped", "Dropped but held (sell/average only)", "Source"])
+        hs.append_row([summary["date"], summary["etfs"], summary["stocks"], ", ".join(summary["added"]),
+                       ", ".join(summary["removed"]), ", ".join(summary["held_dropped"]), source],
+                      value_input_option="RAW")
+
+    def sync_watchlist(self, universe: Dict[str, dict], rows: List[dict], held: set) -> List[str]:
+        """Makes the tracker's Watchlist match the new list, so the sheet's own Signals rank the same names.
+        Writes only the input cells (B type, C include, D symbol, G name, H sector, I volume, J price; A #).
+        A new name goes into an empty row, else into the row of a dropped, unheld name. Rows are never deleted."""
+        ws = self._ws("Watchlist")
+        first, last = 5, 200
+        cur = ws.get(f"A{first}:D{last}")
+        cur = [list(r) + [""] * 4 for r in cur] + [["", "", "", ""]] * (last - first + 1 - len(cur))
+        row_of = {str(r[3]).strip().upper(): first + i for i, r in enumerate(cur) if str(r[3]).strip()}
+        stats = {r["symbol"]: r for r in rows}
+        upd, notes = [], []
+        free = [first + i for i, r in enumerate(cur) if not str(r[3]).strip()]
+        reusable = [row_of[s] for s in row_of if s not in universe and s not in held]
+        for s, rn in row_of.items():
+            inc = "Y" if (s in universe and universe[s]["include"]) else "N"
+            upd.append({"range": f"C{rn}", "values": [[inc]]})
+            st = stats.get(s)
+            if st and st.get("avg_volume") is not None and st.get("last_close"):
+                upd.append({"range": f"I{rn}:J{rn}", "values": [[st["avg_volume"], st["last_close"]]]})
+        for s, u in universe.items():
+            if s in row_of:
+                continue
+            slots = free or reusable
+            if not slots:
+                notes.append(f"Watchlist has no free row for {s} (rows {first}-{last} full)")
+                continue
+            rn = slots.pop(0)
+            st = stats.get(s, {})
+            upd.append({"range": f"A{rn}:D{rn}", "values": [[rn - first + 1, u["type"], "Y" if u["include"] else "N", s]]})
+            upd.append({"range": f"G{rn}:J{rn}", "values": [[u.get("name", ""), u.get("sector", ""),
+                                                            st.get("avg_volume", ""), st.get("last_close", "")]]})
+            upd.append({"range": f"M{rn}", "values": [[""]]})        # backup CMP / RSI belonged to the old name
+            upd.append({"range": f"P{rn}", "values": [[""]]})
+        if upd:
+            ws.batch_update(upd, value_input_option="USER_ENTERED")
+        return notes
+
+    def log_universe_change(self, changes: List[str]):
+        try:
+            hs = self._book().worksheet(UNIVERSE_HISTORY_TAB)
+        except Exception:
+            hs = self._book().add_worksheet(title=UNIVERSE_HISTORY_TAB, rows=200, cols=7)
+            hs.append_row(["Date", "ETFs", "Stocks", "Added", "Dropped", "Dropped but held (sell/average only)", "Source"])
+        hs.append_row([now_ist().date().isoformat(), "", "", "; ".join(changes)[:45000], "", "",
+                       "your sheet edits (Sync list from sheet workflow)"], value_input_option="RAW")
+
+    def read_universe(self) -> Tuple[Dict[str, dict], Optional[str]]:
+        ws = self._book().worksheet(UNIVERSE_TAB)
+        vals = ws.get_all_values()
+        last = vals[1][1] if len(vals) > 1 and len(vals[1]) > 1 else None
+        return UR.universe_from_table(vals), last
+
     @staticmethod
     def _next_row(ws, col: int, first: int) -> int:
         return max(first, len(ws.col_values(col)) + 1)
@@ -730,14 +872,71 @@ class SheetLogger:
 
 
 # ==========================================
+# 4b. UNIVERSE FILES
+# ==========================================
+def load_universe_meta() -> dict:
+    try:
+        with open(UNIVERSE_META_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_universe_meta(meta: dict):
+    with open(UNIVERSE_META_FILE + ".tmp", "w") as f:
+        json.dump(meta, f, indent=1, default=str)
+    os.replace(UNIVERSE_META_FILE + ".tmp", UNIVERSE_META_FILE)
+
+
+def save_active_universe(universe: Dict[str, dict]):
+    with open(ACTIVE_UNIVERSE_FILE + ".tmp", "w", newline="") as f:
+        f.write(UR.to_csv(universe))
+    os.replace(ACTIVE_UNIVERSE_FILE + ".tmp", ACTIVE_UNIVERSE_FILE)
+
+
+def restore_universe(sheet: "SheetLogger"):
+    """A rebuilt server has no state/universe_active.csv: take the refreshed list back from the sheet's Universe tab."""
+    if os.path.exists(ACTIVE_UNIVERSE_FILE) or not UNIVERSE_AUTO or SHEET_MODE == "off" or not GSHEET_ID:
+        return
+    try:
+        u, last = sheet.read_universe()
+    except Exception as e:
+        print(f"no Universe tab to restore from ({e}); using {UNIVERSE_FILE}")
+        return
+    if len([1 for x in u.values() if x["include"]]) >= 10:
+        save_active_universe(u)
+        meta = load_universe_meta()
+        meta.update(last_refresh=last, restored_from_sheet=now_ist().isoformat())
+        save_universe_meta(meta)
+        print(f"Universe restored from the sheet's {UNIVERSE_TAB} tab ({len(u)} rows, refreshed {last}).")
+
+
+def fetch_csv(urls: List[str], parser, min_rows: int) -> Tuple[Optional[list], str]:
+    errs = []
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
+                                                       "Accept": "text/csv,*/*", "Referer": "https://www.nseindia.com/"})
+            txt = urllib.request.urlopen(req, timeout=40).read().decode("utf-8", "replace")
+            rows = parser(txt)
+            if len(rows) >= min_rows:
+                return rows, url
+            errs.append(f"{url}: only {len(rows)} rows")
+        except Exception as e:
+            errs.append(f"{url}: {str(e)[:60]}")
+    return None, "; ".join(errs)
+
+
+# ==========================================
 # 5. BOT
 # ==========================================
 class Bot:
     def __init__(self):
         _ensure_dirs()
+        self.sheet = SheetLogger()
+        restore_universe(self.sheet)
         self.universe = load_universe()
         self.broker = Broker(self.universe)
-        self.sheet = SheetLogger()
         self.state: Optional[dict] = None
         self.today = now_ist().date()
         self.lock_path = os.path.join(LOCK_DIR, f"run_{self.today}_{MODE}.json")
@@ -1209,6 +1408,7 @@ class Bot:
             tg(f"🚨 No state file {STATE_FILE}. Run `etf_dukan_bot.py init --capital 4000000 --start YYYY-MM-DD` first.")
             return
         backup_state()
+        self.apply_sheet_sync()                       # your list from the "Sync list from sheet" workflow, if new
         self.broker.login()
         self.broker.load_tokens()
         try:
@@ -1266,6 +1466,8 @@ class Bot:
             if not PAPER_MODE:
                 time.sleep(5)
                 print("\n".join(self.reconcile(report_only=True)))
+            self.sheet.flush(self.state)
+            self.maybe_refresh_universe()             # 1 Apr / 1 Oct: new ETF + stock list, used from tomorrow
         except SkipDay as e:
             self.skip(str(e))
         finally:
@@ -1273,10 +1475,195 @@ class Bot:
             self.sheet.backup_state(self.state)
             self.broker.logout()
 
+    # --- your own edits, synced from the sheet by the "ETF Bot: Sync list from sheet" workflow ---
+    def apply_sheet_sync(self) -> bool:
+        """The workflow commits universe.csv + universe_synced.txt; the VM gets them on boot (or the workflow
+        copies them onto a running VM). The first run after that makes universe.csv the bot's list.
+        Held counters missing from it stay with Include = N. Returns True if a new sync was applied."""
+        if not os.path.exists(SHEET_SYNC_STAMP):
+            return False
+        with open(SHEET_SYNC_STAMP) as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+        stamp = lines[0] if lines else ""
+        meta = load_universe_meta()
+        if not stamp or meta.get("sheet_sync_applied") == stamp:
+            return False
+        if meta.get("last_refresh") and stamp[:10] < str(meta["last_refresh"])[:10]:
+            meta["sheet_sync_applied"] = stamp          # older than the last 6-monthly refresh: superseded by it
+            save_universe_meta(meta)
+            return False
+        try:
+            new = load_universe(UNIVERSE_FILE)
+        except Exception as e:
+            tg(f"⚠️ Synced list in universe.csv is unreadable ({e}); keeping the current list.")
+            return False
+        kept = []
+        for s in sorted(self.held_symbols()):
+            if s not in new and s in self.universe:
+                new[s] = dict(self.universe[s], include=False)
+                kept.append(s)
+        if sum(1 for u in new.values() if u["include"]) < 10:
+            tg("⚠️ Synced list has fewer than 10 names with Include = Y; keeping the current list.")
+            return False
+        save_active_universe(new)
+        self.universe = new
+        self.broker.u = new
+        meta["sheet_sync_applied"] = stamp
+        save_universe_meta(meta)
+        changes = lines[1:]
+        tg(f"📝 Your sheet list (synced {stamp}) is now the bot's list:\n  " + "\n  ".join(changes[:40])
+           + (f"\nHeld but not on the sheet, kept with Include = N (sell / average only): {', '.join(kept)}" if kept else ""),
+           loud=True)
+        try:
+            self.sheet.log_universe_change([f"synced {stamp}"] + changes)
+        except Exception as e:
+            print(f"Universe History not updated: {e}")
+        return True
+
+    # --- 6-monthly universe refresh ---
+    def held_symbols(self) -> set:
+        st = self.state or {}
+        return set(st.get("positions", {})) | {l["sym"] for l in st.get("core", [])}
+
+    def maybe_refresh_universe(self):
+        """Called after the day's buys. Never raises: a failed refresh is retried on the next trading day."""
+        meta = load_universe_meta()
+        try:
+            if meta.get("sheet_pending"):
+                self._write_universe_sheet(meta)
+            if UNIVERSE_AUTO and UR.is_due(self.today, meta.get("last_refresh"), UNIVERSE_MONTHS):
+                if now_ist() > at_ist(self.today, UNIVERSE_LATEST):
+                    print(f"universe refresh due but it is after {UNIVERSE_LATEST}; next run")
+                    return
+                self.refresh_universe()
+        except Exception as e:
+            print(f"universe refresh failed:\n{traceback.format_exc()}")
+            tg(f"⚠️ 6-monthly ETF/stock list refresh failed ({str(e)[:150]}). The current list stays; "
+               f"it is tried again on the next trading day.")
+
+    def _write_universe_sheet(self, meta: dict) -> bool:
+        if SHEET_MODE == "off" or not GSHEET_ID:
+            return True
+        last = os.path.join(HOME, "state", "universe_last_refresh.json")
+        try:
+            with open(last) as f:
+                d = json.load(f)
+            self.sheet.write_universe(d["rows"], d["summary"], d["params"], dt.date.fromisoformat(d["next_due"]), d["source"])
+            notes = self.sheet.sync_watchlist(load_universe(ACTIVE_UNIVERSE_FILE), d["rows"], set(d["held"])) \
+                if UNIVERSE_SYNC_WATCHLIST else []
+            if notes:
+                tg("⚠️ Watchlist update: " + "; ".join(notes))
+            meta["sheet_pending"] = False
+            save_universe_meta(meta)
+            return True
+        except Exception as e:
+            meta["sheet_pending"] = True
+            save_universe_meta(meta)
+            tg(f"⚠️ New ETF/stock list saved on the server but not yet written to the sheet ({str(e)[:120]}). "
+               f"Retried on the next run.")
+            return False
+
+    def refresh_universe(self, force: bool = False, dry_run: bool = False) -> bool:
+        meta = load_universe_meta()
+        today = self.today.isoformat()
+        n50, src1 = fetch_csv(NIFTY50_URLS, UR.parse_nifty50, 45)
+        etl, src2 = fetch_csv(ETF_LIST_URLS, UR.parse_etf_list, 50)
+        if (n50 is None or etl is None) and not force:
+            fails = sorted(set(meta.get("list_fail_dates", [])) | {today})
+            meta["list_fail_dates"] = fails
+            save_universe_meta(meta)
+            if len(fails) < UNIVERSE_FALLBACK_DAYS:
+                tg(f"⚠️ 6-monthly list refresh: could not download the NSE "
+                   f"{'NIFTY 50 list' if n50 is None else ''}{' and ' if n50 is None and etl is None else ''}"
+                   f"{'ETF list' if etl is None else ''} ({(src1 if n50 is None else src2)[:200]}). "
+                   f"Trying again next trading day ({len(fails)}/{UNIVERSE_FALLBACK_DAYS}); after that the current "
+                   f"names are re-ranked by liquidity instead.")
+                return False
+        old = self.universe
+        etf_c: Dict[str, dict] = {}
+        for r in etl or []:
+            o = old.get(r["symbol"], {})
+            etf_c[r["symbol"]] = {"symbol": r["symbol"], "underlying": r["underlying"] or r["name"], "name": r["name"],
+                                  "sector": o.get("sector") or UR.guess_sector(r["underlying"] or r["name"])}
+        for s, o in old.items():
+            if o["type"] == S.ETF and s not in etf_c:
+                etf_c[s] = {"symbol": s, "underlying": o.get("name", s), "name": o.get("name", s), "sector": o.get("sector", "")}
+        if n50 is not None:
+            stk_c = [{"symbol": r["symbol"], "name": r["name"], "industry": r["industry"],
+                      "sector": (old.get(r["symbol"]) or {}).get("sector") or r["industry"]} for r in n50]
+        else:
+            stk_c = [{"symbol": s, "name": o.get("name", s), "sector": o.get("sector", ""),
+                      "industry": "Financial Services" if UR.is_financial(o.get("sector", "")) else o.get("sector", "")}
+                     for s, o in old.items() if o["type"] == S.STOCK]
+        source = (f"NSE NIFTY 50 list" if n50 is not None else "current stock names (NSE list unreachable)") + " + " + \
+                 (f"NSE ETF list" if etl is not None else "current ETF names (NSE list unreachable)") + \
+                 " + AngelOne daily candles"
+        sm = self.broker.scrip_master_nse()
+        cands = {c["symbol"]: c for c in list(etf_c.values()) + stk_c}
+        stats: Dict[str, dict] = {}
+        missing, failed, run_fail = [], [], 0
+        for i, (sym, c) in enumerate(cands.items()):
+            row = sm.get((old.get(sym) or {}).get("angel_symbol") or f"{sym}-EQ")
+            if not row:
+                missing.append(sym)
+                continue
+            if run_fail >= 8:                          # API struggling: let the per-minute limit reset
+                time.sleep(30)
+                run_fail = 0
+            bars = self.broker.daily_bars(row["token"], self.today)
+            if bars is None:
+                failed.append(sym)
+                run_fail += 1
+            else:
+                run_fail = 0
+                lq = UR.liquidity(bars)
+                if lq:
+                    stats[sym] = lq
+            time.sleep(0.4)                            # candle API: 3/sec, 180/min
+        asked = len(cands) - len(missing)
+        if asked == 0 or len(failed) > 0.3 * asked:
+            raise RuntimeError(f"AngelOne candles failed for {len(failed)}/{asked} counters")
+        p = universe_params()
+        new, rows, summary = UR.build(old, self.held_symbols(), list(etf_c.values()), stk_c, stats, p, self.today)
+        for s in new:                                  # keep the scrip-master symbol that was actually found
+            if not new[s].get("angel_symbol"):
+                new[s]["angel_symbol"] = f"{s}-EQ"
+        if summary["etfs"] < 10 or summary["stocks"] < 10:
+            raise RuntimeError(f"only {summary['etfs']} ETFs / {summary['stocks']} stocks passed; list not changed")
+        nd = UR.next_due(self.today, UNIVERSE_MONTHS)
+        txt = (f"🔄 {'PREVIEW of the ' if dry_run else ''}6-monthly ETF + stock list refresh {self.today:%d-%b-%Y}\n"
+               f"{summary['etfs']} ETFs + {summary['stocks']} stocks (by 6-month median traded value).\n"
+               f"New: {', '.join(summary['added']) or 'none'}\n"
+               f"Dropped: {', '.join(summary['removed']) or 'none'}\n"
+               + (f"Dropped but held (not sold; no new buys, target sell / averaging / Core 3x continue): "
+                  f"{', '.join(summary['held_dropped'])}\n" if summary["held_dropped"] else "")
+               + (f"Not found at AngelOne: {', '.join(missing[:15])}{' …' if len(missing) > 15 else ''}\n" if missing else "")
+               + (f"No candles: {', '.join(failed[:15])}\n" if failed else "")
+               + f"Source: {source}. Next refresh {nd:%d-%b-%Y}."
+               + ("" if dry_run else f"\nUsed from the next trading day. Full list: sheet tab '{UNIVERSE_TAB}'."))
+        for n in summary["notes"]:
+            print("universe:", n)
+        if dry_run:
+            with open(os.path.join(HOME, "state", "universe_preview.csv"), "w") as f:
+                f.write(UR.to_csv(new))
+            tg(txt + f"\n(Preview only: nothing changed. File state/universe_preview.csv)")
+            return True
+        save_active_universe(new)
+        with open(os.path.join(HOME, "state", "universe_last_refresh.json"), "w") as f:
+            json.dump({"rows": rows, "summary": summary, "params": p.text(), "next_due": nd.isoformat(),
+                       "source": source, "held": sorted(self.held_symbols())}, f, default=str)
+        meta.update(last_refresh=today, source=source, etfs=summary["etfs"], stocks=summary["stocks"],
+                    list_fail_dates=[], sheet_pending=True)
+        save_universe_meta(meta)
+        tg(txt, loud=bool(summary["added"] or summary["removed"] or summary["held_dropped"]))   # list changed: ring
+        self._write_universe_sheet(meta)
+        return True
+
     def plan_now(self):
         self.state = load_state()
         if not self.state:
             raise SystemExit(f"No state file {STATE_FILE}; run init first.")
+        self.apply_sheet_sync()
         self.broker.login()
         self.broker.load_tokens()
         try:
@@ -1331,6 +1718,9 @@ def main():
     sp.add_parser("reconcile")
     sp.add_parser("recover")
     sp.add_parser("flush-sheet")
+    ru = sp.add_parser("refresh-universe", help="the 6-monthly ETF + stock list refresh, now")
+    ru.add_argument("--dry-run", action="store_true", help="show the new list on Telegram; change nothing")
+    ru.add_argument("--force", action="store_true", help="refresh even if not due / NSE lists unreachable")
     for name in ("withdraw", "deposit"):
         w = sp.add_parser(name)
         w.add_argument("amount", type=float)
@@ -1424,6 +1814,18 @@ def main():
             sys.exit(1)
     elif a.cmd == "plan":
         bot.plan_now()
+    elif a.cmd == "refresh-universe":
+        bot.state = load_state()
+        meta = load_universe_meta()
+        if not (a.force or a.dry_run) and not UR.is_due(bot.today, meta.get("last_refresh"), UNIVERSE_MONTHS):
+            print(f"Not due: last refresh {meta.get('last_refresh')}, next {UR.next_due(bot.today, UNIVERSE_MONTHS)}. "
+                  f"Use --force or --dry-run.")
+            return
+        bot.broker.login()
+        try:
+            bot.refresh_universe(force=a.force, dry_run=a.dry_run)
+        finally:
+            bot.broker.logout()
     elif a.cmd in ("reconcile", "recover"):
         bot.state = load_state()
         bot.broker.login()

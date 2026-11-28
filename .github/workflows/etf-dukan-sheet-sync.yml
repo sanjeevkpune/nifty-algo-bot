@@ -1,0 +1,138 @@
+name: "ETF Bot: Sync list from sheet"
+
+# Run this by hand (Actions > "ETF Bot: Sync list from sheet" > Run workflow) after you edit the ETF / stock
+# list on your Google Sheet's Watchlist tab (Type, Include, NSE symbol columns).
+#
+# It reads the Watchlist, checks every row, and commits the result to etf_dukan/universe.csv on main.
+# The bot makes it its list at the start of its next run (2:45 pm):
+#   * VM off  -> the next boot pulls it (startup.sh does git reset --hard origin/main).
+#   * VM on   -> this workflow copies just the two list files onto the VM, so today's 2:45 pm run uses it.
+# Held counters you removed from the sheet are kept by the bot with Include = N (they still sell / average).
+# Every run sends a Telegram message (what changed, dry run / applied / refused / failed), using the
+# TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets the VM already uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only show what would change (commit nothing)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: etf-dukan-sheet-sync
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: "streamlit-db-503313"
+  VM_NAME: "angel-one-auto-trading-bot-v2"
+  ZONE: "us-central1-c"
+  VM_USER: "kumar_sanjeev_pune"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install gspread
+        run: pip install --quiet gspread google-auth
+
+      - name: Read and check the Watchlist
+        id: sync
+        env:
+          SA_JSON: ${{ secrets.GCP_SA_KEY }}
+          SHEET_ID: ${{ vars.EKD_GSHEET_ID }}
+        run: |
+          if [ -z "$SHEET_ID" ]; then echo "::error::Repository variable EKD_GSHEET_ID is not set."; exit 1; fi
+          printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa.json"
+          set +e
+          python3 etf_dukan/sheet_sync.py --sheet "$SHEET_ID" --sa "$RUNNER_TEMP/sa.json" | tee "$RUNNER_TEMP/out.txt"
+          code=${PIPESTATUS[0]}
+          set -e
+          rm -f "$RUNNER_TEMP/sa.json"
+          { echo "### ETF list sync from the sheet"; echo '```'; cat "$RUNNER_TEMP/out.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" != "0" ]; then
+            echo "🚨 REFUSED: the sheet's list was rejected; the bot's list is unchanged." > "$RUNNER_TEMP/result.txt"
+            echo "::error::The sheet's list was rejected; nothing changed."; exit 1
+          fi
+          if git diff --quiet -- etf_dukan/universe.csv etf_dukan/universe_synced.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No change: the sheet's list already matches the bot's list." > "$RUNNER_TEMP/result.txt"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              echo "DRY RUN: nothing committed. Run again without 'dry run' to apply." > "$RUNNER_TEMP/result.txt"
+            else
+              echo "✅ APPLIED: committed to the repo." > "$RUNNER_TEMP/result.txt"
+            fi
+          fi
+
+      - name: Commit the new list to main
+        if: steps.sync.outputs.changed == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add etf_dukan/universe.csv etf_dukan/universe_synced.txt
+          git commit -m "ETF list synced from the sheet's Watchlist"
+          git push origin HEAD:main
+
+      - name: Authenticate to Google Cloud
+        if: steps.sync.outputs.changed == 'true' && github.event.inputs.dry_run != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        if: steps.sync.outputs.changed == 'true' && github.event.inputs.dry_run != 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Copy the list onto the VM if it is running
+        if: steps.sync.outputs.changed == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          STATUS=$(gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --format='get(status)' || echo UNKNOWN)
+          if [ "$STATUS" != "RUNNING" ]; then
+            echo "VM is $STATUS: the next boot pulls the new list." | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/result.txt"
+            exit 0
+          fi
+          # Only the two list files are updated; no other code changes reach the running VM.
+          gcloud compute ssh "${VM_USER}@${VM_NAME}" --zone="$ZONE" --project="$PROJECT_ID" --quiet --command="
+            cd /home/${VM_USER}/trading-bot && sudo git -c safe.directory=\* fetch -q origin main &&
+            sudo git -c safe.directory=\* checkout origin/main -- etf_dukan/universe.csv etf_dukan/universe_synced.txt && head -1 etf_dukan/universe_synced.txt" \
+            && echo "Copied onto the running VM: the bot's next run (2:45 pm) uses it." | tee -a "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/result.txt" \
+            || { echo "::warning::Could not reach the VM; the next boot pulls the new list."; \
+                 echo "⚠️ Could not reach the running VM; the next boot pulls the new list." >> "$RUNNER_TEMP/result.txt"; }
+
+      - name: Telegram message
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets not set; no Telegram message."; exit 0
+          fi
+          {
+            echo "🟢 ANGEL ONE · ETF ki Dukan"
+            echo "📝 Sync list from sheet ($(TZ=Asia/Kolkata date '+%d-%b %H:%M') IST)$([ '${{ github.event.inputs.dry_run }}' = 'true' ] && echo ' - DRY RUN')"
+            if [ -f "$RUNNER_TEMP/result.txt" ]; then cat "$RUNNER_TEMP/result.txt"
+            else echo "❌ FAILED before the list was checked (job $JOB_STATUS). Nothing changed."; fi
+            if [ -f "$RUNNER_TEMP/out.txt" ]; then echo; head -c 3000 "$RUNNER_TEMP/out.txt"; fi
+            echo; echo "$RUN_URL"
+          } > "$RUNNER_TEMP/tg.txt"
+          curl -s -o /dev/null -w "Telegram HTTP %{http_code}\n" "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text@$RUNNER_TEMP/tg.txt"

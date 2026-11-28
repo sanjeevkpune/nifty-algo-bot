@@ -13,7 +13,9 @@ lock and state files, fill checks, `PAPER_MODE`, crash handling.
 | `etf_dukan_bot.py` | The bot: login, data, plan, orders, reconciliation, sheet, CLI |
 | `strategy.py` | The rules as pure functions (no broker, no clock) |
 | `signals.py` | Reads the sheet's Signals tab and cross-checks it with the bot's plan |
-| `universe.csv` | The tracker's Watchlist: 47 ETFs + 30 stocks with Include = Y (16 more ETFs at N) |
+| `universe.csv` | The starting list: 47 ETFs + 30 stocks with Include = Y (16 more ETFs at N). After the first 6-monthly refresh the bot uses `state/universe_active.csv` instead |
+| `universe_refresh.py` | The 6-monthly ETF + stock list refresh rules (pure functions) |
+| `sheet_sync.py` | Used by the "ETF Bot: Sync list from sheet" workflow: Watchlist tab -> `universe.csv` |
 | `config.env.example` | Every setting with its default (the VM's `/etc/trade-config/etf_dukan.env` is written by the setup script) |
 | `nse_holidays.txt` | Optional holiday list |
 | `setup_etf_dukan.sh` | VM setup, called from `startup.sh` on every boot (idempotent) |
@@ -189,6 +191,7 @@ python etf_dukan_bot.py withdraw 15000      # after you take the monthly withdra
 python etf_dukan_bot.py deposit 100000
 python etf_dukan_bot.py split ITBEES 10     # corporate action: 1 share became 10
 python etf_dukan_bot.py flush-sheet         # retry queued sheet rows
+python etf_dukan_bot.py refresh-universe --dry-run   # preview the 6-monthly ETF + stock list refresh (--force: do it now)
 ```
 
 ## Assumptions in v1 (tell me if any is wrong)
@@ -205,12 +208,60 @@ python etf_dukan_bot.py flush-sheet         # retry queued sheet rows
 4. **Pledged holdings.** Selling holdings that are pledged for the option bot's margin is assumed to work directly
    at AngelOne. If AngelOne asks for an unpledge first, the sell is rejected and you get an alert.
 5. **Signals and universe.** The live signals come from the sheet's Signals tab, cross-checked as described
-   above. The universe is the tracker's Watchlist at today's Include flags, exported to `universe.csv`. Edit that file
-   when you change the Watchlist; the bot doesn't read the Watchlist tab.
+   above. The universe is refreshed by the bot every 6 months, and your own Watchlist edits reach it when you
+   run the "Sync list from sheet" workflow (see "ETF and stock list refresh" below).
 6. **Times.** Sell orders stop at 15:09 and buy orders at 15:24, so no order is sent close to the 15:30 close.
    A start after 15:15 skips the day.
 7. **One run a day.** If the server is off at 2:45 pm, that day is skipped. Nothing is caught up the next day,
    the same as missing a day by hand.
+
+## ETF and stock list refresh (every 6 months)
+
+The list of counters the bot may buy is refreshed by the bot itself, inside its normal daily run, so there is no
+extra job or workflow.
+
+- **When.** After the 3:10 pm buys on the first trading day on or after **1 April** and **1 October** (just after
+  NSE's March / September index rebalances), and once on the first run after this was installed. The new list is
+  used from the next trading day, so the day's trades never change halfway.
+- **Liquidity.** The **median daily traded value** (close x volume) over the last ~6 months (125 trading days),
+  from AngelOne daily candles. The median ignores one-off block deals that would inflate an average.
+- **ETFs.** All NSE-listed ETFs (NSE's ETF list), except debt / liquid / G-Sec / bond ETFs. One ETF per underlying
+  index or commodity: the most liquid one. It must trade at least **₹1 crore a day** and have **60+ trading days**
+  of history. At most **50** ETFs, most liquid first. Gold and silver are each one group (GOLDBEES / SILVERBEES today).
+- **Stocks.** The current **NIFTY 50** members, the **30 most liquid**, with at most **4 financials** and at most
+  **3 per other NSE industry**.
+- **Less churn.** A name already in the list counts 25% more liquid when it is compared with a newcomer.
+- **Held counters that drop out are not sold.** They stay in the bot's list with Include = N: no new buys, but the
+  target sell, averaging and Core 3x sell carry on as normal until the position is closed.
+- **Sheet.** The `Universe` tab gets the full list with liquidity numbers and status (KEPT / NEW / DROPPED /
+  DROPPED - held), the `Universe History` tab gets one row per refresh (added / dropped), and the tracker's
+  `Watchlist` gets the new Include flags, new names in empty rows (or rows of dropped, unheld names), and fresh
+  volume / price snapshots. Only input cells are written; formulas are not touched.
+- **Telegram.** One message with what was added and dropped.
+- **If NSE can't be reached** from the server, it retries on the next trading days; after 10 failed days it
+  re-ranks the current names by liquidity instead. If AngelOne candles fail, nothing changes and it retries.
+- **Rebuilt server.** The list is read back from the sheet.
+
+### Your own edits in the sheet (sync when you want)
+
+The tracker's **Watchlist** tab is the list you edit: **Type** (B), **Include** (C), **NSE symbol** (D), plus name /
+sector if you like. To add a name, fill an empty row; to stop new buys in a name, set Include to N.
+Nothing changes in the bot until you sync:
+
+1. GitHub > **Actions** > **ETF Bot: Sync list from sheet** > **Run workflow** (tick *dry run* to only see the changes).
+2. It reads the Watchlist, checks every row (ETF/Stock, Y/N, a symbol AngelOne knows) and commits the list to
+   `etf_dukan/universe.csv` (+ `universe_synced.txt` with the time and the changes). The job summary shows what changed.
+   Fewer than 10 names with Include = Y (e.g. a cleared tab) is rejected and nothing changes.
+3. If the VM is running, the workflow copies just those two files onto it; if it's off, the next boot pulls them.
+4. The bot's next run (2:45 pm) makes it its list and tells you on Telegram. A held counter you removed stays with
+   Include = N (it still sells / averages). A sync older than the last 6-monthly refresh is not re-applied.
+
+**Telegram.** Every run of the workflow sends a message (what changed, dry run / applied / refused / failed, with a
+link to the run), using the `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` repo secrets the VM already uses. The bot
+also rings when it switches to a synced list, and when a 6-monthly refresh adds or drops names.
+
+The 6-monthly refresh rewrites the Include flags from liquidity. Re-apply a manual choice after it, or put names you
+never want in `EKD_UNIV_EXCLUDE`.
 
 ## Checking the setup
 
