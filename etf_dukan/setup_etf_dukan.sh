@@ -10,6 +10,9 @@
 #   ekd-capital      vars.EKD_CAPITAL       default 4000000
 #   ekd-gsheet-id    vars.EKD_GSHEET_ID     default: the ETF ki Dukan tracker sheet
 #   ekd-api-key      secrets.EKD_API_KEY    optional separate SmartAPI app key; else the shared API_KEY is used
+#   bot-settings     written by the "Bot settings (paper/live, lots)" workflow (.github/workflows/bot-settings.yml):
+#                    paper/live and lots for every bot, KEY=number lines. It wins over the values above and over
+#                    the defaults startup.sh writes into config.env (PAPER_MODE, NUM_LOTS, DHAN_PAPER_MODE, ...).
 # AngelOne login, Telegram and the Google service account are the ones startup.sh already writes
 # (/etc/trade-config/config.env and <trading-bot>/service_account.json).
 set -u
@@ -22,6 +25,29 @@ META_URL="http://metadata.google.internal/computeMetadata/v1/instance/attributes
 
 meta() { curl -sf -H "Metadata-Flavor: Google" "${META_URL}/$1" 2>/dev/null || true; }
 
+# Paper/live and lots from the "Bot settings" workflow. Only known keys with whole-number values are used.
+BOT_SETTINGS=$(meta bot-settings)
+setting() { printf '%s\n' "${BOT_SETTINGS}" | tr -d '\r ' | grep -E "^$1=[0-9]+$" | tail -1 | cut -d= -f2; }
+
+echo "=== Bot settings (paper/live, lots) from the workflow ==="
+CONF=/etc/trade-config/config.env
+if [ -z "${BOT_SETTINGS}" ]; then
+    echo "None saved yet: startup.sh defaults stay."
+elif [ -f "${CONF}" ]; then
+    for KEY in PAPER_MODE NUM_LOTS DHAN_PAPER_MODE DHAN_NUM_LOTS DHAN_V4_LIVE DHAN_V4_NUM_LOTS; do
+        VAL=$(setting "${KEY}")
+        [ -n "${VAL}" ] || continue
+        # Replace the line in place (some bots read config.env themselves and keep the FIRST value).
+        if grep -q "^${KEY}=" "${CONF}"; then
+            sed -i "s/^${KEY}=.*/${KEY}=${VAL}/" "${CONF}"
+        else
+            echo "${KEY}=${VAL}" >> "${CONF}"
+        fi
+        echo "  ${KEY}=${VAL}"
+    done
+    chmod 644 "${CONF}"
+fi
+
 echo "=== ETF ki Dukan bot: setup ==="
 if [ ! -f "${BOT_DIR}/etf_dukan_bot.py" ]; then
     echo "ETF bot code not found in ${BOT_DIR}; skipping."
@@ -33,6 +59,10 @@ START=$(meta ekd-start-date);  [ -n "${START}" ] || START=auto
 CAPITAL=$(meta ekd-capital);   [ -n "${CAPITAL}" ] || CAPITAL=4000000
 SHEET=$(meta ekd-gsheet-id);   [ -n "${SHEET}" ] || SHEET="${DEFAULT_SHEET}"
 EKD_KEY=$(meta ekd-api-key)
+# The workflow's ETF settings win over the repo variable.
+S_PAPER=$(setting EKD_PAPER_MODE); if [ -n "${S_PAPER}" ]; then PAPER="${S_PAPER}"; [ "${PAPER}" = "0" ] || PAPER=1; fi
+BUY_AMT=$(setting EKD_BUY_AMOUNT)
+AVG_AMT=$(setting EKD_AVG_AMOUNT)
 
 echo "1. Python packages (already installed by startup.sh; this only fills gaps)..."
 pip3 install --break-system-packages -q smartapi-python pyotp requests gspread google-auth logzero websocket-client pycryptodome \
@@ -54,6 +84,8 @@ EKD_SIGNAL_POLICY=bot
 EKD_BROKER_CASH_FLOOR=500000
 ENVEOF
 if [ -n "${EKD_KEY}" ]; then echo "EKD_API_KEY=${EKD_KEY}" >> /etc/trade-config/etf_dukan.env; fi
+if [ -n "${BUY_AMT}" ]; then echo "EKD_BUY_AMOUNT=${BUY_AMT}" >> /etc/trade-config/etf_dukan.env; fi
+if [ -n "${AVG_AMT}" ]; then echo "EKD_AVG_AMOUNT=${AVG_AMT}" >> /etc/trade-config/etf_dukan.env; fi
 chown root:"${USER_NAME}" /etc/trade-config/etf_dukan.env
 chmod 640 /etc/trade-config/etf_dukan.env
 

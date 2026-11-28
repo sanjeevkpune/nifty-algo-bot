@@ -103,9 +103,9 @@ SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.j
 STATE_DIR = os.environ.get("LEMONN_STATE_DIR",
                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"))
 
-# Paper trading until the end of 2026, then controlled by DHAN_PAPER_MODE
-PAPER_MODE_END_DATE = datetime.date(2026, 12, 31)
-PAPER_MODE = True if now_ist().date() <= PAPER_MODE_END_DATE else env_bool("DHAN_PAPER_MODE")
+# Paper unless DHAN_PAPER_MODE is exactly 0. Set it with the "Bot settings (paper/live, lots)" workflow.
+# (A missing value means paper, so a broken config.env can never switch this bot live.)
+PAPER_MODE = os.environ.get("DHAN_PAPER_MODE", "1").strip() != "0"
 
 NUM_LOTS = int(os.environ.get("DHAN_NUM_LOTS", "5"))
 PAPER_SLIPPAGE_PTS = 0.25

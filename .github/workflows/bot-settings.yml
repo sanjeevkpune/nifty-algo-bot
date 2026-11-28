@@ -1,0 +1,160 @@
+name: Bot settings (paper/live, lots)
+
+# One switch for every bot in the VM crontab: paper or live, and how many lots (ETF: rupees per buy).
+#
+#   strategy      one bot, or all of them
+#   mode          keep as is / paper / live
+#   lots          option bots only (1-20). Empty = keep. With "All strategies" it sets all three option bots.
+#   etf amount    ETF ki Dukan only: rupees per buy (new and averaging buys). Empty = keep.
+#   confirm       type LIVE when a bot goes live, or a live bot's size goes up. Otherwise nothing is changed.
+#   Run with everything on "keep" / empty to just see the current settings.
+#
+# Where it is stored: the VM metadata key "bot-settings" (numbers only, no secrets; nothing is committed).
+# When it takes effect:
+#   * VM stopped, or a weekday 09:00-15:35 IST (bots trading): saved now, used from the next boot.
+#   * VM running outside those hours: also applied now (pull main, rewrite the settings, crontab).
+# Every run sends the result to Telegram. A bot that is already running keeps its settings until its next start.
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: 'Strategy'
+        required: true
+        default: 'All strategies'
+        type: choice
+        options:
+          - All strategies
+          - Adaptive Strangle (AngelOne)
+          - Lemonn v3 Dual-Session (Dhan)
+          - Lemonn v4 Sideways Straddle (Dhan)
+          - ETF ki Dukan (AngelOne)
+      mode:
+        description: 'Paper or live'
+        required: true
+        default: 'keep as is'
+        type: choice
+        options:
+          - keep as is
+          - paper
+          - live
+      lots:
+        description: 'Number of lots (option bots, 1-20). Empty = keep'
+        required: false
+        default: ''
+        type: string
+      etf_buy_amount:
+        description: 'ETF ki Dukan: rupees per buy, e.g. 40000. Empty = keep'
+        required: false
+        default: ''
+        type: string
+      confirm:
+        description: 'Type LIVE to allow real orders (going live, or more lots while live)'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: bot-settings
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: "streamlit-db-503313"
+  VM_NAME: "angel-one-auto-trading-bot-v2"
+  ZONE: "us-central1-c"
+  VM_USER: "kumar_sanjeev_pune"
+
+jobs:
+  settings:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Read the current settings
+        run: |
+          gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --format=json > vm.json
+          jq -r '[.metadata.items[]? | select(.key=="bot-settings") | .value][0] // ""' vm.json > current.txt
+          jq -r '[.metadata.items[]? | select(.key=="ekd-paper-mode") | .value][0] // ""' vm.json > ekd_meta.txt
+          jq -r '.status' vm.json > status.txt
+          echo "VM status: $(cat status.txt)"; echo "Saved settings:"; cat current.txt
+
+      - name: Work out the new settings
+        id: calc
+        env:
+          STRATEGY: ${{ github.event.inputs.strategy }}
+          MODE: ${{ github.event.inputs.mode }}
+          LOTS: ${{ github.event.inputs.lots }}
+          ETF_AMOUNT: ${{ github.event.inputs.etf_buy_amount }}
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          export CURRENT="$(cat current.txt)" EKD_META="$(cat ekd_meta.txt)"
+          python3 .github/scripts/bot_settings.py --out new.txt --summary summary.txt
+
+      - name: Save to the VM metadata
+        if: steps.calc.outputs.changed == 'true'
+        run: |
+          gcloud compute instances add-metadata "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" \
+              --metadata-from-file=bot-settings=new.txt
+          echo "Saved:"; cat new.txt
+
+      - name: Apply now if the VM is running and the bots are not trading
+        id: apply
+        if: steps.calc.outputs.changed == 'true'
+        run: |
+          STATUS=$(cat status.txt)
+          HHMM=$(TZ=Asia/Kolkata date +%H%M); DOW=$(TZ=Asia/Kolkata date +%u)
+          if [ "$STATUS" != "RUNNING" ]; then
+            echo "when=Takes effect at the next VM start (VM is ${STATUS})." >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0900 ] && [ "$HHMM" -le 1535 ]; then
+            echo "when=Bots are trading now (${HHMM} IST): takes effect at the next VM start, today's runs are unchanged." >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          DIR="/home/${VM_USER}/trading-bot"
+          if gcloud compute ssh "${VM_USER}@${VM_NAME}" --zone="$ZONE" --project="$PROJECT_ID" --quiet --command="
+                set -e
+                cd ${DIR}
+                sudo git fetch origin main && sudo git reset --hard origin/main
+                sudo chown -R ${VM_USER}:${VM_USER} ${DIR}
+                sudo bash ${DIR}/etf_dukan/setup_etf_dukan.sh ${VM_USER} ${DIR}
+                echo '--- now in config.env:'
+                grep -E '^(PAPER_MODE|NUM_LOTS|DHAN_PAPER_MODE|DHAN_NUM_LOTS|DHAN_V4_LIVE|DHAN_V4_NUM_LOTS)=' /etc/trade-config/config.env
+                echo '--- now in etf_dukan.env:'
+                sudo grep -E '^EKD_(PAPER_MODE|BUY_AMOUNT|AVG_AMOUNT)=' /etc/trade-config/etf_dukan.env"; then
+            echo "when=Applied on the VM now; each bot uses it from its next start." >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not apply on the running VM; the saved settings are used at the next start."
+            echo "when=Saved, but applying on the running VM failed: takes effect at the next VM start." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Telegram
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WHEN: ${{ steps.apply.outputs.when }}
+          CALC: ${{ steps.calc.outcome }}
+          CHANGED: ${{ steps.calc.outputs.changed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$CALC" = "success" ] && [ -f summary.txt ]; then
+            MSG="$(cat summary.txt)"
+            [ -n "$WHEN" ] && MSG="${MSG}"$'\n\n'"${WHEN}"
+            SILENT=true; [ "$CHANGED" = "true" ] && SILENT=false
+          else
+            MSG="❌ Bot settings workflow failed or was refused: nothing was changed."$'\n'"${RUN_URL}"
+            SILENT=false
+          fi
+          echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then echo "No Telegram secrets; skipping."; exit 0; fi
+          curl -sS -o /dev/null -w "Telegram HTTP %{http_code}\n" "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=${MSG}" \
+              --data-urlencode "disable_notification=${SILENT}" || true

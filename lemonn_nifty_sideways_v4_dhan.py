@@ -38,8 +38,8 @@ Differences to know:
       - "Lemonn_v4_Trades": one row per leg, same columns as Lemonn_Dual_v3
       - "Lemonn_v4_Daily": one row per trading day, traded or skipped, with
         every filter value, so paper results can be compared with the backtest.
-  * Paper mode: always on until 31 Dec 2026; after that it stays on unless
-    you add DHAN_V4_LIVE=1 to config.env.
+  * Paper mode: on unless DHAN_V4_LIVE=1 is in config.env (set by the
+    "Bot settings (paper/live, lots)" workflow).
 """
 import sys
 import os
@@ -94,11 +94,9 @@ SHEET_TAB = os.environ.get("LEMONN_V4_SHEET_TAB", "Lemonn_v4_Daily")      # one 
 STATE_DIR = os.environ.get("LEMONN_STATE_DIR",
                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"))
 
-# Paper trading until the end of 2026, then controlled by DHAN_PAPER_MODE
-# v4 is a new strategy: it stays in PAPER mode until you deliberately switch it.
-# Live trading needs BOTH: the date is after 31 Dec 2026 AND DHAN_V4_LIVE=1 in config.env.
-PAPER_MODE_END_DATE = datetime.date(2026, 12, 31)
-PAPER_MODE = not (now_ist().date() > PAPER_MODE_END_DATE and env_bool("DHAN_V4_LIVE", "0"))
+# v4 stays in PAPER mode until you deliberately switch it: live only with DHAN_V4_LIVE=1 in config.env.
+# Set it with the "Bot settings (paper/live, lots)" workflow.
+PAPER_MODE = not env_bool("DHAN_V4_LIVE", "0")
 
 NUM_LOTS = int(os.environ.get("DHAN_V4_NUM_LOTS", os.environ.get("DHAN_NUM_LOTS", "5")))
 PAPER_SLIPPAGE_PTS = 0.25
