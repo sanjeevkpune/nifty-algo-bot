@@ -94,12 +94,12 @@ a{color:var(--accent)}
 
   <section id="hm" hidden>
     <h2>Hilega-Milega weekly F&amp;O alerts <span class="pill">Alerts only</span></h2>
-    <p class="muted">Weekly RSI(9) with green EMA3 and red WMA21. Buy: first week RSI is above 50 and above both lines, NIFTY above its 50-day average, strongest 3-month gain first, 15 slots. Sell: weekly RSI closes below 50. Fills at the next open. Written every Friday evening by GitHub Actions into the HM_ tabs of the V2 sheet. "backtest seed" rows were already held by the backtest when live tracking began on 20 Nov 2026.</p>
+    <p class="muted">Every signal, no cap. Weekly RSI(9) with green EMA3 and red WMA21. Buy: first week RSI is above 50 and above both lines. Sell: weekly RSI closes below 50. Filled at the next open, measured per signal on a notional ₹1 lakh each, net of 0.18% a side. Written every Friday evening by GitHub Actions into the HM_ tabs of the V2 sheet. Performance counts live signals only (from the week ending 27 Nov 2026); "backtest seed" rows were already in a buy state when tracking began and still get sell alerts.</p>
     <div class="grid" id="hm-cards"></div>
-    <h3>Model return vs NIFTY since live start (weekly, %): bars = model, line = NIFTY</h3><div class="chart" id="hm-chart"></div>
-    <h3>Open positions and next-open orders</h3><div class="tw"><table id="hm-open"></table></div>
-    <h3>Signals, newest first</h3><div class="tw"><table id="hm-signals"></table></div>
-    <h3>Closed trades, newest first</h3><div class="tw"><table id="hm-closed"></table></div>
+    <h3>Live signals: total P&amp;L by week (bars) and booked P&amp;L (line), ₹1 lakh per signal</h3><div class="chart" id="hm-chart"></div>
+    <h3>Open signals and next-open orders</h3><div class="tw"><table id="hm-open"></table></div>
+    <h3>Alerts, newest first</h3><div class="tw"><table id="hm-signals"></table></div>
+    <h3>Closed signals, newest first</h3><div class="tw"><table id="hm-closed"></table></div>
   </section>
 
   <section id="backtests" hidden>
@@ -226,14 +226,14 @@ function render() {
   table('ad-log', d.adaptive.log, [['date', 'Date'], ['timestamp', 'Time'], ['strategy_version', 'Version'], ['session_status', 'Status'], ['nifty_spot_950', 'Spot 9:50', 'p'], ['final_ce_symbol', 'CE'], ['final_pe_symbol', 'PE'], ['active_qty', 'Qty', 'n'], ['exit_reason', 'Exit / skip reason'], ['net_pnl', 'Net P&L', 'r']], 'No sessions logged yet.');
 
   const hm = d.hm || {summary: {}}, hs = hm.summary;
-  cards('hm-cards', [['Model return since start', hs.model_return, 'pct', 1], ['NIFTY over the same weeks', hs.nifty_return, 'pct', 1],
-    ['Model value (notional)', hs.model_value, 'rs'], ['Open positions / 15', hs.open], ['Closed trades', hs.closed],
-    ['Win rate, closed (net)', hs.win_rate, 'pct'], ['Average closed trade (net)', hs.avg_net, 'pct', 1],
-    ['Last week ending', hs.week || null], ['New buys (NIFTY filter)', hs.new_buys || null]]);
-  chart('hm-chart', hm.curve, {x: 'date', y: 'model', line: 'nifty', lineName: 'NIFTY', unit: '%', label: 'Model vs NIFTY return', empty: 'No weekly rows yet. The first run is Friday evening after the close.'});
-  table('hm-open', hm.open, [['symbol', 'Symbol'], ['status', 'Status'], ['source', 'Source'], ['buy_signal_week', 'Buy signal week'], ['entry_date_next_open', 'Entry date'], ['entry_price', 'Entry', 'p'], ['last_price', 'Last', 'p'], ['return', 'Return %', 'p'], ['p_l_1_15_slot', 'P&L ₹ (1/15 slot)', 'r'], ['weeks_held', 'Weeks', 'n'], ['sell_signal_week', 'Sell signal week']], 'No open positions.');
-  table('hm-signals', hm.signals, [['alert_time_ist', 'Alert time'], ['signal_week', 'Week'], ['signal', 'Signal'], ['symbol', 'Symbol'], ['weekly_close', 'Close', 'p'], ['rsi_9', 'RSI', 'p'], ['green_ema3', 'Green', 'p'], ['red_wma21', 'Red', 'p'], ['3m_gain_at_signal', '3M %', 'p'], ['note', 'Note']], 'No signals yet.');
-  table('hm-closed', hm.closed, [['symbol', 'Symbol'], ['source', 'Source'], ['entry_date_next_open', 'Bought'], ['entry_price', 'Entry', 'p'], ['sell_signal_week', 'Sell signal week'], ['exit_date_next_open', 'Sold'], ['exit_price', 'Exit', 'p'], ['net_return_after_0_18_side', 'Net return %', 'p'], ['p_l_1_15_slot', 'P&L ₹', 'r'], ['weeks_held', 'Weeks', 'n']], 'No closed trades yet.');
+  cards('hm-cards', [['Open buy signals (all)', hs.open_all], ['Live open / closed', (hs.open_live ?? '—') + ' / ' + (hs.closed_live ?? '—')],
+    ['Live open P&L', hs.open_pnl, 'rs', 1], ['Live booked P&L', hs.booked_pnl, 'rs', 1], ['Win rate, closed (net)', hs.win_rate, 'pct'],
+    ['Average closed signal (net)', hs.avg_net, 'pct', 1], ['Average vs NIFTY, same weeks', hs.vs_nifty, 'pct', 1],
+    ['Last week ending', hs.week || null], ['Last week buys / sells', (hs.buys ?? '—') + ' / ' + (hs.sells ?? '—')], ['NIFTY above 50-DMA', hs.nifty_filter || null]]);
+  chart('hm-chart', hm.curve, {x: 'date', y: 'total', line: 'booked', lineName: 'booked', label: 'Live signal P&L', empty: 'No weekly rows yet. The first run is Friday evening after the close.'});
+  table('hm-open', hm.open, [['symbol', 'Symbol'], ['status', 'Status'], ['source', 'Source'], ['nifty_above_50_dma_at_signal', 'NIFTY>50DMA'], ['buy_signal_week', 'Buy signal week'], ['entry_date_next_open', 'Entry date'], ['entry_price', 'Entry', 'p'], ['last_price', 'Last', 'p'], ['return', 'Return %', 'p'], ['nifty_same_period', 'NIFTY %', 'p'], ['p_l_per_signal', 'P&L ₹', 'r'], ['weeks_held', 'Weeks', 'n'], ['sell_signal_week', 'Sell signal week']], 'No open signals.');
+  table('hm-signals', hm.signals, [['alert_time_ist', 'Alert time'], ['signal_week', 'Week'], ['signal', 'Signal'], ['symbol', 'Symbol'], ['weekly_close', 'Close', 'p'], ['rsi_9', 'RSI', 'p'], ['green_ema3', 'Green', 'p'], ['red_wma21', 'Red', 'p'], ['3m_gain_at_signal', '3M %', 'p'], ['note', 'Note']], 'No alerts yet.');
+  table('hm-closed', hm.closed, [['symbol', 'Symbol'], ['source', 'Source'], ['nifty_above_50_dma_at_signal', 'NIFTY>50DMA'], ['entry_date_next_open', 'Bought'], ['entry_price', 'Entry', 'p'], ['sell_signal_week', 'Sell signal week'], ['exit_date_next_open', 'Sold'], ['exit_price', 'Exit', 'p'], ['net_return_after_0_18_side', 'Net %', 'p'], ['nifty_same_period', 'NIFTY %', 'p'], ['net_vs_nifty', 'vs NIFTY %', 'p'], ['p_l_per_signal', 'P&L ₹', 'r'], ['weeks_held', 'Weeks', 'n']], 'No closed signals yet.');
 
   const bt = d.backtests;
   table('bt-table', bt.tradetron, [['strategy', 'Strategy'], ['window', 'Window'], ['capital', 'Capital', 'r'], ['net_p_l', 'Net P&L', 'r'], ['cagr', 'CAGR %', 'p'], ['win_rate', 'Win rate %', 'p'], ['max_dd', 'Max DD (₹)', 'r'], ['sharpe', 'Sharpe', 'p'], ['trades', 'Trades', 'n'], ['high_caveats', 'High caveats'], ['report', 'Report', 'link'], ['updated', 'Copied on']], 'The "Tradetron Backtests" tab is empty.');

@@ -71,12 +71,53 @@ def test_process():
     check(sold is not None and sold > bought, f"UP gets a SELL signal later ({sold})")
     t = [t for t in st["trades"] if t["sym"] == "UP"]
     check(t and t[0]["status"] == "CLOSED" and t[0]["entry_px"] and t[0]["exit_px"], "trade closed with entry and exit prices")
-    check(abs(st["weekly"][-1]["nav"] - (st["cash"] + sum(
-        p["units"] * W.close_at(W.weeks[-1], s) for s, p in st["positions"].items()))) < 2, "model value = cash + holdings")
+    wk = st["weekly"][-1]
+    check(wk["open_signals"] == len(st["positions"]) and wk["closed"] == sum(t["status"] == "CLOSED" for t in st["trades"]),
+          "weekly row counts open and closed signals")
+    check(t[0]["vs_nifty_pct"] is not None and t[0]["nifty_ret_pct"] is not None, "closed signal has NIFTY comparison")
     rows = H.sheet_rows(st)
     check(rows["HM_Trades"][0][:3] == ["Trade id", "Symbol", "Status"] and len(rows["HM_Weekly"]) == len(st["weekly"]) + 1,
           "sheet tabs have headers and one weekly row per week")
     check(all(len(r) == len(rows["HM_Trades"][0]) for r in rows["HM_Trades"]), "trade rows match the header width")
+
+
+def test_no_cap():
+    """30 stocks all signalling in the same week: every one is alerted and tracked (no 15-stock cap)."""
+    O, C, V, N = synthetic()
+    syms = [f"S{i}" for i in range(30)]
+    C2 = pd.concat([C["UP"].rename(s) * (1 + i / 100) for i, s in enumerate(syms)], axis=1)
+    O2, V2 = C2.copy(), C2 * 0 + 1e7
+    W = H.Weekly(O2, C2, V2, N, C2.index[-1])
+    st = H.new_state()
+    most = 0
+    for w in W.weeks[60:]:
+        ev = H.process_week(st, W, w, syms, "t")
+        most = max(most, len(ev["buys"]))
+    check(most == 30, f"all 30 signals alerted in one week (got {most})")
+    check(max(wk["open_signals"] for wk in st["weekly"]) == 30, "all 30 tracked at once")
+
+
+def test_split():
+    """A 2:1 split while a signal is open: Yahoo back-adjusts history, the entry price follows."""
+    O, C, V, N = synthetic()
+    W = H.Weekly(O, C, V, N, C.index[-1])
+    st = H.new_state()
+    for w in W.weeks[60:]:
+        H.process_week(st, W, w, ["UP"], "t")
+        if st["positions"]:
+            break
+    p = st["positions"]["UP"]
+    e0 = p["entry_px"]
+    # a 2:1 split right after that week: real prices halve from then on, and Yahoo halves all earlier
+    # prices too, so the whole adjusted history is the old series / 2
+    C2, O2 = C / 2, O / 2
+    W2 = H.Weekly(O2, C2, V, N, C.index[-1])
+    nxt = W2.weeks[W2.weeks.index(w) + 1]
+    H.process_week(st, W2, nxt, ["UP"], "t")
+    t = next(t for t in st["trades"] if t["sym"] == "UP")
+    check(abs(st["positions"]["UP"]["entry_px"] - e0 / 2) < 1e-6 if "UP" in st["positions"] else abs(t["entry_px"] - e0 / 2) < 0.01,
+          "entry price halves after a 2:1 split")
+    check(abs(t["ret_pct"]) < 20, f"return stays sane after the split ({t['ret_pct']}%)")
 
 
 def test_main_dry(tmp="/tmp/hm_test_state.json"):
@@ -100,6 +141,8 @@ if __name__ == "__main__":
     test_mktlots()
     test_week_end()
     test_process()
+    test_no_cap()
+    test_split()
     test_main_dry()
     print("FAILED" if check.failed else "all passed")
     sys.exit(1 if check.failed else 0)

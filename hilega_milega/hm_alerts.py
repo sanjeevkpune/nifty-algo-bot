@@ -5,26 +5,27 @@ Hilega-Milega weekly alerts for NSE F&O stocks  --  ALERTS ONLY, no orders are e
 Indicator (weekly candles, Friday close):  RSI(9) of weekly closes,
     green = EMA(3) of that RSI,  red = WMA(21) of that RSI.
 
-Rule (the best weekly rule from the 2016-2026 backtest, "B2", 15 slots):
+Rule (weekly "B2" rule from the 2016-2026 backtest), EVERY signal, no 15-stock cap:
   BUY   first week RSI is above 50 AND above both green and red (it was not the week before),
-        stock is in today's NSE F&O list, 20-day average turnover above Rs 5 crore,
-        and NIFTY closes above its 50-day average. If more signals than free slots,
-        the highest 3-month (63 trading days) gain goes first. Max 15 stocks, equal size.
-  SELL  a held stock's weekly RSI closes below 50.
+        stock is in today's NSE F&O list, 20-day average turnover above Rs 5 crore.
+        Every such stock is alerted and tracked. NIFTY above/below its 50-day average is shown
+        and recorded (the backtest only bought when above), so both can be compared later.
+  SELL  an open signal's weekly RSI closes below 50.
   Both are acted on at the next trading day's open (normally Monday).
+  Performance is per signal: net return after 0.18% a side, the same period's NIFTY return,
+  and Rs P&L on a notional HM_PER_SIGNAL per signal.
 
 Each run:
   1. reads the F&O list from NSE (fallbacks: last saved list, then fno_list.txt here),
   2. reads ~3 years of daily prices from Yahoo Finance,
   3. processes every finished week since the last run (state file), filling last week's
-     orders at Monday's open, then marking the model portfolio at Friday's close,
+     signals at Monday's open, then marking every open signal at Friday's close,
   4. posts the alert to Telegram and rewrites the HM_* tabs of the Google Sheet,
   5. saves the state (the workflow commits it to the `hilega-milega-state` branch).
 
 Environment:
   HM_STATE         state file path (default hm_state.json)
-  HM_CAPITAL       notional capital for the tracked model portfolio (default 1000000)
-  HM_SLOTS         max stocks (default 15)
+  HM_PER_SIGNAL    notional Rs per signal for the Rs P&L columns (default 100000)
   HM_FORCE=1       redo the latest finished week even if it was already sent
   HM_DRY_RUN=1     print the alert only: no Telegram, no sheet, state not saved
   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID   Telegram (skipped if missing)
@@ -46,8 +47,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))          # repo root, for notify.py
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-SLOTS = int(os.environ.get("HM_SLOTS", "15"))
-CAPITAL = float(os.environ.get("HM_CAPITAL", "1000000"))
+PER_SIGNAL = float(os.environ.get("HM_PER_SIGNAL", "100000"))   # notional ₹ per signal, for ₹ P&L
 COST = 0.0018                                     # per side, same as the backtest
 MIN_TURNOVER = 5e7                                # Rs 5 crore, 20-day average
 WEEK_DONE_AT = dt.time(15, 45)                    # a Friday's candle counts as final after this (IST)
@@ -190,7 +190,11 @@ class Weekly:
         self.roc63 = (C / C.shift(63) - 1).reindex(self.weeks)
         self.nifty = nifty.reindex(self.weeks)
         self.nifty50 = nifty.rolling(50).mean().reindex(self.weeks)
-        self.day_index = list(C.index)
+        self.nifty_daily = nifty
+
+    def nifty_on(self, day):
+        v = self.nifty_daily.loc[:day].dropna()
+        return float(v.iloc[-1]) if len(v) else None
 
     def open_after(self, week_end, sym):
         """First trading day after `week_end` and that day's open for `sym` (fallback: its close)."""
@@ -229,9 +233,9 @@ def last_finished_week_end(now_ist, trading_days):
 
 # ------------------------------------------------------------------ state
 def new_state():
-    return {"version": 1, "cash": CAPITAL, "capital": CAPITAL, "slots": SLOTS, "last_week": None,
-            "positions": {}, "pending_buys": [], "pending_sells": [], "trades": [], "signals": [],
-            "weekly": [], "fno_list": [], "fno_list_date": None, "nifty_start": None, "start_week": None, "prev": None}
+    return {"version": 2, "per_signal": PER_SIGNAL, "last_week": None, "positions": {}, "pending_buys": [],
+            "pending_sells": [], "trades": [], "signals": [], "weekly": [], "fno_list": [], "fno_list_date": None,
+            "start_week": None, "prev": None}
 
 
 def d2s(d):
@@ -242,72 +246,107 @@ def r2(x, n=2):
     return None if x is None or (isinstance(x, float) and np.isnan(x)) else round(float(x), n)
 
 
-def process_week(st, W, wend, fno, now_str):
-    """Advance the model by one finished week. Returns the alert's facts for that week."""
-    wkey = d2s(wend)
-    nav_prev = st["weekly"][-1]["nav"] if st["weekly"] else st["capital"]
-    events = {"week": wkey, "filled_buys": [], "filled_sells": [], "sells": [], "buys": [],
-              "no_slot": [], "paused": [], "missing": [], "unfunded": [], "weak": []}
+def perf(trades, flt=None):
+    """Per-signal numbers for LIVE signals (closed: net return; open: return so far).
+    Signals carried in from the backtest seed get alerts but are left out of these numbers."""
+    trades = [t for t in trades if t.get("origin", "live") == "live"]
+    closed = [t for t in trades if t["status"] == "CLOSED" and (flt is None or t.get("nifty_ok") == flt)]
+    opn = [t for t in trades if t["status"] == "OPEN" and (flt is None or t.get("nifty_ok") == flt)]
+    nets = [t["net_ret_pct"] for t in closed if t.get("net_ret_pct") is not None]
+    alpha = [t["vs_nifty_pct"] for t in closed if t.get("vs_nifty_pct") is not None]
+    return {"closed": len(closed), "open": len(opn),
+            "win_rate_pct": r2(100 * sum(n > 0 for n in nets) / len(nets), 1) if nets else None,
+            "avg_net_pct": r2(np.mean(nets)) if nets else None,
+            "avg_vs_nifty_pct": r2(np.mean(alpha)) if alpha else None,
+            "avg_open_pct": r2(np.mean([t["ret_pct"] for t in opn if t.get("ret_pct") is not None])) if opn else None,
+            "realised": r2(sum(t["pnl"] or 0 for t in closed), 0), "unrealised": r2(sum(t["pnl"] or 0 for t in opn), 0)}
 
-    # 1) last week's orders at this week's first open
+
+def process_week(st, W, wend, fno, now_str):
+    """Advance one finished week. Every buy signal is tracked until its own sell signal (no cap)."""
+    wkey = d2s(wend)
+    per = st.get("per_signal", PER_SIGNAL)
+    events = {"week": wkey, "filled_buys": [], "filled_sells": [], "sells": [], "buys": [], "missing": [], "weak": [],
+              "revised": []}
+    trade = lambda tid: next((t for t in st["trades"] if t["id"] == tid), None)
+    hold = lambda d0, d1: int(round((pd.Timestamp(d1) - pd.Timestamp(d0)).days / 7))
+
+    def still(series_df, s, week):   # does today's data (split-adjusted) still show last week's signal?
+        try:
+            v = series_df[s].loc[pd.Timestamp(week)]
+            return None if pd.isna(v) else v
+        except KeyError:
+            return None
+
+    # 0) Yahoo back-adjusts prices after a split or bonus: re-read each open signal's entry price
+    for s, p in st["positions"].items():
+        if s in W.O and pd.Timestamp(p["entry_date"]) in W.O.index:
+            px0 = W.O[s].loc[pd.Timestamp(p["entry_date"])]
+            if not pd.isna(px0) and px0 > 0 and abs(px0 / p["entry_px"] - 1) > 0.02:
+                p["entry_px"], p["units"] = float(px0), p["cost"] / (float(px0) * (1 + COST))
+                t = trade(p["id"])
+                if t:
+                    t["entry_px"] = r2(px0)
+
+    # 1) last week's signals are filled at this week's first open
     for o in st["pending_sells"]:
         p = st["positions"].get(o["sym"])
         if not p:
+            continue
+        r = still(W.R, o["sym"], o["signal_week"])
+        if r is not None and r >= 50:
+            events["revised"].append(o["sym"])
             continue
         day, px = W.open_after(pd.Timestamp(o["signal_week"]), o["sym"])
         if px is None:
             events["missing"].append(o["sym"])
             continue
         st["positions"].pop(o["sym"])
-        st["cash"] += p["units"] * px * (1 - COST)
-        gross = px / p["entry_px"] - 1
-        t = next((t for t in st["trades"] if t["id"] == p["id"]), None)
+        t = trade(p["id"])
         if t:
-            t.update(status="CLOSED", sell_signal_week=o["signal_week"], sell_signal_close=o["close"],
-                     sell_rsi=o["rsi"], exit_date=d2s(day), exit_px=r2(px), last_px=r2(px),
-                     ret_pct=r2(gross * 100), net_ret_pct=r2(((1 - COST) * px / ((1 + COST) * p["entry_px"]) - 1) * 100),
-                     pnl=r2(p["units"] * px * (1 - COST) - p["cost"], 0),
-                     weeks_held=int(round((pd.Timestamp(day) - pd.Timestamp(p["entry_date"])).days / 7)))
+            net = (1 - COST) * px / ((1 + COST) * p["entry_px"]) - 1
+            n_ret = W.nifty_on(day) / t["nifty_entry"] - 1 if t.get("nifty_entry") else None
+            t.update(status="CLOSED", sell_signal_week=o["signal_week"], sell_signal_close=o["close"], sell_rsi=o["rsi"],
+                     exit_date=d2s(day), exit_px=r2(px), last_px=r2(px), ret_pct=r2((px / p["entry_px"] - 1) * 100),
+                     net_ret_pct=r2(net * 100), nifty_ret_pct=r2(n_ret * 100) if n_ret is not None else None,
+                     vs_nifty_pct=r2((net - n_ret) * 100) if n_ret is not None else None,
+                     pnl=r2(p["units"] * px * (1 - COST) - p["cost"], 0), weeks_held=hold(p["entry_date"], day))
         events["filled_sells"].append(o["sym"])
     for o in st["pending_buys"]:
-        if o["sym"] in st["positions"] or len(st["positions"]) >= st["slots"]:
+        if o["sym"] in st["positions"]:
+            continue
+        b = still(W.buy, o["sym"], o["signal_week"])
+        if b is not None and not bool(b):
+            events["revised"].append(o["sym"])
             continue
         day, px = W.open_after(pd.Timestamp(o["signal_week"]), o["sym"])
         if px is None:
             events["missing"].append(o["sym"])
             continue
-        spend = min(nav_prev / st["slots"], st["cash"])
-        if spend < 0.5 * nav_prev / st["slots"]:          # model out of cash (backtest rule: skip)
-            events["unfunded"].append(o["sym"])
-            continue
-        units = spend / (px * (1 + COST))
-        st["cash"] -= spend
         tid = f"{o['sym']}-{o['signal_week']}"
-        st["positions"][o["sym"]] = {"id": tid, "entry_date": d2s(day), "entry_px": px, "units": units,
-                                     "cost": spend, "signal_week": o["signal_week"]}
-        st["trades"].append({"id": tid, "sym": o["sym"], "status": "OPEN", "origin": "live", "buy_signal_week": o["signal_week"],
+        st["positions"][o["sym"]] = {"id": tid, "entry_date": d2s(day), "entry_px": px,
+                                     "units": per / (px * (1 + COST)), "cost": per, "signal_week": o["signal_week"]}
+        st["trades"].append({"id": tid, "sym": o["sym"], "status": "OPEN", "origin": o.get("origin", "live"),
+                             "nifty_ok": o.get("nifty_ok", "Y"), "buy_signal_week": o["signal_week"],
                              "buy_signal_close": o["close"], "buy_rsi": o["rsi"], "roc63_pct": o["roc63_pct"],
-                             "entry_date": d2s(day), "entry_px": r2(px), "last_px": r2(px), "ret_pct": 0.0,
-                             "net_ret_pct": None, "pnl": None, "weeks_held": 0, "sell_signal_week": None,
+                             "entry_date": d2s(day), "entry_px": r2(px), "nifty_entry": r2(W.nifty_on(day)),
+                             "last_px": r2(px), "ret_pct": 0.0, "net_ret_pct": None, "nifty_ret_pct": None,
+                             "vs_nifty_pct": None, "pnl": None, "weeks_held": 0, "sell_signal_week": None,
                              "sell_signal_close": None, "sell_rsi": None, "exit_date": None, "exit_px": None})
         events["filled_buys"].append(o["sym"])
     st["pending_buys"], st["pending_sells"] = [], []
 
-    # 2) mark to market at this week's close
-    value = 0.0
+    # 2) mark every open signal at this week's close
+    nifty, n50 = float(W.nifty.loc[wend]), float(W.nifty50.loc[wend])
     for s, p in st["positions"].items():
         c = W.close_at(wend, s) or p["entry_px"]
-        value += p["units"] * c
-        t = next((t for t in st["trades"] if t["id"] == p["id"]), None)
+        t = trade(p["id"])
         if t:
-            t["last_px"] = r2(c)
-            t["ret_pct"] = r2((c / p["entry_px"] - 1) * 100)
-            t["pnl"] = r2(p["units"] * c - p["cost"], 0)
-            t["weeks_held"] = int(round((pd.Timestamp(wend) - pd.Timestamp(p["entry_date"])).days / 7))
-    nav = st["cash"] + value
-    nifty, n50 = float(W.nifty.loc[wend]), float(W.nifty50.loc[wend])
-    if st["nifty_start"] is None:
-        st["nifty_start"], st["start_week"] = nifty, wkey
+            t.update(last_px=r2(c), ret_pct=r2((c / p["entry_px"] - 1) * 100), pnl=r2(p["units"] * c - p["cost"], 0),
+                     weeks_held=hold(p["entry_date"], wend),
+                     nifty_ret_pct=r2((nifty / t["nifty_entry"] - 1) * 100) if t.get("nifty_entry") else None)
+    if st["start_week"] is None:
+        st["start_week"] = wkey
     market_ok = bool(nifty > n50)
 
     def facts(s):
@@ -315,7 +354,7 @@ def process_week(st, W, wend, fno, now_str):
                 "green": r2(W.E[s].loc[wend], 1), "red": r2(W.W[s].loc[wend], 1),
                 "roc63_pct": r2(W.roc63[s].loc[wend] * 100, 1) if s in W.roc63 else None}
 
-    # 3) exits for held stocks
+    # 3) SELL: an open signal's weekly RSI closed below 50
     for s, p in st["positions"].items():
         if s not in W.R or np.isnan(W.R[s].loc[wend]):
             events["missing"].append(s)
@@ -327,9 +366,8 @@ def process_week(st, W, wend, fno, now_str):
             st["pending_sells"].append(f)
             events["sells"].append(f)
 
-    # 3b) held stocks that turned weak this week (RSI fell under both lines but is still above 50)
+    # 3b) WATCH: open signals that turned weak this week (RSI under both lines, still above 50)
     sells_now = {f["sym"] for f in events["sells"]}
-    events["weak"] = []
     for s in st["positions"]:
         if s in sells_now or s not in W.R:
             continue
@@ -338,43 +376,38 @@ def process_week(st, W, wend, fno, now_str):
         if bool(weak.loc[wend]) and not bool(weak.shift(fill_value=False).loc[wend]):
             events["weak"].append(facts(s))
 
-    # 4) entries for free slots
-    free = st["slots"] - len(st["positions"]) + len(st["pending_sells"])
-    cands = []
+    # 4) BUY: every F&O stock with a fresh signal (no cap). NIFTY filter is shown, not applied.
     for s in fno:
         if s in st["positions"] or s not in W.buy:
             continue
         if bool(W.buy[s].loc[wend]) and bool(W.liquid[s].loc[wend]):
-            cands.append(facts(s))
-    cands.sort(key=lambda f: -(f["roc63_pct"] if f["roc63_pct"] is not None else -1e9))
-    if market_ok:
-        st["pending_buys"] = cands[:free]
-        events["buys"], events["no_slot"] = cands[:free], cands[free:]
-    else:
-        events["paused"] = cands
+            f = facts(s)
+            f["nifty_ok"] = "Y" if market_ok else "N"
+            events["buys"].append(f)
+    events["buys"].sort(key=lambda f: -(f["roc63_pct"] if f["roc63_pct"] is not None else -1e9))
+    st["pending_buys"] = [dict(f, origin="live") for f in events["buys"]]
 
     # 5) logs
-    for kind, lst in (("SELL", events["sells"]), ("BUY", events["buys"]),
-                      ("BUY, no free slot", events["no_slot"]), ("BUY, paused (NIFTY below 50-DMA)", events["paused"]),
-                      ("WATCH: held, RSI under both lines", events["weak"])):
+    for kind, lst in (("SELL", events["sells"]), ("BUY", events["buys"]), ("WATCH: RSI under both lines", events["weak"])):
         for f in lst:
+            note = ""
+            if kind == "SELL" and f.get("ret_pct") is not None:
+                note = f"bought {f['entry_date']} at {f['entry_px']}, {f['ret_pct']:+.1f}% to this close"
+            elif kind == "BUY" and f.get("nifty_ok") == "N":
+                note = "NIFTY below its 50-day average (the backtest skipped these)"
             st["signals"].append({"alert_time": now_str, "signal_week": wkey, "signal": kind, "sym": f["sym"],
                                   "close": f["close"], "rsi": f["rsi"], "green": f["green"], "red": f["red"],
-                                  "roc63_pct": f["roc63_pct"],
-                                  "note": (f"bought {f['entry_date']} at {f['entry_px']}, {f['ret_pct']:+.1f}%"
-                                           if kind == "SELL" and f.get("ret_pct") is not None else "")})
-    closed = [t for t in st["trades"] if t["status"] == "CLOSED"]
-    wins = [t for t in closed if (t.get("net_ret_pct") or 0) > 0]
+                                  "roc63_pct": f["roc63_pct"], "note": note})
+    a, y = perf(st["trades"]), perf(st["trades"], "Y")
     st["weekly"].append({"week": wkey, "alert_time": now_str, "nifty": r2(nifty), "nifty_50dma": r2(n50),
-                         "new_buys": "ON" if market_ok else "PAUSED", "buy_signals": len(events["buys"]),
-                         "sell_signals": len(events["sells"]), "held": len(st["positions"]),
-                         "held_after_orders": len(st["positions"]) - len(st["pending_sells"]) + len(st["pending_buys"]),
-                         "cash": r2(st["cash"], 0), "nav": r2(nav, 0),
-                         "model_return_pct": r2((nav / st["capital"] - 1) * 100),
-                         "nifty_return_pct": r2((nifty / st["nifty_start"] - 1) * 100),
-                         "closed_trades": len(closed), "win_rate_pct": r2(len(wins) / len(closed) * 100, 1) if closed else None,
-                         "avg_closed_net_pct": r2(np.mean([t["net_ret_pct"] for t in closed]), 2) if closed else None})
-    events.update(market_ok=market_ok, nifty=nifty, n50=n50, nav=nav, free=free)
+                         "nifty_filter": "ON" if market_ok else "OFF", "buy_signals": len(events["buys"]),
+                         "sell_signals": len(events["sells"]), "open_signals": len(st["positions"]),
+                         "open_live": a["open"], "invested": r2(a["open"] * per, 0), "unrealised": a["unrealised"],
+                         "realised": a["realised"], "total_pnl": r2((a["unrealised"] or 0) + (a["realised"] or 0), 0),
+                         "closed": a["closed"], "win_rate_pct": a["win_rate_pct"], "avg_net_pct": a["avg_net_pct"],
+                         "avg_vs_nifty_pct": a["avg_vs_nifty_pct"], "avg_open_pct": a["avg_open_pct"],
+                         "rule_closed": y["closed"], "rule_win_rate_pct": y["win_rate_pct"], "rule_avg_net_pct": y["avg_net_pct"]})
+    events.update(market_ok=market_ok, nifty=nifty, n50=n50)
     st["last_week"] = wkey
     return events
 
@@ -386,58 +419,51 @@ def fmt_day(s):
 
 def message(st, ev, W, wend, fno_src):
     L = [f"📈 Hilega-Milega weekly · week ending {fmt_day(ev['week'])}",
-         f"NIFTY {ev['nifty']:,.0f} vs 50-day avg {ev['n50']:,.0f}: new buys {'ON' if ev['market_ok'] else 'PAUSED'}",
-         "Alerts only, no orders placed. Act at the next open (normally Monday).", ""]
+         f"NIFTY {ev['nifty']:,.0f} vs 50-day avg {ev['n50']:,.0f}: "
+         + ("above (backtest rule takes buys)" if ev["market_ok"] else "BELOW (the backtest skipped buys in such weeks)"),
+         "Alerts only, no orders placed. Every signal, no cap. Act at the next open (normally Monday).", ""]
     if ev["sells"]:
         L.append(f"🔴 SELL {len(ev['sells'])} · weekly RSI closed below 50")
         for f in ev["sells"]:
-            L.append(f"• {f['sym']}  close {f['close']:,} · RSI {f['rsi']} · bought {pd.Timestamp(f['entry_date']).strftime('%d %b')} "
+            L.append(f"• {f['sym']}  close {f['close']:,} · RSI {f['rsi']} · bought {pd.Timestamp(f['entry_date']).strftime('%d %b %y')} "
                      f"@ {f['entry_px']:,} · {f['ret_pct']:+.1f}%")
         L.append("")
     if ev["buys"]:
-        L.append(f"🟢 BUY {len(ev['buys'])} (free slots {ev['free']}) · RSI above 50 and above green & red, "
-                 "strongest 3-month gain first. Size: 1/15 of capital each.")
+        L.append(f"🟢 BUY {len(ev['buys'])} · RSI above 50 and above green & red (biggest 3-month gain first)"
+                 + ("" if ev["market_ok"] else " ⚠️ NIFTY below 50-DMA"))
         for f in ev["buys"]:
             L.append(f"• {f['sym']}  close {f['close']:,} · RSI {f['rsi']} (green {f['green']}, red {f['red']}) · 3M {f['roc63_pct']:+.1f}%")
         L.append("")
     if not (ev["sells"] or ev["buys"]):
-        L.append("No new buy or sell for the model this week.")
-        L.append("")
-    if ev["no_slot"]:
-        L.append(f"Also a BUY signal, but the model is full ({st['slots']} stocks): " + ", ".join(f["sym"] for f in ev["no_slot"]))
-        L.append("")
-    if ev["paused"]:
-        L.append("Buy signals NOT taken (NIFTY below its 50-day average): " + ", ".join(f["sym"] for f in ev["paused"]))
+        L.append("No new buy or sell signal this week.")
         L.append("")
     sells = {f["sym"] for f in ev["sells"]}
-    held = [s for s in st["positions"] if s not in sells]
-    hold_txt = []
-    watch = []
-    for s in sorted(held, key=lambda s: st["positions"][s]["entry_date"]):
+    held = sorted((s for s in st["positions"] if s not in sells), key=lambda s: st["positions"][s]["entry_date"])
+    txt, watch = [], []
+    for s in held:
         p = st["positions"][s]
         c = W.close_at(wend, s) or p["entry_px"]
-        hold_txt.append(f"{s} {(c / p['entry_px'] - 1) * 100:+.1f}%")
+        txt.append(f"{s} {(c / p['entry_px'] - 1) * 100:+.1f}%")
         try:
             if W.R[s].loc[wend] < W.E[s].loc[wend] and W.R[s].loc[wend] < W.W[s].loc[wend]:
                 watch.append(s)
         except KeyError:
             pass
-    n_after = len(held) + len(ev["buys"])
-    L.append(f"📋 Holding {n_after}/{st['slots']} after these orders" + (":" if hold_txt or ev["buys"] else "."))
-    if hold_txt:
-        L.append("  " + " · ".join(hold_txt))
-    if ev["buys"]:
-        L.append("  new: " + ", ".join(f["sym"] for f in ev["buys"]))
+    L.append(f"📋 Open buy signals: {len(held) + len(ev['buys'])} ({len(held)} earlier + {len(ev['buys'])} new)")
+    if txt:
+        L.append("  " + " · ".join(txt))
     if watch:
         L.append("Weakening (RSI under both lines, still above 50): " + ", ".join(watch))
     wk = st["weekly"][-1]
     L.append("")
-    L.append(f"Tracked model (₹{st['capital']:,.0f} start): {wk['model_return_pct']:+.2f}% · NIFTY {wk['nifty_return_pct']:+.2f}% since "
-             f"{fmt_day(st['start_week'])} close · closed trades {wk['closed_trades']}"
-             + (f", win rate {wk['win_rate_pct']}%" if wk["win_rate_pct"] is not None else ""))
+    L.append(f"Live tracking (signals from {fmt_day(st['start_week'])} on, ₹{st.get('per_signal', PER_SIGNAL):,.0f} each): "
+             f"{wk['open_live']} open, P&L ₹{wk['unrealised']:,.0f} · {wk['closed']} closed, booked ₹{wk['realised']:,.0f}"
+             + (f", win rate {wk['win_rate_pct']}%, avg net {wk['avg_net_pct']:+.2f}%, vs NIFTY {wk['avg_vs_nifty_pct']:+.2f}%"
+                if wk["closed"] else ""))
     L.append(f"F&O list: {fno_src}")
-    if ev["unfunded"]:
-        L.append("Model portfolio had no cash to take last week's buy: " + ", ".join(ev["unfunded"]))
+    if ev["revised"]:
+        L.append("Last week's signal no longer shows on corrected (split-adjusted) prices, not acted on: "
+                 + ", ".join(ev["revised"]))
     if ev["missing"]:
         L.append("⚠️ No price data for: " + ", ".join(sorted(set(ev["missing"]))))
     return "\n".join(L)
@@ -445,23 +471,25 @@ def message(st, ev, W, wend, fno_src):
 
 # ------------------------------------------------------------------ Google Sheet
 TABS = {
-    "HM_Trades": ["Trade id", "Symbol", "Status", "Source", "Buy signal week", "Buy signal close", "Buy RSI", "3M gain % at signal",
-                  "Entry date (next open)", "Entry price", "Sell signal week", "Sell signal close", "Sell RSI",
-                  "Exit date (next open)", "Exit price", "Last price", "Return %", "Net return % (after 0.18%/side)",
-                  "P&L ₹ (1/15 slot)", "Weeks held"],
+    "HM_Trades": ["Trade id", "Symbol", "Status", "Source", "NIFTY above 50-DMA at signal", "Buy signal week",
+                  "Buy signal close", "Buy RSI", "3M gain % at signal", "Entry date (next open)", "Entry price",
+                  "Sell signal week", "Sell signal close", "Sell RSI", "Exit date (next open)", "Exit price", "Last price",
+                  "Return %", "Net return % (after 0.18%/side)", "NIFTY same period %", "Net vs NIFTY %",
+                  "P&L ₹ per signal", "Weeks held"],
     "HM_Signals": ["Alert time (IST)", "Signal week", "Signal", "Symbol", "Weekly close", "RSI(9)", "Green EMA3",
                    "Red WMA21", "3M gain %", "Note"],
-    "HM_Weekly": ["Week ending", "Alert time (IST)", "NIFTY", "NIFTY 50-DMA", "New buys", "Buy signals", "Sell signals",
-                  "Held at close", "Held after orders", "Cash ₹", "Model value ₹", "Model return %", "NIFTY return %",
-                  "Closed trades", "Win rate %", "Avg closed net return %"],
+    "HM_Weekly": ["Week ending", "Alert time (IST)", "NIFTY", "NIFTY 50-DMA", "NIFTY filter", "Buy signals",
+                  "Sell signals", "Open signals (all)", "Open live signals", "Invested ₹ (live)", "Open P&L ₹ (live)",
+                  "Booked P&L ₹ (live)", "Total P&L ₹ (live)", "Closed live signals", "Win rate %", "Avg net return %", "Avg net vs NIFTY %", "Avg open return %",
+                  "Closed (filter on)", "Win rate % (filter on)", "Avg net % (filter on)"],
 }
-T_KEYS = ["id", "sym", "status", "origin", "buy_signal_week", "buy_signal_close", "buy_rsi", "roc63_pct", "entry_date", "entry_px",
-          "sell_signal_week", "sell_signal_close", "sell_rsi", "exit_date", "exit_px", "last_px", "ret_pct", "net_ret_pct",
-          "pnl", "weeks_held"]
+T_KEYS = ["id", "sym", "status", "origin", "nifty_ok", "buy_signal_week", "buy_signal_close", "buy_rsi", "roc63_pct",
+          "entry_date", "entry_px", "sell_signal_week", "sell_signal_close", "sell_rsi", "exit_date", "exit_px", "last_px",
+          "ret_pct", "net_ret_pct", "nifty_ret_pct", "vs_nifty_pct", "pnl", "weeks_held"]
 S_KEYS = ["alert_time", "signal_week", "signal", "sym", "close", "rsi", "green", "red", "roc63_pct", "note"]
-W_KEYS = ["week", "alert_time", "nifty", "nifty_50dma", "new_buys", "buy_signals", "sell_signals", "held",
-          "held_after_orders", "cash", "nav", "model_return_pct", "nifty_return_pct", "closed_trades", "win_rate_pct",
-          "avg_closed_net_pct"]
+W_KEYS = ["week", "alert_time", "nifty", "nifty_50dma", "nifty_filter", "buy_signals", "sell_signals", "open_signals",
+          "open_live", "invested", "unrealised", "realised", "total_pnl", "closed", "win_rate_pct", "avg_net_pct", "avg_vs_nifty_pct",
+          "avg_open_pct", "rule_closed", "rule_win_rate_pct", "rule_avg_net_pct"]
 
 
 def sheet_rows(st):
@@ -470,7 +498,8 @@ def sheet_rows(st):
     trades = sorted(st["trades"], key=lambda t: (t["status"] != "OPEN", t["entry_date"]), reverse=False)
     open_t = [t for t in trades if t["status"] == "OPEN"]
     closed_t = sorted([t for t in trades if t["status"] != "OPEN"], key=lambda t: t["exit_date"] or "", reverse=True)
-    pend = [{"id": "", "sym": o["sym"], "status": "BUY AT NEXT OPEN", "origin": "live", "buy_signal_week": o["signal_week"],
+    pend = [{"id": "", "sym": o["sym"], "status": "BUY AT NEXT OPEN", "origin": o.get("origin", "live"),
+             "nifty_ok": o.get("nifty_ok"), "buy_signal_week": o["signal_week"],
              "buy_signal_close": o["close"], "buy_rsi": o["rsi"], "roc63_pct": o["roc63_pct"]} for o in st["pending_buys"]]
     open_rows = []
     for t in open_t:

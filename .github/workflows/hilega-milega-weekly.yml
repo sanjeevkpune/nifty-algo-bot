@@ -67,7 +67,7 @@ jobs:
           HM_STATE: ${{ runner.temp }}/hm_state.json
           HM_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           HM_FORCE: ${{ inputs.resend && '1' || '0' }}
-          HM_CAPITAL: ${{ vars.HM_CAPITAL || '1000000' }}
+          HM_PER_SIGNAL: ${{ vars.HM_PER_SIGNAL || '100000' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_ID: ${{ secrets.GSHEET_ID_V2 }}

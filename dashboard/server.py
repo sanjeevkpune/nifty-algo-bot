@@ -239,22 +239,20 @@ def build(raw, errors):
         if isinstance(r.get("year"), float):
             r["year"] = str(int(r["year"]))
 
-    # Hilega-Milega weekly alerts (written by hilega_milega/hm_alerts.py from GitHub Actions)
+    # Hilega-Milega weekly alerts (hilega_milega/hm_alerts.py on GitHub Actions): every signal, no cap
     hm_t, hm_w = R.get("hm_trades", []), R.get("hm_weekly", [])
     hm_open = [r for r in hm_t if r.get("status") != "CLOSED"]
     hm_closed = [r for r in hm_t if r.get("status") == "CLOSED"]
-    hm_live_closed = [r for r in hm_closed if r.get("source") == "live"]
     last_w = hm_w[0] if hm_w else {}
-    hm_curve = sorted(({"date": str(r.get("week_ending")), "model": r.get("model_return"), "nifty": r.get("nifty_return")}
-                       for r in hm_w if isinstance(r.get("model_return"), float)), key=lambda r: r["date"])
-    nets = [r["net_return_after_0_18_side"] for r in hm_closed if isinstance(r.get("net_return_after_0_18_side"), float)]
-    hm = {"summary": {"model_return": last_w.get("model_return"), "nifty_return": last_w.get("nifty_return"),
-                      "model_value": last_w.get("model_value"), "week": str(last_w.get("week_ending") or ""),
-                      "new_buys": last_w.get("new_buys"), "open": len([r for r in hm_open if r.get("status") != "BUY AT NEXT OPEN"]),
-                      "closed": len(hm_closed), "live_closed": len(hm_live_closed),
-                      "win_rate": round(100 * sum(1 for n in nets if n > 0) / len(nets), 1) if nets else None,
-                      "avg_net": round(sum(nets) / len(nets), 2) if nets else None},
-          "curve": hm_curve, "open": hm_open, "closed": hm_closed, "signals": R.get("hm_signals", [])[:150]}
+    hm_curve = sorted(({"date": str(r.get("week_ending")), "total": r.get("total_p_l_live"), "booked": r.get("booked_p_l_live")}
+                       for r in hm_w if isinstance(r.get("total_p_l_live"), float)), key=lambda r: r["date"])
+    hm = {"summary": {"week": str(last_w.get("week_ending") or ""), "nifty_filter": last_w.get("nifty_filter"),
+                      "open_all": last_w.get("open_signals_all"), "open_live": last_w.get("open_live_signals"),
+                      "closed_live": last_w.get("closed_live_signals"), "win_rate": last_w.get("win_rate"),
+                      "avg_net": last_w.get("avg_net_return"), "vs_nifty": last_w.get("avg_net_vs_nifty"),
+                      "open_pnl": last_w.get("open_p_l_live"), "booked_pnl": last_w.get("booked_p_l_live"),
+                      "buys": last_w.get("buy_signals"), "sells": last_w.get("sell_signals")},
+          "curve": hm_curve, "open": hm_open, "closed": hm_closed, "signals": R.get("hm_signals", [])[:200]}
 
     return {
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -286,14 +284,18 @@ def demo_raw():
         "v3_legs": [["Date", "Session", "Symbol", "Leg_PnL", "Paper"], ["2026-11-23", "AFTERNOON_ATM", "SAMPLE", "-100", "TRUE"]],
         "adaptive_log": [["Date", "Timestamp", "Strategy_Version", "Session_Status", "Net_PnL"],
                          ["2026-11-24", "15:20:00", "SAMPLE LIVE", "TRADED", "500"]],
-        "hm_trades": [["Trade id", "Symbol", "Status", "Source", "Buy signal week", "Entry date (next open)", "Entry price",
-                       "Last price", "Return %", "Net return % (after 0.18%/side)", "P&L ₹ (1/15 slot)", "Weeks held"],
-                      ["", "SAMPLE2", "BUY AT NEXT OPEN", "live", "2026-11-27", "", "", "", "", "", "", ""],
-                      ["SAMPLE1-2026-11-06", "SAMPLE1", "OPEN", "live", "2026-11-06", "2026-11-09", "100", "104", "4", "", "2600", "3"]],
+        "hm_trades": [["Trade id", "Symbol", "Status", "Source", "NIFTY above 50-DMA at signal", "Buy signal week",
+                       "Entry date (next open)", "Entry price", "Last price", "Return %", "Net return % (after 0.18%/side)",
+                       "NIFTY same period %", "Net vs NIFTY %", "P&L ₹ per signal", "Weeks held"],
+                      ["", "SAMPLE2", "BUY AT NEXT OPEN", "live", "Y", "2026-11-27", "", "", "", "", "", "", "", "", ""],
+                      ["SAMPLE1-2026-11-06", "SAMPLE1", "OPEN", "backtest seed", "Y", "2026-11-06", "2026-11-09", "100", "104",
+                       "4", "", "1.2", "", "3800", "3"]],
         "hm_signals": [["Alert time (IST)", "Signal week", "Signal", "Symbol", "Weekly close", "RSI(9)"],
                        ["2026-11-27 16:45", "2026-11-27", "BUY", "SAMPLE2", "250", "61.2"]],
-        "hm_weekly": [["Week ending", "Model return %", "NIFTY return %", "Model value ₹", "New buys"],
-                      ["2026-11-27", "2.16", "-0.75", "1021616", "ON"], ["2026-11-20", "0", "0", "1000000", "ON"]],
+        "hm_weekly": [["Week ending", "NIFTY filter", "Buy signals", "Sell signals", "Open signals (all)", "Open live signals",
+                       "Open P&L ₹ (live)", "Booked P&L ₹ (live)", "Total P&L ₹ (live)", "Closed live signals"],
+                      ["2026-12-04", "ON", "9", "3", "140", "9", "12000", "0", "12000", "0"],
+                      ["2026-11-27", "ON", "8", "12", "138", "0", "0", "0", "0", "0"]],
     }
 
 
