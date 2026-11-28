@@ -58,6 +58,7 @@ caps the system journal at 200 MB and empties the apt cache on every boot.
   bot-settings.yml          Manual: paper/live and lots per bot (or all), LIVE confirm, Telegram report
   vm-deploy.yml             Manual: push startup.sh + secrets to VM metadata (optionally re-run it now)
   etf-dukan-check.yml       Manual: runs etf_dukan/check_setup.py on the VM
+  hilega-milega-weekly.yml  Fri 16:45 IST (+ Sat/Mon back-ups): Hilega-Milega weekly F&O alerts to Telegram + sheet
 startup.sh                  VM boot script: packages, clone/pull main, /etc/trade-config/config.env, crontab
 requirements.txt            Python packages for the root bots
 cleanup_logs.sh             Daily 09:00: old log folders, run locks, old state files, ETF caches, disk alert
@@ -77,6 +78,7 @@ test_lemonn_v4_connectivity.py   Read-only checks for the Dhan v4 bot
 
 etf_dukan/                  ETF ki Dukan bot, its own README, setup script and setup check
 dashboard/                  Strategy Desk: password-protected dashboard on port 8080 (see dashboard/README.md)
+hilega_milega/              Hilega-Milega weekly F&O alerts (alerts only, runs on GitHub, not the VM)
 ```
 
 The bot scripts stay in the repository root on purpose: the crontab, the relative run-lock files

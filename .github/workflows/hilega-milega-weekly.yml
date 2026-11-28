@@ -1,0 +1,110 @@
+name: "Hilega-Milega: weekly F&O alerts"
+
+# ALERTS ONLY: no broker login, no orders. Runs on GitHub, so it does not need the trading VM.
+#
+# Schedule (IST): Friday 16:45 after the close, with back-up runs Saturday 09:00 and Monday 08:00.
+# A week is sent only once (the state remembers it), so the back-ups stay quiet when Friday worked.
+# You can also run it by hand: Actions > "Hilega-Milega: weekly F&O alerts" > Run workflow.
+#
+# Uses the secrets the other workflows already use: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+# GSHEET_ID_V2 (the "V2-Algo Trade Logs" sheet: tabs HM_Trades, HM_Signals, HM_Weekly) and GCP_SA_KEY.
+# The tracked model's state is kept on the branch `hilega-milega-state` (created on the first run).
+
+on:
+  schedule:
+    - cron: "15 11 * * 5"   # Fri 16:45 IST
+    - cron: "30 3 * * 6"    # Sat 09:00 IST (back-up)
+    - cron: "30 2 * * 1"    # Mon 08:00 IST (back-up)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only show the alert in the log (no Telegram, no sheet, nothing saved)"
+        type: boolean
+        default: false
+      resend:
+        description: "Send the latest finished week again (recomputes it)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hilega-milega-weekly
+  cancel-in-progress: false
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: pip install --quiet -r hilega_milega/requirements.txt
+
+      - name: Load saved state
+        run: |
+          if git fetch --quiet --depth=1 origin hilega-milega-state 2>/dev/null; then
+            git show FETCH_HEAD:state.json > "$RUNNER_TEMP/hm_state.json"
+            echo "Loaded state from branch hilega-milega-state"
+          else
+            cp hilega_milega/seed_state.json "$RUNNER_TEMP/hm_state.json"
+            echo "First run: starting from hilega_milega/seed_state.json"
+          fi
+
+      - name: Scan, alert, update the sheet
+        env:
+          HM_STATE: ${{ runner.temp }}/hm_state.json
+          HM_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          HM_FORCE: ${{ inputs.resend && '1' || '0' }}
+          HM_CAPITAL: ${{ vars.HM_CAPITAL || '1000000' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID_V2 }}
+          SA_JSON: ${{ secrets.GCP_SA_KEY }}
+          TG_DEDUP_SECS: "0"
+        run: |
+          if [ -n "$SA_JSON" ]; then printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa.json"; export GCP_SA_FILE="$RUNNER_TEMP/sa.json"; fi
+          python hilega_milega/hm_alerts.py
+
+      - name: Save state to branch hilega-milega-state
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name "hilega-milega-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          dir="$RUNNER_TEMP/state-branch"
+          if git fetch --quiet origin hilega-milega-state 2>/dev/null; then
+            git worktree add "$dir" FETCH_HEAD
+            cd "$dir" && git checkout -B hilega-milega-state
+          else
+            git worktree add --detach "$dir"
+            cd "$dir" && git checkout --orphan hilega-milega-state && git rm -rf --quiet . && git clean -fdq
+          fi
+          cp "$RUNNER_TEMP/hm_state.json" state.json
+          printf '%s\n' "State of the Hilega-Milega weekly alerts (written by .github/workflows/hilega-milega-weekly.yml). Do not edit." > README.md
+          git add state.json README.md
+          if git diff --cached --quiet; then echo "state unchanged"; exit 0; fi
+          git commit --quiet -m "Hilega-Milega state after $(python3 -c "import json;print(json.load(open('state.json'))['last_week'])")"
+          git push --quiet origin hilega-milega-state
+
+      - name: Telegram on failure
+        if: ${{ failure() }}
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -z "$TG_TOKEN" ] && exit 0
+          curl -s -o /dev/null "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode chat_id="$TG_CHAT" \
+            --data-urlencode text="⚠️ Hilega-Milega weekly alert run failed. A back-up run will try again; log: $RUN_URL"

@@ -126,6 +126,9 @@ RANGES = {  # name: (sheet, range)
     "tt_backtests": ("v2", "'Tradetron Backtests'!A1:M100"),
     "tt_v4_monthly": ("v2", "'Tradetron v4 Monthly'!A1:C200"),
     "etf_bt": ("v2", "'ETF Backtest'!A1:E30"),
+    "hm_trades": ("v2", "HM_Trades!A1:T3000"),
+    "hm_signals": ("v2", "HM_Signals!A1:J400"),
+    "hm_weekly": ("v2", "HM_Weekly!A1:P1000"),
 }
 
 
@@ -236,6 +239,23 @@ def build(raw, errors):
         if isinstance(r.get("year"), float):
             r["year"] = str(int(r["year"]))
 
+    # Hilega-Milega weekly alerts (written by hilega_milega/hm_alerts.py from GitHub Actions)
+    hm_t, hm_w = R.get("hm_trades", []), R.get("hm_weekly", [])
+    hm_open = [r for r in hm_t if r.get("status") != "CLOSED"]
+    hm_closed = [r for r in hm_t if r.get("status") == "CLOSED"]
+    hm_live_closed = [r for r in hm_closed if r.get("source") == "live"]
+    last_w = hm_w[0] if hm_w else {}
+    hm_curve = sorted(({"date": str(r.get("week_ending")), "model": r.get("model_return"), "nifty": r.get("nifty_return")}
+                       for r in hm_w if isinstance(r.get("model_return"), float)), key=lambda r: r["date"])
+    nets = [r["net_return_after_0_18_side"] for r in hm_closed if isinstance(r.get("net_return_after_0_18_side"), float)]
+    hm = {"summary": {"model_return": last_w.get("model_return"), "nifty_return": last_w.get("nifty_return"),
+                      "model_value": last_w.get("model_value"), "week": str(last_w.get("week_ending") or ""),
+                      "new_buys": last_w.get("new_buys"), "open": len([r for r in hm_open if r.get("status") != "BUY AT NEXT OPEN"]),
+                      "closed": len(hm_closed), "live_closed": len(hm_live_closed),
+                      "win_rate": round(100 * sum(1 for n in nets if n > 0) / len(nets), 1) if nets else None,
+                      "avg_net": round(sum(nets) / len(nets), 2) if nets else None},
+          "curve": hm_curve, "open": hm_open, "closed": hm_closed, "signals": R.get("hm_signals", [])[:150]}
+
     return {
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "errors": errors,
@@ -247,6 +267,7 @@ def build(raw, errors):
         "v4": {"days": v4_days, "log": list(reversed(v4))},
         "v3": {"days": v3_days, "legs": list(reversed(legs)), "sessions": list(reversed(sess))},
         "adaptive": {"days": ad_days, "log": list(reversed(ad))},
+        "hm": hm,
         "backtests": {"tradetron": R.get("tt_backtests", []), "v4_monthly": R.get("tt_v4_monthly", []),
                       "etf_summary": etf_bt_summary, "etf_yearly": etf_bt_yearly},
     }
@@ -265,6 +286,14 @@ def demo_raw():
         "v3_legs": [["Date", "Session", "Symbol", "Leg_PnL", "Paper"], ["2026-11-23", "AFTERNOON_ATM", "SAMPLE", "-100", "TRUE"]],
         "adaptive_log": [["Date", "Timestamp", "Strategy_Version", "Session_Status", "Net_PnL"],
                          ["2026-11-24", "15:20:00", "SAMPLE LIVE", "TRADED", "500"]],
+        "hm_trades": [["Trade id", "Symbol", "Status", "Source", "Buy signal week", "Entry date (next open)", "Entry price",
+                       "Last price", "Return %", "Net return % (after 0.18%/side)", "P&L ₹ (1/15 slot)", "Weeks held"],
+                      ["", "SAMPLE2", "BUY AT NEXT OPEN", "live", "2026-11-27", "", "", "", "", "", "", ""],
+                      ["SAMPLE1-2026-11-06", "SAMPLE1", "OPEN", "live", "2026-11-06", "2026-11-09", "100", "104", "4", "", "2600", "3"]],
+        "hm_signals": [["Alert time (IST)", "Signal week", "Signal", "Symbol", "Weekly close", "RSI(9)"],
+                       ["2026-11-27 16:45", "2026-11-27", "BUY", "SAMPLE2", "250", "61.2"]],
+        "hm_weekly": [["Week ending", "Model return %", "NIFTY return %", "Model value ₹", "New buys"],
+                      ["2026-11-27", "2.16", "-0.75", "1021616", "ON"], ["2026-11-20", "0", "0", "1000000", "ON"]],
     }
 
 
