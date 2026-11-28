@@ -36,7 +36,7 @@ o = bot.spot_ohlc()
 res("ok" if o.get("open") and o.get("close") else "warn", "NIFTY open / prev close", f"{o}")
 
 try:
-    bot.load_master(); res("ok", "Scrip master", f"expiry {bot.expiry}, lot {bot.lot_size}, DTE {(bot.expiry - bot.today).days}")
+    bot.load_master(); res("ok", "Scrip master", f"expiry {bot.expiry}, lot {bot.lot_size}, DTE {M.trading_days_to_expiry(bot.today, bot.expiry)} trading days")
 except Exception as e:
     res("fail", "Scrip master", str(e)); sys.exit(1)
 
