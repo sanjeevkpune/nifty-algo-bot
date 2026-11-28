@@ -9,6 +9,7 @@ One password-protected page for every bot in this repo, served by the trading VM
 | Lemonn v4 straddle | V2 sheet (`GSHEET_ID_V2`): `Lemonn_v4_Daily` |
 | Lemonn v3 dual session | V2 sheet: `Lemonn_Dual_v3`, `Lemonn_Log` |
 | Adaptive strangle | V2 sheet: `Sheet1` |
+| Hilega-Milega alerts | V2 sheet: `HM_Trades`, `HM_Signals`, `HM_Weekly` (written by the weekly GitHub workflow; every signal, no cap) |
 | Backtests | V2 sheet: `Tradetron Backtests`, `Tradetron v4 Monthly`, `ETF Backtest` |
 
 The backtest tabs are copies of the Tradetron reports (and the ETF new-setup report), so the VM needs
